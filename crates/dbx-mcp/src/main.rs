@@ -1,0 +1,42 @@
+use std::sync::Arc;
+
+use dbx_mcp::{
+    http::serve_streamable_http, with_legacy_discovery_fallback, DbxBackend, DbxMcpServer, LocalBackend, McpTransport,
+    RuntimeConfig, WebBackend,
+};
+use rmcp::ServiceExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--version") {
+        println!("dbx-mcp {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    // Diagnostics (plugin-tool discovery, bridge fallbacks) go to stderr,
+    // which is safe under the stdio transport. RUST_LOG controls the level;
+    // warnings are on by default so silent degradation stays visible.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let runtime = RuntimeConfig::from_environment_and_args()?;
+    let backend: Arc<dyn DbxBackend> = if let Ok(base_url) = std::env::var("DBX_WEB_URL") {
+        Arc::new(
+            WebBackend::new(base_url, std::env::var("DBX_WEB_PASSWORD").unwrap_or_default())
+                .map_err(std::io::Error::other)?,
+        )
+    } else {
+        let db_path = dbx_mcp::paths::storage_db_path().map_err(std::io::Error::other)?;
+        Arc::new(LocalBackend::open(&db_path).await.map_err(std::io::Error::other)?)
+    };
+    match runtime.transport {
+        McpTransport::Stdio => {
+            let transport = with_legacy_discovery_fallback(rmcp::transport::stdio());
+            let service = DbxMcpServer::new(backend).serve(transport).await?;
+            service.waiting().await?;
+            Ok(())
+        }
+        McpTransport::StreamableHttp => {
+            let http = runtime.http.ok_or_else(|| std::io::Error::other("missing HTTP MCP runtime configuration"))?;
+            serve_streamable_http(backend, http).await?;
+            Ok(())
+        }
+    }
+}
