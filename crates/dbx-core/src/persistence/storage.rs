@@ -8677,8 +8677,12 @@ fn apply_sync_tunnel_profiles_in_tx(
         let mut sanitized = profile.clone();
         sanitized.scrub_secrets();
         let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO tunnel_profiles (id, config_json) VALUES (?1, ?2)", params![profile.id(), json])
-            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO tunnel_profiles (id, config_json) VALUES (?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json",
+            params![profile.id(), json],
+        )
+        .map_err(|e| e.to_string())?;
         if sanitized != profile {
             persist_secret_in_tx(
                 tx,
@@ -10912,6 +10916,7 @@ mod tests {
             ssh_agent_sock_path: String::new(),
             auth_method: "password".to_string(),
             allow_exec_channel_proxy: false,
+            proxy_command: String::new(),
             profile_id: String::new(),
         })
     }
@@ -11201,6 +11206,8 @@ mod tests {
 
     fn mq_connection(id: &str, token: &str) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: id.to_string(),
             name: "Pulsar".to_string(),
@@ -11247,6 +11254,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -11276,6 +11284,8 @@ mod tests {
 
     fn nacos_connection(id: &str, password: &str) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: id.to_string(),
             name: "Nacos".to_string(),
@@ -11322,6 +11332,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -11499,7 +11510,10 @@ mod tests {
         let target_dir = temp_data_dir("import-empty-target");
         std::fs::create_dir_all(managed_key_path(&target_dir).parent().unwrap()).unwrap();
         std::fs::copy(managed_key_path(&source_dir), managed_key_path(&target_dir)).unwrap();
-        let _target_storage = crate::persistence::test_storage::open(&target_dir.join("dbx.db")).await.unwrap();
+        // 打开一次以创建空目标库；导入前必须释放，否则 Windows 上目标文件被占用、
+        // 替换会失败（与相邻用例一致）。
+        let target_storage = crate::persistence::test_storage::open(&target_dir.join("dbx.db")).await.unwrap();
+        drop(target_storage);
 
         let result = maybe_import_user_data_db(&target_dir, Some(&source_dir)).unwrap();
 

@@ -16,13 +16,15 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::future::Future;
 use std::io::BufReader;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
-use tokio::task::JoinHandle;
-use tokio_postgres::config::SslMode;
+use tokio::net::TcpStream;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_postgres::config::{Host, SslMode};
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::types::{FromSql, Kind, Type};
 use tokio_postgres::{AsyncMessage, NoTls, Row, SimpleQueryMessage, Socket};
@@ -88,6 +90,12 @@ pub struct PostgresTableAccessInfo {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostgresInheritsParent {
+    pub schema: String,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PostgresTablePartitionInfo {
     pub is_partition: bool,
     pub parent_schema: Option<String>,
@@ -101,6 +109,14 @@ pub struct PostgresTablePartitionInfo {
     pub is_foreign: bool,
     pub foreign_server: Option<String>,
     pub foreign_options: Vec<(String, String)>,
+    /// Traditional `INHERITS` parent tables (relkind ≠ 'p'), in
+    /// `inhseqno` order. A relation is either a declarative partition
+    /// (`is_partition = true`, single parent of relkind 'p') or a
+    /// traditional-inheritance child (one or more `INHERITS` parents of
+    /// relkind 'r'), never both. Empty for plain tables and declarative
+    /// partitions. Used by table sync to emit `CREATE TABLE ... INHERITS
+    /// (parent...)` so the dependency survives a structure transfer.
+    pub inherits_parents: Vec<PostgresInheritsParent>,
 }
 
 /// The state of a partition-local column DEFAULT relative to the parent's
@@ -2561,6 +2577,125 @@ fn postgres_client_keys() -> &'static Mutex<PostgresClientKeys> {
 /// (`RAISE NOTICE`/`WARNING`, etc.) into a per-backend buffer instead of
 /// discarding them. Query execution drains the buffer so notices are
 /// attached to the `QueryResult` of the statement that raised them.
+/// Delay between staggered TCP connection attempts when a hostname resolves
+/// to several addresses (Happy Eyeballs, RFC 8305 §4): short enough that
+/// falling back to a reachable address feels instant, long enough that a
+/// healthy preferred address still wins the race.
+const HAPPY_EYEBALLS_STAGGER: Duration = Duration::from_millis(250);
+
+/// Dial `addr` once. Split out so the happy-eyeballs racer below stays readable.
+async fn dial_socket_addr_once(addr: SocketAddr) -> std::io::Result<TcpStream> {
+    TcpStream::connect(addr).await
+}
+
+/// Connect to the first reachable address in `addrs`, racing the attempts
+/// with a short stagger instead of trying them strictly one after another.
+/// See [`happy_eyeballs_dial_with`] for the racing semantics.
+async fn happy_eyeballs_dial(addrs: &[SocketAddr], stagger: Duration) -> std::io::Result<TcpStream> {
+    happy_eyeballs_dial_with(addrs, stagger, dial_socket_addr_once).await
+}
+
+/// Racing dial with an injectable per-address dial function, so tests can
+/// script a hanging address deterministically (the dial is the external
+/// boundary; the racing orchestration is the behavior under test).
+///
+/// The first address is dialed immediately; each further address is started
+/// after `stagger` unless an earlier attempt already failed, in which case the
+/// next address is tried at once. The first successful dial wins and the
+/// remaining attempts are aborted. When every attempt fails, the last error
+/// is returned.
+async fn happy_eyeballs_dial_with<F, Fut>(
+    addrs: &[SocketAddr],
+    stagger: Duration,
+    dial: F,
+) -> std::io::Result<TcpStream>
+where
+    F: Fn(SocketAddr) -> Fut + Send,
+    Fut: Future<Output = std::io::Result<TcpStream>> + Send + 'static,
+{
+    let mut remaining = addrs.iter();
+    let mut in_flight: JoinSet<std::io::Result<TcpStream>> = JoinSet::new();
+    let mut last_err: Option<std::io::Error> = None;
+
+    let Some(first) = remaining.next() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no socket addresses to dial"));
+    };
+    in_flight.spawn(dial(*first));
+
+    loop {
+        tokio::select! {
+            biased;
+            result = in_flight.join_next(), if !in_flight.is_empty() => {
+                match result {
+                    Some(Ok(Ok(stream))) => {
+                        in_flight.abort_all();
+                        return Ok(stream);
+                    }
+                    Some(Ok(Err(err))) => last_err = Some(err),
+                    Some(Err(join_err)) => {
+                        last_err = Some(std::io::Error::other(join_err.to_string()));
+                    }
+                    // Unreachable: this arm is disabled while the set is empty.
+                    None => break,
+                }
+                // A finished attempt immediately frees the way for the next address.
+                if let Some(addr) = remaining.next() {
+                    in_flight.spawn(dial(*addr));
+                } else if in_flight.is_empty() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(stagger), if remaining.len() > 0 => {
+                if let Some(addr) = remaining.next() {
+                    in_flight.spawn(dial(*addr));
+                }
+            }
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no socket addresses to dial")))
+}
+
+/// Resolve a single-host PostgreSQL config ahead of the driver's own dial and
+/// pin it to the first reachable resolved address (Happy Eyeballs, RFC 8305).
+///
+/// The winning IP is passed as `hostaddr`, so the driver's dial goes straight
+/// to the reachable address while TLS still validates against the original
+/// hostname. Returns the config unchanged when there is nothing to race:
+/// several hosts, an explicit `hostaddr`, a Unix socket, an IP literal, a
+/// single resolved address, or an inconclusive probe (the driver's own dial
+/// then surfaces the real error).
+async fn pin_postgres_hostaddr(pg_config: &tokio_postgres::Config) -> tokio_postgres::Config {
+    let mut pg_config = pg_config.clone();
+    let [Host::Tcp(host)] = pg_config.get_hosts() else {
+        return pg_config;
+    };
+    if !pg_config.get_hostaddrs().is_empty() || host.parse::<IpAddr>().is_ok() {
+        return pg_config;
+    }
+    let port = pg_config.get_ports().first().copied().unwrap_or(5432);
+    let Ok(resolved) = tokio::net::lookup_host((host.as_str(), port)).await else {
+        return pg_config;
+    };
+    let mut addrs: Vec<SocketAddr> = resolved.collect();
+    addrs.sort();
+    addrs.dedup();
+    if addrs.len() < 2 {
+        return pg_config;
+    }
+    // The probe only picks the address; the driver's own dial (with its
+    // connect_timeout and TLS setup) still opens the real connection.
+    let probe =
+        tokio::time::timeout(super::tcp_probe_timeout(), happy_eyeballs_dial(&addrs, HAPPY_EYEBALLS_STAGGER)).await;
+    if let Ok(Ok(winner)) = probe {
+        if let Ok(addr) = winner.peer_addr() {
+            pg_config.hostaddr(addr.ip());
+        }
+    }
+    pg_config
+}
+
 struct NoticeCapturingConnect<T>
 where
     T: MakeTlsConnect<Socket> + Clone + Sync + Send + 'static,
@@ -2587,6 +2722,10 @@ where
         let tls = self.tls.clone();
         let pg_config = pg_config.clone();
         Box::pin(async move {
+            // Prefer the first reachable resolved address so an unreachable
+            // IPv6 address cannot burn the whole connect timeout before IPv4
+            // is tried (issue #10955).
+            let pg_config = pin_postgres_hostaddr(&pg_config).await;
             let (client, mut connection) = pg_config.connect(tls).await?;
             // No query can complete before the connection is being driven, so
             // the notice buffer is handed to the driver task through a slot
@@ -3940,8 +4079,9 @@ pub async fn get_table_partition_info(
     };
     let relkind = relation.try_get::<_, String>(0).unwrap_or_default();
     let is_partition = relation.try_get::<_, bool>(1).unwrap_or(false);
+    let has_inherits_parent = relation.try_get::<_, bool>(2).unwrap_or(false);
     let is_foreign = relkind == "f";
-    if relkind != "p" && !is_foreign && !is_partition {
+    if relkind != "p" && !is_foreign && !is_partition && !has_inherits_parent {
         return Ok(PostgresTablePartitionInfo::default());
     }
 
@@ -3953,7 +4093,12 @@ pub async fn get_table_partition_info(
     )
     .await?;
     let Some(row) = rows.first() else {
-        return Ok(PostgresTablePartitionInfo { is_partition, is_foreign, ..Default::default() });
+        let inherits_parents = if has_inherits_parent {
+            get_table_inherits_parents_inner(&client, schema, table).await?
+        } else {
+            Vec::new()
+        };
+        return Ok(PostgresTablePartitionInfo { is_partition, is_foreign, inherits_parents, ..Default::default() });
     };
     let foreign_options = row
         .try_get::<_, Option<Vec<String>>>(5)
@@ -3963,6 +4108,12 @@ pub async fn get_table_partition_info(
         .into_iter()
         .filter_map(|option| option.split_once('=').map(|(key, value)| (key.to_string(), value.to_string())))
         .collect();
+    // `postgres_table_partition_info_sql` only carries the single declarative
+    // partition parent (a partition has exactly one). A traditional-inheritance
+    // child can have several `INHERITS` parents, fetched separately so the
+    // declarative-partition path stays untouched.
+    let inherits_parents =
+        if has_inherits_parent { get_table_inherits_parents_inner(&client, schema, table).await? } else { Vec::new() };
     Ok(PostgresTablePartitionInfo {
         is_partition,
         parent_schema: row.try_get::<_, Option<String>>(0).ok().flatten().filter(|value| !value.is_empty()),
@@ -3972,11 +4123,47 @@ pub async fn get_table_partition_info(
         is_foreign,
         foreign_server: row.try_get::<_, Option<String>>(4).ok().flatten().filter(|value| !value.is_empty()),
         foreign_options,
+        inherits_parents,
     })
 }
 
 pub async fn get_table_partition_key(pool: &Pool, schema: &str, table: &str) -> Result<Option<String>, String> {
     Ok(get_table_partition_info(pool, schema, table).await?.key)
+}
+
+/// The traditional `INHERITS` parents of a relation (relkind ≠ 'p'), in
+/// `inhseqno` order. Used by table sync to emit
+/// `CREATE TABLE ... INHERITS (parent...)`. Returns an empty vector for
+/// plain tables and declarative partitions. Unlike
+/// `get_table_partition_info` this never hits the declarative-partition
+/// catalog (`relispartition` / `pg_partitioned_table`), so it runs on
+/// 9.x servers where `INHERITS` is the only inheritance form.
+pub async fn get_table_inherits_parents(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<PostgresInheritsParent>, String> {
+    let schema = if schema.is_empty() { "public" } else { schema };
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    get_table_inherits_parents_inner(&client, schema, table).await
+}
+
+async fn get_table_inherits_parents_inner(
+    client: &deadpool_postgres::Client,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<PostgresInheritsParent>, String> {
+    let rows = postgres_query_cached(client, postgres_table_inherits_parents_sql(), &[&schema, &table])
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .map(|row| PostgresInheritsParent {
+            schema: row.try_get::<_, String>(0).unwrap_or_default(),
+            table: row.try_get::<_, String>(1).unwrap_or_default(),
+        })
+        .filter(|parent| !parent.schema.is_empty() && !parent.table.is_empty())
+        .collect())
 }
 
 /// The partitioning strategy of a single PostgreSQL partitioned parent, read
@@ -4534,6 +4721,10 @@ pub async fn fetch_postgres_partition_tree(
                 is_foreign,
                 foreign_server: row.try_get::<_, Option<String>>(9).ok().flatten().filter(|value| !value.is_empty()),
                 foreign_options,
+                // This tree only walks declarative partitions (the query
+                // filters `c.relispartition`); traditional-inheritance
+                // children are not tree nodes, so they carry no parents here.
+                inherits_parents: Vec::new(),
             };
             Some(PostgresPartitionTreeNode {
                 oid,
@@ -4611,8 +4802,8 @@ fn postgres_columns_for_relations_sql() -> &'static str {
              ) AS is_pk, \
              col_description(a.attrelid, a.attnum) AS column_comment, \
              CASE a.attidentity \
-               WHEN 'd' THEN 'generated by default as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
-               WHEN 'a' THEN 'generated always as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
+               WHEN 'd' THEN 'generated by default as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s minvalue %s maxvalue %s cache %s %s)', pseq.seqstart, pseq.seqincrement, pseq.seqmin, pseq.seqmax, pseq.seqcache, CASE WHEN pseq.seqcycle THEN 'cycle' ELSE 'no cycle' END) ELSE '' END \
+               WHEN 'a' THEN 'generated always as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s minvalue %s maxvalue %s cache %s %s)', pseq.seqstart, pseq.seqincrement, pseq.seqmin, pseq.seqmax, pseq.seqcache, CASE WHEN pseq.seqcycle THEN 'cycle' ELSE 'no cycle' END) ELSE '' END \
                ELSE CASE a.attgenerated \
                  WHEN 's' THEN 'generated always as (' || pg_get_expr(ad.adbin, ad.adrelid) || ') stored' \
                  WHEN 'v' THEN 'generated always as (' || pg_get_expr(ad.adbin, ad.adrelid) || ') virtual' \
@@ -5596,7 +5787,12 @@ fn postgres_table_partition_relation_sql() -> &'static str {
               SELECT 1 FROM pg_catalog.pg_inherits i \
               WHERE i.inhrelid = c.oid \
                 AND (SELECT parent.relkind FROM pg_catalog.pg_class parent WHERE parent.oid = i.inhparent) = 'p' \
-            ) AS is_partition \
+            ) AS is_partition, \
+            EXISTS ( \
+              SELECT 1 FROM pg_catalog.pg_inherits i \
+              WHERE i.inhrelid = c.oid \
+                AND COALESCE((SELECT parent.relkind FROM pg_catalog.pg_class parent WHERE parent.oid = i.inhparent), 'r') <> 'p' \
+            ) AS has_inherits_parent \
      FROM pg_catalog.pg_class c \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f') \
@@ -5638,6 +5834,23 @@ fn postgres_table_partition_info_compat_sql() -> &'static str {
      LEFT JOIN pg_catalog.pg_foreign_server fs ON fs.oid = ft.ftserver \
      WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f') \
      LIMIT 1"
+}
+
+fn postgres_table_inherits_parents_sql() -> &'static str {
+    // Traditional-inheritance parents only: a declarative partition child
+    // is also a `pg_inherits` row, but its parent has relkind 'p', which we
+    // exclude here so partitions stay owned by `get_table_partition_info`.
+    // Uses no 10+ catalog columns (`relispartition`/`pg_partitioned_table`),
+    // so it runs unchanged on 9.x where `INHERITS` is the only form.
+    "SELECT pn.nspname AS parent_schema, pc.relname AS parent_table \
+     FROM pg_catalog.pg_inherits i \
+     JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
+     JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
+     JOIN pg_catalog.pg_class c ON c.oid = i.inhrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND c.relname = $2 \
+       AND COALESCE(pc.relkind, 'r') <> 'p' \
+     ORDER BY i.inhseqno"
 }
 
 fn postgres_table_partition_local_objects_sql() -> &'static str {
@@ -7354,8 +7567,16 @@ pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> R
 /// last known count, often `0` (#10461). `pg_stat_user_tables.n_live_tup` is the
 /// statistics collector's live estimate: it tracks DML within seconds and still
 /// avoids a `COUNT(*)` scan, which is what the UI promises in its column hint.
+///
+/// A zero `n_live_tup` only carries information when the collector has actually
+/// observed DML on the table (`n_tup_ins/upd/del`): after `pg_stat_reset()`, an
+/// import that bypasses the collector, or `pg_upgrade`, the entry reports zeros
+/// while a recent ANALYZE left a perfectly good `reltuples` behind — trusting the
+/// zero masked that count and showed a populated table as `0` rows (#11072).
+/// When no DML was observed, fall back to `reltuples` instead.
 const POSTGRES_OBJECT_STATISTICS_SQL: &str = "SELECT c.relname, \
-        GREATEST(COALESCE(s.n_live_tup, c.reltuples), 0)::bigint AS estimated_rows, \
+        GREATEST(CASE WHEN COALESCE(s.n_tup_ins, 0) + COALESCE(s.n_tup_upd, 0) + COALESCE(s.n_tup_del, 0) > 0 \
+        THEN COALESCE(s.n_live_tup, 0) ELSE c.reltuples END, 0)::bigint AS estimated_rows, \
         pg_catalog.pg_total_relation_size(c.oid)::bigint AS total_bytes \
  FROM pg_catalog.pg_class c \
  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -7469,8 +7690,8 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
              ) AS is_pk, \
              col_description(a.attrelid, a.attnum) AS column_comment, \
              CASE a.attidentity \
-               WHEN 'd' THEN 'generated by default as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
-               WHEN 'a' THEN 'generated always as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
+               WHEN 'd' THEN 'generated by default as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s minvalue %s maxvalue %s cache %s %s)', pseq.seqstart, pseq.seqincrement, pseq.seqmin, pseq.seqmax, pseq.seqcache, CASE WHEN pseq.seqcycle THEN 'cycle' ELSE 'no cycle' END) ELSE '' END \
+               WHEN 'a' THEN 'generated always as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s minvalue %s maxvalue %s cache %s %s)', pseq.seqstart, pseq.seqincrement, pseq.seqmin, pseq.seqmax, pseq.seqcache, CASE WHEN pseq.seqcycle THEN 'cycle' ELSE 'no cycle' END) ELSE '' END \
                ELSE CASE a.attgenerated \
                  WHEN 's' THEN 'generated always as (' || pg_get_expr(ad.adbin, ad.adrelid) || ') stored' \
                  WHEN 'v' THEN 'generated always as (' || pg_get_expr(ad.adbin, ad.adrelid) || ') virtual' \
@@ -9394,9 +9615,12 @@ fn opengauss_foreign_keys_sql() -> &'static str {
 }
 
 fn postgres_table_dependencies_sql() -> &'static str {
-    // Foreign keys aren't the only ordering constraint on export/replay: a
-    // partition must be created after its parent table exists too, so union
-    // in `pg_inherits` partition-of edges alongside the FK edges.
+    // Foreign keys aren't the only ordering constraint on export/replay:
+    // a child relation must be created after its parent exists too. The
+    // `pg_inherits` union covers both declarative partitions (parent
+    // relkind 'p') and traditional `INHERITS` children (parent relkind
+    // 'r'); both need the parent first, so no `relispartition` filter is
+    // applied here (matching the 9.x compat path).
     "SELECT child.relname AS table_name, parent.relname AS ref_table \
      FROM pg_catalog.pg_constraint con \
      JOIN pg_catalog.pg_class child ON child.oid = con.conrelid \
@@ -9409,7 +9633,7 @@ fn postgres_table_dependencies_sql() -> &'static str {
      UNION \
      SELECT child.relname AS table_name, parent.relname AS ref_table \
      FROM pg_catalog.pg_inherits i \
-     JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid AND child.relispartition \
+     JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid \
      JOIN pg_catalog.pg_namespace child_schema ON child_schema.oid = child.relnamespace \
      JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent \
      JOIN pg_catalog.pg_namespace parent_schema ON parent_schema.oid = parent.relnamespace \
@@ -12477,13 +12701,42 @@ mod tests {
         assert!(sql.contains("parent_schema.nspname = $1"));
         assert!(!sql.contains("information_schema"));
         assert!(sql.contains("pg_catalog.pg_inherits"));
-        assert!(sql.contains("child.relispartition"));
+        // Both declarative partitions and traditional `INHERITS` children need
+        // their parent created first, so the dependency edge covers every
+        // `pg_inherits` row (no `relispartition` filter) — matching the 9.x
+        // compat path which never had the column to filter on.
+        assert!(!sql.contains("relispartition"));
         // 兼容版面向 9.x：不能引用 relispartition，但 INHERITS 边要保留
         // （旧式子表同样要先建父表）。
         assert!(!compat_sql.contains("relispartition"));
         assert!(compat_sql.contains("pg_catalog.pg_inherits"));
         assert!(compat_sql.contains("con.contype = 'f'"));
         assert!(compat_sql.contains("ORDER BY table_name, ref_table"));
+    }
+
+    #[test]
+    fn postgres_table_inherits_parents_sql_targets_traditional_parents() {
+        let sql = postgres_table_inherits_parents_sql();
+        // Resolves parents via pg_inherits, excludes the declarative-partition
+        // 'p' relkind so partition parents stay owned by partition_info.
+        assert!(sql.contains("pg_catalog.pg_inherits"));
+        assert!(sql.contains("i.inhrelid"));
+        assert!(sql.contains("COALESCE(pc.relkind, 'r') <> 'p'"));
+        // Order is stable across DB restarts.
+        assert!(sql.contains("ORDER BY i.inhseqno"));
+        // No 10+-only columns, so it runs unchanged on 9.x.
+        assert!(!sql.contains("relispartition"));
+        assert!(!sql.contains("pg_partitioned_table"));
+    }
+
+    #[test]
+    fn postgres_table_partition_relation_sql_flags_inherits_parent() {
+        let sql = postgres_table_partition_relation_sql();
+        assert!(sql.contains("AS is_partition"));
+        assert!(sql.contains("AS has_inherits_parent"));
+        // The INHERITS flag selects parents whose relkind is not 'p'
+        // (declarative partitions are excluded so they stay is_partition).
+        assert!(sql.contains("<> 'p'"));
     }
 
     #[test]
@@ -15636,9 +15889,15 @@ mod tests {
     #[test]
     fn object_statistics_prefers_live_tuples_and_keeps_a_reltuples_fallback() {
         // #10461: `reltuples` lags behind DML, so the live estimate must win when
-        // `pg_stat_user_tables` is available...
+        // the collector has observed DML on the table...
         assert!(POSTGRES_OBJECT_STATISTICS_SQL.contains("pg_catalog.pg_stat_user_tables"));
-        assert!(POSTGRES_OBJECT_STATISTICS_SQL.contains("COALESCE(s.n_live_tup, c.reltuples)"));
+        assert!(POSTGRES_OBJECT_STATISTICS_SQL.contains("THEN COALESCE(s.n_live_tup, 0)"));
+        // ...while a zeroed collector entry (pg_stat_reset / pg_upgrade / an
+        // import that bypassed the collector, #11072) carries no information and
+        // must not mask a recent ANALYZE's `reltuples`.
+        assert!(POSTGRES_OBJECT_STATISTICS_SQL
+            .contains("WHEN COALESCE(s.n_tup_ins, 0) + COALESCE(s.n_tup_upd, 0) + COALESCE(s.n_tup_del, 0) > 0",));
+        assert!(POSTGRES_OBJECT_STATISTICS_SQL.contains("ELSE c.reltuples END"));
         // ...while an engine without that view still reports counts.
         assert!(!POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL.contains("pg_stat_user_tables"));
         assert!(POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL.contains("GREATEST(c.reltuples, 0)"));
@@ -15649,5 +15908,95 @@ mod tests {
             assert!(sql.contains("c.relkind IN ('r','m','f','p')"));
             assert!(sql.contains("WHERE n.nspname = $1"));
         }
+    }
+
+    // Issue #10955: a hostname resolving to both IPv6 and IPv4 must connect
+    // through the reachable address instead of stalling on the unreachable
+    // one until the pool's create timeout fires.
+
+    #[tokio::test]
+    async fn happy_eyeballs_dial_does_not_wait_for_hung_first_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let bad_ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let unreachable = SocketAddr::new(bad_ip, reachable.port());
+        let started = Instant::now();
+        let stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            happy_eyeballs_dial_with(&[unreachable, reachable], Duration::from_millis(50), |addr| async move {
+                if addr.ip() == bad_ip {
+                    // The unreachable IPv6/NAT64 address from #10955: the
+                    // SYN is never answered, so this dial never resolves.
+                    futures::future::pending::<std::io::Result<TcpStream>>().await
+                } else {
+                    TcpStream::connect(addr).await
+                }
+            }),
+        )
+        .await
+        .expect("dial must not stall on the unreachable address")
+        .expect("dial must succeed through the reachable address");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "fallback must be near-instant, not wait out the hung attempt"
+        );
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_dial_tries_next_address_on_fast_failure() {
+        let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let started = Instant::now();
+        let stream = happy_eyeballs_dial(&[refused, reachable], Duration::from_millis(50))
+            .await
+            .expect("dial must fall through to the reachable address");
+        assert!(started.elapsed() < Duration::from_secs(5), "a refused address must not cost a full stagger");
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_dial_succeeds_with_single_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = happy_eyeballs_dial(&[addr], Duration::from_millis(50))
+            .await
+            .expect("a single reachable address must connect");
+        assert_eq!(stream.peer_addr().unwrap(), addr);
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_dial_reports_error_when_all_addresses_refused() {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed: Vec<SocketAddr> = [&first, &second].into_iter().map(|l| l.local_addr().unwrap()).collect();
+        drop(first);
+        drop(second);
+        let started = Instant::now();
+        happy_eyeballs_dial(&closed, Duration::from_millis(50))
+            .await
+            .expect_err("all addresses refused: the dial must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused dials must fail fast instead of waiting out a stagger"
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_postgres_hostaddr_leaves_ip_literal_alone() {
+        let config = tokio_postgres::Config::from_str("host=127.0.0.1 port=5432 user=dbx connect_timeout=2").unwrap();
+        let pinned = pin_postgres_hostaddr(&config).await;
+        assert!(pinned.get_hostaddrs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pin_postgres_hostaddr_keeps_explicit_hostaddr() {
+        let mut config = tokio_postgres::Config::from_str("host=localhost port=5432 user=dbx").unwrap();
+        config.hostaddr("127.0.0.1".parse().unwrap());
+        let pinned = pin_postgres_hostaddr(&config).await;
+        assert_eq!(pinned.get_hostaddrs().first(), Some(&"127.0.0.1".parse().unwrap()));
     }
 }

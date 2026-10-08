@@ -679,6 +679,8 @@ mod tests {
 
     fn sqlite_config(id: &str, path: &str) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: id.to_string(),
             name: "SQLite".to_string(),
@@ -725,6 +727,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -757,6 +760,7 @@ mod tests {
     fn transfer_request(source: &str, target: &str, dir: &std::path::Path) -> TransferRequest {
         let db = dir.join("main.db").to_string_lossy().to_string();
         TransferRequest {
+            table_filters: std::collections::HashMap::new(),
             transfer_id: "transfer-entry-test".to_string(),
             source_connection_id: source.to_string(),
             source_database: db.clone(),
@@ -771,7 +775,7 @@ mod tests {
             drop_target_before_create: false,
             drop_target_confirmed: false,
             content: TransferContent::DataOnly,
-            objects: Vec::new(),
+            objects: Some(Vec::new()),
             mode: TransferMode::Append,
             target_table_name_case: TransferTableNameCase::Preserve,
             quote_target_column_names: true,
