@@ -10,6 +10,7 @@ mod assets;
 mod filesystem;
 mod host;
 mod installer;
+mod jdbc_sessions;
 mod lifecycle;
 mod manifest;
 mod marketplace;
@@ -160,6 +161,7 @@ pub struct PluginRegistry {
     root_dir: PathBuf,
     app_version: String,
     lifecycle: PluginLifecycle,
+    jdbc_runtimes: jdbc_sessions::JdbcRuntimeCache,
 }
 
 impl PluginRegistry {
@@ -168,7 +170,12 @@ impl PluginRegistry {
     }
 
     pub fn new_with_app_version(root_dir: PathBuf, app_version: impl Into<String>) -> Self {
-        Self { root_dir, app_version: app_version.into(), lifecycle: PluginLifecycle::default() }
+        Self {
+            root_dir,
+            app_version: app_version.into(),
+            lifecycle: PluginLifecycle::default(),
+            jdbc_runtimes: Default::default(),
+        }
     }
 
     pub fn lifecycle(&self) -> PluginLifecycle {
@@ -309,8 +316,16 @@ impl PluginRegistry {
         let env = env.with_plugin_data_dir(&self.plugin_data_dir(&plugin.manifest.id));
         let session = PluginSidecarSession::start(plugin, self.app_version.clone(), env).await?;
         let result = session.invoke_with_timeout(method, params, Some(driver_id), timeout_duration).await;
-        session.shutdown().await;
-        result
+        match (result, session.shutdown().await) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(invoke_error), Ok(())) => Err(invoke_error),
+            (Ok(_), Err(shutdown_error)) => {
+                Err(format!("Plugin invocation completed but shutdown failed: {shutdown_error}"))
+            }
+            (Err(invoke_error), Err(shutdown_error)) => {
+                Err(format!("{invoke_error}; additionally failed to stop plugin: {shutdown_error}"))
+            }
+        }
     }
 
     pub async fn start_driver_session(&self, driver_id: &str) -> Result<Arc<PluginDriverSession>, String> {
@@ -384,7 +399,8 @@ fn ensure_plugin_compatible(plugin: &InstalledPlugin) -> Result<(), String> {
 pub struct PluginDriverSession {
     sidecar: Arc<PluginSidecarSession>,
     driver_id: String,
-    _activity: lifecycle::PluginUsageGuard,
+    _activity: Option<lifecycle::PluginUsageGuard>,
+    logical: Option<Arc<jdbc_sessions::JdbcLogicalSession>>,
 }
 
 impl PluginDriverSession {
@@ -396,7 +412,7 @@ impl PluginDriverSession {
         activity: lifecycle::PluginUsageGuard,
     ) -> Result<Self, String> {
         let sidecar = PluginSidecarSession::start(plugin, app_version, env).await?;
-        Ok(Self { sidecar, driver_id, _activity: activity })
+        Ok(Self { sidecar, driver_id, _activity: Some(activity), logical: None })
     }
 
     pub async fn invoke<T>(&self, method: &str, params: serde_json::Value) -> Result<T, String>
@@ -415,11 +431,22 @@ impl PluginDriverSession {
     where
         T: DeserializeOwned,
     {
+        if let Some(logical) = &self.logical {
+            return logical.invoke(method, params, timeout_duration).await;
+        }
         self.sidecar.invoke_with_timeout(method, params, Some(&self.driver_id), timeout_duration).await
     }
 
-    pub async fn shutdown(&self) {
-        self.sidecar.shutdown().await;
+    pub async fn shutdown(&self) -> Result<(), String> {
+        if let Some(logical) = &self.logical {
+            logical.close().await;
+            return Ok(());
+        }
+        self.sidecar.shutdown().await
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.logical.as_ref().is_none_or(|logical| logical.is_available())
     }
 
     pub async fn pid(&self) -> Option<u32> {
@@ -446,6 +473,14 @@ impl PluginDriverSession {
     ) -> Result<Self, String> {
         let activity = PluginLifecycle::default().begin_connection(&plugin.manifest.id, &driver_id)?;
         Self::start(plugin, driver_id, env!("CARGO_PKG_VERSION").to_string(), env, activity).await
+    }
+}
+
+impl Drop for PluginDriverSession {
+    fn drop(&mut self) {
+        if let Some(logical) = &self.logical {
+            logical.close_in_background();
+        }
     }
 }
 
@@ -560,7 +595,7 @@ sleep 30
         pending.abort();
         assert!(pending.await.unwrap_err().is_cancelled());
         assert!(lifecycle.begin_update("sample.sidecar").is_ok());
-        host.stop_all().await;
+        host.stop_all().await.unwrap();
     }
 
     #[cfg(unix)]
@@ -603,7 +638,7 @@ sleep 30
             .expect("session should start");
         let pid = session.pid().await.expect("child should have a pid");
 
-        session.shutdown().await;
+        session.shutdown().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(!process_exists(pid));
