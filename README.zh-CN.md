@@ -1,3 +1,15 @@
+# DBX-Next
+
+由 [xue-ding-e](https://github.com/xue-ding-e) 独立维护的下游版本，基于 [t8y2 及原贡献者的 DBX](https://github.com/t8y2/dbx)，保留原作者归属及 Apache-2.0 许可证，不是上游官方发行版。
+
+首期完整承接 `a2d52919c4c5661c7215175a8f17b216978a4efb`，其源代码树与已有 Linux 服务发行源 `5dd45e85f0a072cac9564acdcef2e9f178dd5be1` 完全一致。运行基线源自官方 **v0.6.29**（`9192af28aefb434fb90d27dad78831961ce0f1e8`），不是最新上游运行代码。`upstream-main` 单独保留官方完整历史；`main` 按独立功能划分，保留来源引用且没有 merge commit。
+
+现有安装不变，继续使用[原 fork 发行下载](https://github.com/xue-ding-e/dbx/releases)。本次不发布 Next 二进制或自动更新渠道，不改变 CLI 命令、内部包名、应用标识、配置及密钥目录、MCP 入口。继承的桌面更新器仍指向上游，接受其更新可能覆盖 fork 增强，不应视为 Next 更新渠道。
+
+所有继承的 GitHub workflow 均以 `.disabled` 后缀原文保留，不启用发布、部署、镜像、通知或包发布。后续上游整合和发行验证另行进行。以下保留原项目说明，其下载链接不代表 Next 发行。
+
+---
+
 <div align="center">
   <p style="font-size: 18px; white-space: nowrap;"><strong>25 MB 驾驭 100+ 种数据库。桌面端、Docker、CLI、内置 AI 助手与 MCP Server。</strong></p>
 

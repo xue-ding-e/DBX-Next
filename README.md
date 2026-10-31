@@ -1,3 +1,17 @@
+# DBX-Next
+
+Independent downstream maintenance by [xue-ding-e](https://github.com/xue-ding-e), based on [DBX by t8y2 and its contributors](https://github.com/t8y2/dbx). Original authorship and Apache-2.0 licensing are retained. This is not an official upstream release.
+
+## Initial compatibility baseline
+
+This baseline preserves the complete fork integration at `a2d52919c4c5661c7215175a8f17b216978a4efb`, whose source tree exactly matches the existing Linux service release source `5dd45e85f0a072cac9564acdcef2e9f178dd5be1`. It is based on upstream **v0.6.29** (`9192af28aefb434fb90d27dad78831961ce0f1e8`), not the latest upstream runtime. `upstream-main` separately retains official history; `main` is linear with feature-separated commits and original-source references.
+
+Existing installations are unchanged. Continue using [the existing fork releases](https://github.com/xue-ding-e/dbx/releases). This initialization publishes no Next binaries or automatic-update channel. CLI commands, internal package names, application identifier, profile/key storage and MCP endpoints are unchanged. The inherited desktop updater still points upstream and accepting its update can replace fork features; it is not a Next update channel.
+
+Inherited GitHub workflows are preserved byte-for-byte as `.disabled` files. No release, deployment, mirror, notification or package publication is enabled. Future upstream integration and release validation are separate work. Original upstream documentation follows for attribution and reference; its download links are not Next releases.
+
+---
+
 <div align="center">
   <p style="font-size: 18px; white-space: nowrap;"><strong>100+ databases in 25 MB. Desktop, Docker, CLI, built-in AI assistant, and MCP Server.</strong></p>
 
