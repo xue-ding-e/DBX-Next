@@ -3174,7 +3174,7 @@ function changeActiveSchema(tabId: string, schema: string | undefined) {
 }
 
 function openGitHub() {
-  openUrl("https://github.com/t8y2/dbx");
+  openUrl("https://github.com/xue-ding-e/DBX-Next");
 }
 function openMcpGuide() {
   openUrl("https://dbxio.com/cn/docs/mcp");

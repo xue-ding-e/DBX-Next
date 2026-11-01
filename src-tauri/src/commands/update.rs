@@ -16,13 +16,11 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
-const OFFICIAL_UPDATE_ENDPOINTS: [&str; 2] = [
-    "https://dl.dbxio.com/releases/latest/latest.json",
-    "https://github.com/t8y2/dbx/releases/latest/download/latest.json",
-];
-const R2_LATEST_RELEASE_DOWNLOAD_PREFIX: &str = "https://dl.dbxio.com/releases/latest/";
-const CNB_RELEASE_DOWNLOAD_PREFIX: &str = "https://cnb.cool/dbxio.com/dbx/-/releases/download/";
-const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/t8y2/dbx/releases/download/";
+const OFFICIAL_UPDATE_ENDPOINTS: [&str; 1] =
+    ["https://github.com/xue-ding-e/DBX-Next/releases/latest/download/latest.json"];
+const R2_LATEST_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/xue-ding-e/DBX-Next/releases/latest/download/";
+const CNB_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/xue-ding-e/DBX-Next/releases/download/";
+const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/xue-ding-e/DBX-Next/releases/download/";
 const UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "update-download-progress";
 const DOWNLOAD_CANCELED_ERROR: &str = "Download canceled by user.";
 const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -237,12 +235,8 @@ impl UpdateDownloadSource {
         match self {
             Self::Official => Ok(OFFICIAL_UPDATE_ENDPOINTS.iter().map(|endpoint| endpoint.to_string()).collect()),
             Self::Cnb => {
-                let version =
-                    latest_version.ok_or_else(|| "Latest version is required for CNB updates.".to_string())?;
-                Ok(vec![
-                    format!("{CNB_RELEASE_DOWNLOAD_PREFIX}{}/latest.json", tag_version(version)),
-                    OFFICIAL_UPDATE_ENDPOINTS[0].to_string(),
-                ])
+                let _ = latest_version.ok_or_else(|| "Latest version is required for CNB updates.".to_string())?;
+                Ok(OFFICIAL_UPDATE_ENDPOINTS.iter().map(|endpoint| endpoint.to_string()).collect())
             }
         }
     }
@@ -517,7 +511,7 @@ pub async fn download_update(
             cache_id: uuid::Uuid::new_v4().to_string(),
             version: version.to_string(),
             portable_mode,
-            release_url: format!("https://github.com/t8y2/dbx/releases/tag/v{version}"),
+            release_url: format!("https://github.com/xue-ding-e/DBX-Next/releases/tag/v{version}"),
             release_notes: release_notes.unwrap_or(notes),
             downloaded_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1034,7 +1028,10 @@ mod tests {
     #[test]
     fn builds_official_update_endpoints() {
         let endpoints = UpdateDownloadSource::Official.endpoints(None).unwrap();
-        assert_eq!(endpoints, OFFICIAL_UPDATE_ENDPOINTS);
+        assert_eq!(
+            endpoints,
+            OFFICIAL_UPDATE_ENDPOINTS.iter().map(|endpoint| endpoint.to_string()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1042,25 +1039,25 @@ mod tests {
         let endpoints = UpdateDownloadSource::Cnb.endpoints(Some("0.5.39")).unwrap();
         assert_eq!(
             endpoints,
-            vec![format!("{CNB_RELEASE_DOWNLOAD_PREFIX}v0.5.39/latest.json"), OFFICIAL_UPDATE_ENDPOINTS[0].to_string()]
+            OFFICIAL_UPDATE_ENDPOINTS.iter().map(|endpoint| endpoint.to_string()).collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn rewrites_github_asset_url_to_cnb() {
+    fn keeps_next_asset_url_for_cnb_source() {
         let download_url = UpdateDownloadSource::Cnb
-            .rewrite_download_url("https://github.com/t8y2/dbx/releases/download/v0.5.39/DBX_0.5.39_aarch64.dmg")
-            .unwrap()
+            .rewrite_download_url(
+                "https://github.com/xue-ding-e/DBX-Next/releases/download/v0.5.39/DBX_0.5.39_aarch64.dmg",
+            )
             .unwrap();
-        assert_eq!(download_url, "https://cnb.cool/dbxio.com/dbx/-/releases/download/v0.5.39/DBX_0.5.39_aarch64.dmg");
+        assert_eq!(download_url, None);
     }
 
     #[test]
-    fn accepts_existing_cnb_asset_url() {
+    fn rejects_non_next_asset_url() {
         let download_url = UpdateDownloadSource::Cnb
-            .rewrite_download_url("https://cnb.cool/dbxio.com/dbx/-/releases/download/v0.5.39/DBX_0.5.39_aarch64.dmg")
-            .unwrap();
-        assert_eq!(download_url, None);
+            .rewrite_download_url("https://github.com/t8y2/dbx/releases/download/v0.5.39/DBX_0.5.39_aarch64.dmg");
+        assert!(download_url.is_err());
     }
 
     #[test]
@@ -1079,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_cnb_portable_asset_candidate_with_r2_fallback() {
+    fn builds_cnb_portable_asset_candidate_with_next_fallback() {
         let candidates = UpdateDownloadSource::Cnb.portable_asset_candidates("v0.5.64", "aarch64").unwrap();
         assert_eq!(
             candidates[0].archive_url,
@@ -1094,24 +1091,29 @@ mod tests {
     #[test]
     fn builds_installer_asset_candidates_for_cnb_source() {
         let candidates = UpdateDownloadSource::Cnb.installer_asset_candidates(
-            "https://github.com/t8y2/dbx/releases/download/v0.5.64/DBX_0.5.64_aarch64.dmg",
+            "https://github.com/xue-ding-e/DBX-Next/releases/download/v0.5.64/DBX_0.5.64_aarch64.dmg",
             Some("0.5.64"),
         );
-        assert_eq!(candidates.len(), 3);
-        assert_eq!(candidates[0], "https://cnb.cool/dbxio.com/dbx/-/releases/download/v0.5.64/DBX_0.5.64_aarch64.dmg");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0],
+            "https://github.com/xue-ding-e/DBX-Next/releases/download/v0.5.64/DBX_0.5.64_aarch64.dmg"
+        );
         assert_eq!(candidates[1], format!("{R2_LATEST_RELEASE_DOWNLOAD_PREFIX}DBX_0.5.64_aarch64.dmg"));
-        assert_eq!(candidates[2], "https://github.com/t8y2/dbx/releases/download/v0.5.64/DBX_0.5.64_aarch64.dmg");
     }
 
     #[test]
     fn builds_installer_asset_candidates_for_official_source() {
         let candidates = UpdateDownloadSource::Official.installer_asset_candidates(
-            "https://github.com/t8y2/dbx/releases/download/v0.5.64/DBX_0.5.64_aarch64.dmg",
+            "https://github.com/xue-ding-e/DBX-Next/releases/download/v0.5.64/DBX_0.5.64_aarch64.dmg",
             Some("0.5.64"),
         );
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0], format!("{R2_LATEST_RELEASE_DOWNLOAD_PREFIX}DBX_0.5.64_aarch64.dmg"));
-        assert_eq!(candidates[1], "https://github.com/t8y2/dbx/releases/download/v0.5.64/DBX_0.5.64_aarch64.dmg");
+        assert_eq!(
+            candidates[1],
+            "https://github.com/xue-ding-e/DBX-Next/releases/download/v0.5.64/DBX_0.5.64_aarch64.dmg"
+        );
         assert!(!candidates.iter().any(|url| url.contains("cnb.cool")));
     }
 

@@ -2,12 +2,9 @@ pub use dbx_platform::version::{is_newer_version, normalize_version, parse_versi
 
 use serde::{Deserialize, Serialize};
 
-const LATEST_JSON_GITHUB_PATH: &str = "https://github.com/t8y2/dbx/releases/latest/download/latest.json";
-const LATEST_JSON_R2_PATH: &str = "releases/latest/latest.json";
-const LATEST_JSON_CNB_PATH: &str = "https://cnb.cool/dbxio.com/dbx/-/releases/latest/download/latest.json";
-const LATEST_EN_NOTES_R2_PATH: &str = "changelog/latest-en.json";
-const GITHUB_RELEASE_API_PREFIX: &str = "https://api.github.com/repos/t8y2/dbx/releases/tags/v";
-const RELEASE_URL_PREFIX: &str = "https://github.com/t8y2/dbx/releases/tag/v";
+const LATEST_JSON_GITHUB_PATH: &str = "https://github.com/xue-ding-e/DBX-Next/releases/latest/download/latest.json";
+const GITHUB_RELEASE_API_PREFIX: &str = "https://api.github.com/repos/xue-ding-e/DBX-Next/releases/tags/v";
+const RELEASE_URL_PREFIX: &str = "https://github.com/xue-ding-e/DBX-Next/releases/tag/v";
 
 #[derive(Debug, Deserialize)]
 pub struct TauriRelease {
@@ -18,8 +15,8 @@ pub struct TauriRelease {
     pub jdbc_plugin: Option<JdbcPluginLatest>,
     #[serde(skip)]
     pub github: Option<GithubReleaseMetadata>,
-    // 英文 release notes，由 R2 latest-en.json 填充（latest.json 不含此字段）。
-    // 仅当用户界面非中文时拉取，build_update_info 优先用它作为 release_notes。
+    // Optional localized notes supplied by a release feed. Next currently uses
+    // the GitHub release body directly when this field is absent.
     #[serde(skip)]
     pub notes_en: Option<String>,
 }
@@ -50,7 +47,7 @@ pub struct UpdateInfo {
     pub release_notes: String,
 }
 
-pub async fn fetch_latest_release(locale: &str, source: crate::DownloadSource) -> Result<TauriRelease, String> {
+pub async fn fetch_latest_release(_locale: &str, source: crate::DownloadSource) -> Result<TauriRelease, String> {
     let client = build_update_http_client()?;
 
     let candidates = update_check_candidates(source);
@@ -60,12 +57,8 @@ pub async fn fetch_latest_release(locale: &str, source: crate::DownloadSource) -
     if let Ok(github) = fetch_github_release_metadata(&client, &release.version).await {
         release.github = Some(github);
     }
-    // 非中文界面用户额外拉取英文 release notes；失败/版本不匹配则保持 None，上层回退中文。
-    if !is_chinese_locale(locale) {
-        if let Ok(notes_en) = fetch_latest_release_notes_en(&client, &release.version).await {
-            release.notes_en = Some(notes_en);
-        }
-    }
+    // Next releases keep their curated notes in the GitHub release body, so
+    // update checks do not depend on the upstream R2 changelog service.
     Ok(release)
 }
 
@@ -90,44 +83,11 @@ async fn fetch_first_available(client: &reqwest::Client, candidates: &[String]) 
 fn update_check_candidates(source: crate::DownloadSource) -> Vec<String> {
     match source {
         crate::DownloadSource::Official => {
-            vec![format!("{}{LATEST_JSON_R2_PATH}", crate::R2_CDN_BASE), LATEST_JSON_GITHUB_PATH.to_string()]
+            vec![LATEST_JSON_GITHUB_PATH.to_string()]
         }
         // CNB exposes a moving latest release, so checking CNB does not need an official-source version first.
-        crate::DownloadSource::Cnb => vec![
-            LATEST_JSON_CNB_PATH.to_string(),
-            format!("{}{LATEST_JSON_R2_PATH}", crate::R2_CDN_BASE),
-            LATEST_JSON_GITHUB_PATH.to_string(),
-        ],
+        crate::DownloadSource::Cnb => vec![LATEST_JSON_GITHUB_PATH.to_string()],
     }
-}
-
-// 拉取 R2 上的英文 release notes（仅最新版本）。version 必须与 latest.json 的 version 一致才采用，
-// 防止 sync-changelog 尚未更新时拿到旧版本英文 notes。
-async fn fetch_latest_release_notes_en(client: &reqwest::Client, expected_version: &str) -> Result<String, String> {
-    let url = format!("{}{LATEST_EN_NOTES_R2_PATH}", crate::R2_CDN_BASE);
-    let resp = client
-        .get(&url)
-        .header(reqwest::header::USER_AGENT, "dbx-update-checker")
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("Failed to fetch English release notes: {e}"))?;
-    let data: LatestEnNotes = resp.json().await.map_err(|e| format!("Failed to parse English release notes: {e}"))?;
-    if normalize_version(&data.version) == normalize_version(expected_version) {
-        Ok(data.notes)
-    } else {
-        Err(format!("English release notes version {} mismatch expected {}", data.version, expected_version))
-    }
-}
-
-fn is_chinese_locale(locale: &str) -> bool {
-    locale == "zh-CN" || locale == "zh-TW"
-}
-
-#[derive(Debug, Deserialize)]
-struct LatestEnNotes {
-    version: String,
-    notes: String,
 }
 
 fn build_update_http_client() -> Result<reqwest::Client, String> {
@@ -222,7 +182,7 @@ mod tests {
               "jdbc_plugin": {
                 "version": "0.1.3",
                 "protocol_version": 1,
-                "url": "https://github.com/t8y2/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip"
+                "url": "https://github.com/xue-ding-e/DBX-Next/releases/latest/download/dbx-jdbc-plugin-latest.zip"
               },
               "platforms": {}
             }"#,
@@ -233,7 +193,10 @@ mod tests {
 
         assert_eq!(jdbc.version, "0.1.3");
         assert_eq!(jdbc.protocol_version, 1);
-        assert_eq!(jdbc.url, "https://github.com/t8y2/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip");
+        assert_eq!(
+            jdbc.url,
+            "https://github.com/xue-ding-e/DBX-Next/releases/latest/download/dbx-jdbc-plugin-latest.zip"
+        );
     }
 
     #[test]
@@ -244,7 +207,7 @@ mod tests {
             jdbc_plugin: None,
             github: Some(GithubReleaseMetadata {
                 name: Some("DBX v0.5.3".to_string()),
-                html_url: Some("https://github.com/t8y2/dbx/releases/tag/v0.5.3".to_string()),
+                html_url: Some("https://github.com/xue-ding-e/DBX-Next/releases/tag/v0.5.3".to_string()),
                 body: Some("### 新功能\n\n真实发布说明".to_string()),
             }),
             notes_en: None,
@@ -253,7 +216,7 @@ mod tests {
         let info = build_update_info(release, "0.5.2");
 
         assert_eq!(info.release_name, "DBX v0.5.3");
-        assert_eq!(info.release_url, "https://github.com/t8y2/dbx/releases/tag/v0.5.3");
+        assert_eq!(info.release_url, "https://github.com/xue-ding-e/DBX-Next/releases/tag/v0.5.3");
         assert_eq!(info.release_notes, "### 新功能\n\n真实发布说明");
         assert!(!info.portable_mode);
     }
@@ -267,7 +230,7 @@ mod tests {
             jdbc_plugin: None,
             github: Some(GithubReleaseMetadata {
                 name: Some("DBX v0.5.3".to_string()),
-                html_url: Some("https://github.com/t8y2/dbx/releases/tag/v0.5.3".to_string()),
+                html_url: Some("https://github.com/xue-ding-e/DBX-Next/releases/tag/v0.5.3".to_string()),
                 body: Some("### 新功能\n\n真实发布说明".to_string()),
             }),
             notes_en: Some("### New Features\n\nReal release notes".to_string()),
@@ -297,18 +260,11 @@ mod tests {
     fn update_check_candidates_follow_selected_source() {
         assert_eq!(
             super::update_check_candidates(crate::DownloadSource::Official),
-            vec![
-                "https://dl.dbxio.com/releases/latest/latest.json",
-                "https://github.com/t8y2/dbx/releases/latest/download/latest.json",
-            ]
+            vec!["https://github.com/xue-ding-e/DBX-Next/releases/latest/download/latest.json"]
         );
         assert_eq!(
             super::update_check_candidates(crate::DownloadSource::Cnb),
-            vec![
-                "https://cnb.cool/dbxio.com/dbx/-/releases/latest/download/latest.json",
-                "https://dl.dbxio.com/releases/latest/latest.json",
-                "https://github.com/t8y2/dbx/releases/latest/download/latest.json",
-            ]
+            vec!["https://github.com/xue-ding-e/DBX-Next/releases/latest/download/latest.json"]
         );
     }
 }

@@ -24,6 +24,16 @@ describe("tunnelProfileSummary", () => {
     expect(tunnelProfileSummary(proxy)).toBe("socks5://127.0.0.1:1080");
   });
 
+  it("defaults proxy profiles to the XenTerm loopback SOCKS endpoint", () => {
+    const proxy = createTunnelProfile("proxy");
+    expect(proxy.type).toBe("proxy");
+    if (proxy.type === "proxy") {
+      expect(proxy.proxy_type).toBe("socks5");
+      expect(proxy.host).toBe("127.0.0.1");
+      expect(proxy.port).toBe(1080);
+    }
+  });
+
   it("returns the url for http tunnel profiles", () => {
     const http = { ...createTunnelProfile("http_tunnel"), url: "https://example.com/dbx_tunnel.php" } as TunnelProfile;
     expect(tunnelProfileSummary(http)).toBe("https://example.com/dbx_tunnel.php");

@@ -97,7 +97,7 @@ async function mountDialog(activeTaskCount: number, initialState: Partial<Dialog
               portable_mode: state.portableMode,
               manual_update_only: state.manualUpdateOnly,
               release_name: "DBX v0.5.61",
-              release_url: "https://github.com/t8y2/dbx/releases/tag/v0.5.61",
+              release_url: "https://github.com/xue-ding-e/DBX-Next/releases/tag/v0.5.61",
               release_notes: state.releaseNotes,
             },
             updateCheckMessage: "",
@@ -449,7 +449,7 @@ describe("UpdateDialog older versions", () => {
     historyButton("Open Release")?.click();
     await flushDialog();
 
-    expect(updateMocks.openExternal).toHaveBeenCalledWith("https://github.com/t8y2/dbx/releases/tag/v0.5.59");
+    expect(updateMocks.openExternal).toHaveBeenCalledWith("https://github.com/xue-ding-e/DBX-Next/releases/tag/v0.5.59");
   });
 
   it("keeps the history collapsed until the user expands it", async () => {

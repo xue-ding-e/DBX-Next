@@ -100,9 +100,9 @@ export function tagVersion(version: string): string {
 export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, source: unknown, fallbackUrl: string): string {
   const normalizedSource = normalizeUpdateDownloadSource(source);
   if (normalizedSource === "cnb" && info?.latest_version) {
-    return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${tagVersion(info.latest_version)}`;
+    return `https://github.com/xue-ding-e/DBX-Next/releases/tag/${tagVersion(info.latest_version)}`;
   }
-  if (normalizedSource === "cnb") return "https://cnb.cool/dbxio.com/dbx/-/releases";
+  if (normalizedSource === "cnb") return "https://github.com/xue-ding-e/DBX-Next/releases";
   return info?.release_url || fallbackUrl;
 }
 
@@ -113,9 +113,9 @@ export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, source: unk
 export function resolveReleaseTagUrl(tag: string, source: unknown): string {
   const normalizedTag = tagVersion(tag);
   if (normalizeUpdateDownloadSource(source) === "cnb") {
-    return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${encodeURIComponent(normalizedTag)}`;
+    return `https://github.com/xue-ding-e/DBX-Next/releases/tag/${encodeURIComponent(normalizedTag)}`;
   }
-  return `https://github.com/t8y2/dbx/releases/tag/${encodeURIComponent(normalizedTag)}`;
+  return `https://github.com/xue-ding-e/DBX-Next/releases/tag/${encodeURIComponent(normalizedTag)}`;
 }
 
 export async function resolveUpdaterProxy(): Promise<string | undefined> {
@@ -149,7 +149,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   const activeTaskCount = computed(() => Math.max(0, Math.trunc(options.getActiveTaskCount?.() ?? 0)));
   const autoUpdateEnabled = computed(() => settingsStore.editorSettings.autoUpdateApp !== false);
   const hasUpdateAvailable = computed(() => (updateDownloaded.value || updateReady.value || updateInfo.value?.update_available === true) && !isUpdateIgnored(updateInfo.value, settingsStore.editorSettings.ignoredUpdateVersion));
-  const latestReleaseUrl = "https://github.com/t8y2/dbx/releases/latest";
+  const latestReleaseUrl = "https://github.com/xue-ding-e/DBX-Next/releases/latest";
   let generation = 0;
   let activeDownload: Promise<void> | undefined;
   let automaticDownload = false;

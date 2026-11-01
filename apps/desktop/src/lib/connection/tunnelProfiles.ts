@@ -34,7 +34,8 @@ export function createTunnelProfile(type: TunnelProfileType): TunnelProfile {
       name: "",
       enabled: true,
       proxy_type: "socks5",
-      host: "",
+      // XenTerm dynamic tunnels listen on the local loopback by default.
+      host: "127.0.0.1",
       port: 1080,
       username: "",
       password: "",
