@@ -2,8 +2,7 @@ name: DBX-Next Release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    tags: ["v*.*.*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -24,73 +23,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  cli:
-    name: Build CLI
+  build:
+    name: Build CLI and Desktop
     runs-on: windows-2022
-    timeout-minutes: 60
-    steps:
-      - name: Check out the source ref
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
-          fetch-depth: 0
-
-      - name: Resolve release version
-        id: release
-        shell: pwsh
-        run: |
-          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
-          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid release tag: $tag" }
-          $version = $tag.Substring(1)
-          $packageVersion = (Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json).version
-          if ($packageVersion -ne $version) { throw "Tag $tag does not match package.json=$packageVersion" }
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Cache Rust dependencies and target
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "./ -> target"
-          shared-key: dbx-next-cli-windows-x64
-          cache-targets: true
-          cache-on-failure: true
-
-      - name: Build the Windows CLI with OS keyring support
-        shell: pwsh
-        run: |
-          cargo build --locked --package dbx-cli --no-default-features --features os-keyring --release --target x86_64-pc-windows-msvc
-          $source = 'target\x86_64-pc-windows-msvc\release\dbx.exe'
-          if (-not (Test-Path -LiteralPath $source)) { throw "Missing DBX CLI binary $source" }
-          $stage = Join-Path $env:RUNNER_TEMP 'cli-package'
-          $assets = Join-Path $env:RUNNER_TEMP 'cli-assets'
-          New-Item -ItemType Directory -Force -Path $stage,$assets | Out-Null
-          Copy-Item -LiteralPath $source -Destination (Join-Path $stage 'dbx.exe') -Force
-          Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $stage 'LICENSE') -Force
-          Copy-Item -LiteralPath 'packages\cli\README.md' -Destination (Join-Path $stage 'README.md') -Force
-          $zip = 'dbx-cli-win32-x64.zip'
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal -Force
-          Copy-Item -LiteralPath $zip -Destination (Join-Path $assets $zip) -Force
-          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -LiteralPath (Join-Path $assets 'CLI-SHA256SUMS') -Value "$hash  $zip" -Encoding utf8NoBOM
-          Copy-Item -LiteralPath $source -Destination (Join-Path $assets 'dbx.exe') -Force
-
-      - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dbx-next-cli-assets
-          path: ${{ runner.temp }}\cli-assets
-          if-no-files-found: error
-          retention-days: 7
-
-  desktop:
-    name: Build Desktop
-    runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Check out the source ref
         uses: actions/checkout@v5
@@ -144,7 +80,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "./ -> target"
-          shared-key: dbx-next-desktop-windows-x64
+          shared-key: dbx-next-windows-x64
           cache-targets: true
           cache-on-failure: true
 
@@ -167,10 +103,27 @@ jobs:
       - name: Run frontend checks
         run: pnpm typecheck
 
-      - name: Build Tauri Desktop bundles
+      - name: Build CLI first to reuse common Cargo target artifacts
+        shell: pwsh
+        run: |
+          cargo build --locked --package dbx-cli --no-default-features --features os-keyring --release --target x86_64-pc-windows-msvc
+          $source = 'target\x86_64-pc-windows-msvc\release\dbx.exe'
+          if (-not (Test-Path -LiteralPath $source)) { throw "Missing CLI binary $source" }
+          $stage = Join-Path $env:RUNNER_TEMP 'build-assets\cli'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -LiteralPath $source -Destination (Join-Path $stage 'dbx.exe') -Force
+          Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $stage 'LICENSE') -Force
+          Copy-Item -LiteralPath 'packages\cli\README.md' -Destination (Join-Path $stage 'README.md') -Force
+          $zip = Join-Path $env:RUNNER_TEMP 'dbx-cli-win32-x64.zip'
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal -Force
+          Copy-Item -LiteralPath $zip -Destination (Join-Path $stage 'dbx-cli-win32-x64.zip') -Force
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath (Join-Path $stage 'CLI-SHA256SUMS') -Value "$hash  dbx-cli-win32-x64.zip" -Encoding utf8NoBOM
+
+      - name: Build Desktop after common Cargo artifacts are available
         run: pnpm tauri build --target x86_64-pc-windows-msvc --ci
 
-      - name: Verify and stage Desktop artifact
+      - name: Verify and stage Desktop artifacts
         shell: pwsh
         run: |
           $bundleRoot = 'target\x86_64-pc-windows-msvc\release\bundle'
@@ -180,7 +133,7 @@ jobs:
           if ($nsis.Count -ne 1 -or $msi.Count -ne 1 -or $sigs.Count -lt 2) { throw 'Desktop bundle verification failed.' }
           $desktopExe = 'target\x86_64-pc-windows-msvc\release\dbx.exe'
           if (-not (Test-Path -LiteralPath $desktopExe)) { throw "Missing Desktop executable $desktopExe" }
-          $stage = Join-Path $env:RUNNER_TEMP 'desktop-assets'
+          $stage = Join-Path $env:RUNNER_TEMP 'build-assets\desktop'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item -LiteralPath $nsis[0].FullName -Destination (Join-Path $stage $nsis[0].Name) -Force
           Copy-Item -LiteralPath "$($nsis[0].FullName).sig" -Destination (Join-Path $stage "$($nsis[0].Name).sig") -Force
@@ -188,11 +141,11 @@ jobs:
           Copy-Item -LiteralPath "$($msi[0].FullName).sig" -Destination (Join-Path $stage "$($msi[0].Name).sig") -Force
           Copy-Item -LiteralPath $desktopExe -Destination (Join-Path $stage 'DBX.exe') -Force
 
-      - name: Upload Desktop artifact
+      - name: Upload combined build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dbx-next-desktop-assets
-          path: ${{ runner.temp }}\desktop-assets
+          name: dbx-next-build-assets
+          path: ${{ runner.temp }}\build-assets
           if-no-files-found: error
           retention-days: 7
 
@@ -205,7 +158,7 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [cli, desktop]
+    needs: build
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
@@ -251,12 +204,11 @@ jobs:
       - name: Install dependencies for Tauri signer
         run: pnpm install --frozen-lockfile
 
-      - name: Download CLI and Desktop artifacts
+      - name: Download combined build artifact
         uses: actions/download-artifact@v4
         with:
-          pattern: dbx-next-*-assets
+          name: dbx-next-build-assets
           path: ${{ runner.temp }}\build-assets
-          merge-multiple: false
 
       - name: Load Tauri updater signing key
         shell: pwsh
@@ -280,8 +232,8 @@ jobs:
           $tag = '${{ steps.release.outputs.tag }}'
           $version = '${{ steps.release.outputs.version }}'
           $root = Join-Path $env:RUNNER_TEMP 'build-assets'
-          $cliRoot = Join-Path $root 'dbx-next-cli-assets'
-          $desktopRoot = Join-Path $root 'dbx-next-desktop-assets'
+          $cliRoot = Join-Path $root 'cli'
+          $desktopRoot = Join-Path $root 'desktop'
           $desktopExe = Join-Path $desktopRoot 'DBX.exe'
           $cliExe = Join-Path $cliRoot 'dbx.exe'
           $nsis = Get-ChildItem -LiteralPath $desktopRoot -Filter '*-setup.exe' -File | Select-Object -First 1
@@ -333,8 +285,8 @@ jobs:
         run: |
           $tag = '${{ steps.release.outputs.tag }}'
           $version = '${{ steps.release.outputs.version }}'
-          $desktopRoot = Join-Path $env:RUNNER_TEMP 'build-assets\dbx-next-desktop-assets'
-          $cliRoot = Join-Path $env:RUNNER_TEMP 'build-assets\dbx-next-cli-assets'
+          $desktopRoot = Join-Path $env:RUNNER_TEMP 'build-assets\desktop'
+          $cliRoot = Join-Path $env:RUNNER_TEMP 'build-assets\cli'
           $upload = @()
           $upload += (Get-ChildItem -LiteralPath $desktopRoot -File | ForEach-Object { $_.FullName })
           $upload += (Get-ChildItem -LiteralPath $cliRoot -File | Where-Object { $_.Name -in @('dbx-cli-win32-x64.zip','CLI-SHA256SUMS') } | ForEach-Object { $_.FullName })
@@ -344,7 +296,7 @@ jobs:
           $names = gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
           $required = @('latest.json','SHA256SUMS','CLI-SHA256SUMS','dbx-cli-win32-x64.zip',"DBX_${version}_x64-setup.exe", "DBX_${version}_x64_en-US.msi", "DBX_${version}_x64-portable.zip", "DBX_${version}_x64-portable.exe")
           foreach ($name in $required) { if ($names -notcontains $name) { throw "Published release is missing $name" } }
-          Write-Host "Published DBX-Next $tag from parallel CLI/Desktop jobs."
+          Write-Host "Published DBX-Next $tag from one reuse-optimized build job."
 
       - name: Remove the ephemeral updater key
         if: always()
