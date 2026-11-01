@@ -113,6 +113,8 @@ DBX-Next's new proxy profile defaults are `SOCKS5`, `127.0.0.1`, and port `1080`
 For connections that must go directly, do not attach this layer or disable that layer. The same shared profile can be attached to many selected connections without copying the XenTerm credentials. A connection may have multiple transport layers; keep the intended order visible in the transport list and test the complete path after reordering.
 
 The database fields still describe the database target. For example, if the database listens on the SSH server itself, use the server-side address and port that the SSH server can reach; `127.0.0.1` in the database field means the SSH server's loopback only when the proxy implementation sends the connection from that server. Do not replace the database target with the local proxy endpoint.
+
+When a multi-hop XenTerm session reaches an RDS private endpoint, keep the database field as the private DNS hostname supplied by the network (for example `pgm-...pg.rds.aliyuncs.com`). Preserve hostname based routing through SOCKS5; do not substitute the resolved private IP or a public endpoint. Verify the hostname resolves to the private address from the target jump session, then test the exact hostname and port through the local SOCKS listener.
 ## Configure DBX with HTTP CONNECT
 
 DBX's Proxy layer also accepts `HTTP CONNECT`, with the same host, port, username, and password fields. XenTerm's Dynamic listener is not an HTTP proxy, so do not set DBX to HTTP merely because the transport is “over SSH.”
