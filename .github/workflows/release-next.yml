@@ -66,6 +66,27 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Resolve pnpm store path
+        id: pnpm-store
+        shell: pwsh
+        run: "\"path=$(pnpm store path --silent)\" >> $env:GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: dbx-next-pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            dbx-next-pnpm-${{ runner.os }}-
+
+      - name: Cache Rust dependencies and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+          shared-key: dbx-next-windows-x64
+          cache-targets: true
+          cache-on-failure: true
+
       - name: Build the DBX CLI native binary
         shell: pwsh
         run: |
