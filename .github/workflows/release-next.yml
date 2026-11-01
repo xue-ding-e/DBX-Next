@@ -26,7 +26,10 @@ jobs:
       - name: Check out the release tag
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          # For manual runs, build the workflow's selected source ref and use
+          # the input only as the release tag. Tag pushes naturally check out
+          # the tag ref itself.
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
       - name: Resolve and validate release version
@@ -66,7 +69,7 @@ jobs:
       - name: Build the DBX CLI native binary
         shell: pwsh
         run: |
-          cargo build --locked --package dbx-cli --no-default-features --release --target x86_64-pc-windows-msvc
+          cargo build --locked --package dbx-cli --no-default-features --features os-keyring --release --target x86_64-pc-windows-msvc
           $cliSource = 'target\x86_64-pc-windows-msvc\release\dbx.exe'
           if (-not (Test-Path -LiteralPath $cliSource)) { throw "Missing DBX CLI binary $cliSource" }
           $cliStaging = Join-Path $env:RUNNER_TEMP 'dbx-next-cli.exe'

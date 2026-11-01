@@ -8,6 +8,9 @@ license = "Apache-2.0"
 default = ["duckdb-sidecar", "mq-admin"]
 duckdb-sidecar = ["dbx-mcp/duckdb-sidecar"]
 mq-admin = ["dbx-mcp/mq-admin"]
+# Native Windows/macOS CLI builds can read the key material provisioned by
+# Desktop's OS keychain migration instead of requiring DBX_SECRET_KEY_FILE.
+os-keyring = ["dbx-core/os-keyring", "dbx-mcp/os-keyring"]
 
 [[bin]]
 name = "dbx"
