@@ -11,7 +11,7 @@ if (-not (Test-Path -LiteralPath $workflowPath -PathType Leaf)) {
   throw "Missing active DBX-Next release workflow: $workflowPath"
 }
 $workflow = Get-Content -LiteralPath $workflowPath -Raw
-foreach ($requiredMarker in @("tauri-apps/tauri-action", 'DBX_${{ steps.release.outputs.version }}_x64-portable.zip', "dbx-cli-win32-x64.zip", "dbx-portable.cmd", "latest.json", "TAURI_SIGNING_PRIVATE_KEY_BASE64")) {
+foreach ($requiredMarker in @("cargo build --locked --package dbx-cli", "pnpm tauri build --target", 'DBX_${version}_x64-portable.zip', "dbx-cli-win32-x64.zip", "dbx-portable.cmd", "latest.json", "TAURI_SIGNING_PRIVATE_KEY_BASE64")) {
   if ($workflow -notlike "*$requiredMarker*") {
     throw "DBX-Next release workflow is missing required marker: $requiredMarker"
   }

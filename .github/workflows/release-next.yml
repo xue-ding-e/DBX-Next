@@ -7,8 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing semantic-version tag to build, for example v0.6.29
+        description: Release tag, for example v0.6.29
         required: true
+        type: string
+      source_ref:
+        description: Source branch or commit to build
+        required: true
+        default: main
         type: string
 
 permissions:
@@ -19,36 +24,92 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  windows-release:
-    name: Windows x64 installer and portable release
+  cli:
+    name: Build CLI
     runs-on: windows-2022
+    timeout-minutes: 60
     steps:
-      - name: Check out the release tag
+      - name: Check out the source ref
         uses: actions/checkout@v5
         with:
-          # For manual runs, build the workflow's selected source ref and use
-          # the input only as the release tag. Tag pushes naturally check out
-          # the tag ref itself.
-          ref: ${{ github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
           fetch-depth: 0
 
-      - name: Resolve and validate release version
+      - name: Resolve release version
         id: release
         shell: pwsh
         run: |
           $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
-          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
-            throw "Release tag must look like v0.6.29, got '$tag'"
-          }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid release tag: $tag" }
+          $version = $tag.Substring(1)
+          $packageVersion = (Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json).version
+          if ($packageVersion -ne $version) { throw "Tag $tag does not match package.json=$packageVersion" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+          shared-key: dbx-next-cli-windows-x64
+          cache-targets: true
+          cache-on-failure: true
+
+      - name: Build the Windows CLI with OS keyring support
+        shell: pwsh
+        run: |
+          cargo build --locked --package dbx-cli --no-default-features --features os-keyring --release --target x86_64-pc-windows-msvc
+          $source = 'target\x86_64-pc-windows-msvc\release\dbx.exe'
+          if (-not (Test-Path -LiteralPath $source)) { throw "Missing DBX CLI binary $source" }
+          $stage = Join-Path $env:RUNNER_TEMP 'cli-package'
+          $assets = Join-Path $env:RUNNER_TEMP 'cli-assets'
+          New-Item -ItemType Directory -Force -Path $stage,$assets | Out-Null
+          Copy-Item -LiteralPath $source -Destination (Join-Path $stage 'dbx.exe') -Force
+          Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $stage 'LICENSE') -Force
+          Copy-Item -LiteralPath 'packages\cli\README.md' -Destination (Join-Path $stage 'README.md') -Force
+          $zip = 'dbx-cli-win32-x64.zip'
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal -Force
+          Copy-Item -LiteralPath $zip -Destination (Join-Path $assets $zip) -Force
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath (Join-Path $assets 'CLI-SHA256SUMS') -Value "$hash  $zip" -Encoding utf8NoBOM
+          Copy-Item -LiteralPath $source -Destination (Join-Path $assets 'dbx.exe') -Force
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbx-next-cli-assets
+          path: ${{ runner.temp }}\cli-assets
+          if-no-files-found: error
+          retention-days: 7
+
+  desktop:
+    name: Build Desktop
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Check out the source ref
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: release
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid release tag: $tag" }
           $version = $tag.Substring(1)
           $packageVersion = (Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json).version
           $tauriVersion = (Get-Content -Raw -LiteralPath 'src-tauri\tauri.conf.json' | ConvertFrom-Json).version
-          if ($packageVersion -ne $version -or $tauriVersion -ne $version) {
-            throw "Tag $tag does not match package.json=$packageVersion and tauri.conf.json=$tauriVersion"
-          }
+          if ($packageVersion -ne $version -or $tauriVersion -ne $version) { throw "Version mismatch: $tag / $packageVersion / $tauriVersion" }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
-          Write-Host "Building DBX-Next $tag from $env:GITHUB_SHA"
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -57,14 +118,6 @@ jobs:
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v6
-
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          targets: x86_64-pc-windows-msvc
 
       - name: Resolve pnpm store path
         id: pnpm-store
@@ -79,219 +132,223 @@ jobs:
           restore-keys: |
             dbx-next-pnpm-${{ runner.os }}-
 
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: x86_64-pc-windows-msvc
+
       - name: Cache Rust dependencies and target
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "./ -> target"
-          shared-key: dbx-next-windows-x64
+          shared-key: dbx-next-desktop-windows-x64
           cache-targets: true
           cache-on-failure: true
 
-      - name: Build the DBX CLI native binary
-        shell: pwsh
-        run: |
-          cargo build --locked --package dbx-cli --no-default-features --features os-keyring --release --target x86_64-pc-windows-msvc
-          $cliSource = 'target\x86_64-pc-windows-msvc\release\dbx.exe'
-          if (-not (Test-Path -LiteralPath $cliSource)) { throw "Missing DBX CLI binary $cliSource" }
-          $cliStaging = Join-Path $env:RUNNER_TEMP 'dbx-next-cli.exe'
-          Copy-Item -LiteralPath $cliSource -Destination $cliStaging -Force
-          "DBX_CLI_STAGING=$cliStaging" >> $env:GITHUB_ENV
-          Write-Host "DBX CLI staged at $cliStaging"
-
-      - name: Validate release signing configuration
+      - name: Load Tauri updater signing key
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY_BASE64: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_BASE64)) {
-            throw 'Missing repository secret TAURI_SIGNING_PRIVATE_KEY_BASE64. Store the DBX-Next updater private key as a base64 secret; never commit it.'
-          }
-          try {
-            $keyBytes = [Convert]::FromBase64String($env:TAURI_SIGNING_PRIVATE_KEY_BASE64.Trim())
-          } catch {
-            throw 'TAURI_SIGNING_PRIVATE_KEY_BASE64 is not valid base64.'
-          }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_BASE64)) { throw 'Missing TAURI_SIGNING_PRIVATE_KEY_BASE64.' }
+          $keyBytes = [Convert]::FromBase64String($env:TAURI_SIGNING_PRIVATE_KEY_BASE64.Trim())
           $keyPath = Join-Path $env:RUNNER_TEMP 'dbx-next-updater.key'
           [IO.File]::WriteAllBytes($keyPath, $keyBytes)
           $keyText = [IO.File]::ReadAllText($keyPath)
           "TAURI_SIGNING_PRIVATE_KEY<<DBX_UPDATER_KEY" >> $env:GITHUB_ENV
           $keyText >> $env:GITHUB_ENV
           "DBX_UPDATER_KEY" >> $env:GITHUB_ENV
-          if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
-            "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> $env:GITHUB_ENV
-          } else {
-            "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" >> $env:GITHUB_ENV
-          }
-          Write-Host "Updater signing key loaded into the ephemeral runner workspace."
+          "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" >> $env:GITHUB_ENV
 
       - name: Run frontend checks
         run: pnpm typecheck
 
-      - name: Build signed Tauri installers and updater artifacts
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ steps.release.outputs.tag }}
-          releaseName: DBX-Next ${{ steps.release.outputs.tag }}
-          releaseBody: |
-            DBX-Next Windows x64 release.
+      - name: Build Tauri Desktop bundles
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --ci
 
-            Assets include the NSIS installer, MSI installer, portable executable/ZIP, and updater manifest.
-          releaseDraft: true
-          prerelease: false
-          args: --target x86_64-pc-windows-msvc --ci
-
-      - name: Verify Windows installers and updater signatures
-        id: bundles
+      - name: Verify and stage Desktop artifact
         shell: pwsh
         run: |
           $bundleRoot = 'target\x86_64-pc-windows-msvc\release\bundle'
-          $nsis = @(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'nsis') -Filter '*.exe' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*.sig' })
+          $nsis = @(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'nsis') -Filter '*.exe' -File -ErrorAction SilentlyContinue)
           $msi = @(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'msi') -Filter '*.msi' -File -ErrorAction SilentlyContinue)
           $sigs = @(Get-ChildItem -LiteralPath $bundleRoot -Recurse -Filter '*.sig' -File -ErrorAction SilentlyContinue)
-          if ($nsis.Count -ne 1) { throw "Expected one NSIS installer, found $($nsis.Count)" }
-          if ($msi.Count -ne 1) { throw "Expected one MSI installer, found $($msi.Count)" }
-          if ($sigs.Count -lt 2) { throw "Expected signed updater artifacts beside NSIS/MSI installers, found $($sigs.Count)" }
-          $exe = 'target\x86_64-pc-windows-msvc\release\dbx.exe'
-          if (-not (Test-Path -LiteralPath $exe)) { throw "Missing executable $exe" }
-          "nsis=$($nsis[0].FullName)" >> $env:GITHUB_OUTPUT
-          "msi=$($msi[0].FullName)" >> $env:GITHUB_OUTPUT
-          "exe=$exe" >> $env:GITHUB_OUTPUT
-          Write-Host "NSIS: $($nsis[0].Name)"
-          Write-Host "MSI: $($msi[0].Name)"
-          Write-Host "Updater signatures: $($sigs.Count)"
+          if ($nsis.Count -ne 1 -or $msi.Count -ne 1 -or $sigs.Count -lt 2) { throw 'Desktop bundle verification failed.' }
+          $desktopExe = 'target\x86_64-pc-windows-msvc\release\dbx.exe'
+          if (-not (Test-Path -LiteralPath $desktopExe)) { throw "Missing Desktop executable $desktopExe" }
+          $stage = Join-Path $env:RUNNER_TEMP 'desktop-assets'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -LiteralPath $nsis[0].FullName -Destination (Join-Path $stage $nsis[0].Name) -Force
+          Copy-Item -LiteralPath "$($nsis[0].FullName).sig" -Destination (Join-Path $stage "$($nsis[0].Name).sig") -Force
+          Copy-Item -LiteralPath $msi[0].FullName -Destination (Join-Path $stage $msi[0].Name) -Force
+          Copy-Item -LiteralPath "$($msi[0].FullName).sig" -Destination (Join-Path $stage "$($msi[0].Name).sig") -Force
+          Copy-Item -LiteralPath $desktopExe -Destination (Join-Path $stage 'DBX.exe') -Force
 
-      - name: Build and sign the portable package
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $version = '${{ steps.release.outputs.version }}'
-          $tag = '${{ steps.release.outputs.tag }}'
-          $exePath = '${{ steps.bundles.outputs.exe }}'
-          $portableDir = Join-Path $env:RUNNER_TEMP "dbx-portable-$version"
-          $portableCliDir = Join-Path $portableDir 'cli'
-          $zipName = "DBX_${version}_x64-portable.zip"
-          New-Item -ItemType Directory -Force -Path $portableDir,$portableCliDir | Out-Null
-          Copy-Item -LiteralPath $exePath -Destination (Join-Path $portableDir 'DBX.exe') -Force
-          Copy-Item -LiteralPath $env:DBX_CLI_STAGING -Destination (Join-Path $portableCliDir 'dbx.exe') -Force
-          @'
-          @echo off
-          set "DBX_DATA_DIR=%~dp0..\data"
-          "%~dp0dbx.exe" %*
-          '@ | Set-Content -LiteralPath (Join-Path $portableCliDir 'dbx-portable.cmd') -Encoding ascii
-          Copy-Item -LiteralPath 'packages\cli\README.md' -Destination (Join-Path $portableCliDir 'README.md') -Force
-          Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $portableDir 'LICENSE') -Force
-          Copy-Item -LiteralPath 'README.md' -Destination (Join-Path $portableDir 'README.md') -Force
-          Set-Content -LiteralPath (Join-Path $portableDir 'portable.dbx') -Value '' -NoNewline
-          $portableExe = Join-Path $portableDir 'DBX.exe'
-          $manifest = [ordered]@{
-            schema_version = 1
-            version = $version
-            arch = 'x64'
-            executable = 'DBX.exe'
-            executable_sha256 = (Get-FileHash -LiteralPath $portableExe -Algorithm SHA256).Hash.ToLowerInvariant()
-            source = 'DBX-Next GitHub Actions release'
-            source_commit = $env:GITHUB_SHA
-          } | ConvertTo-Json
-          Set-Content -LiteralPath (Join-Path $portableDir 'portable-update.json') -Value $manifest -Encoding utf8NoBOM
-          Compress-Archive -Path (Join-Path $portableDir '*') -DestinationPath $zipName -CompressionLevel Optimal -Force
-          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
-            pnpm tauri signer sign '--password=' $zipName
-          } else {
-            pnpm tauri signer sign $zipName
-          }
-          if (-not (Test-Path -LiteralPath "$zipName.sig")) { throw "Missing portable signature $zipName.sig" }
-
-          $rawName = "DBX_${version}_x64-portable.exe"
-          Copy-Item -LiteralPath $exePath -Destination $rawName -Force
-          $rawHash = (Get-FileHash -LiteralPath $rawName -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -LiteralPath "$rawName.sha256" -Value "$rawHash  $rawName" -Encoding utf8NoBOM
-
-          $cliPackageDir = Join-Path $env:RUNNER_TEMP "dbx-cli-win32-x64-$version"
-          New-Item -ItemType Directory -Force -Path $cliPackageDir | Out-Null
-          Copy-Item -LiteralPath $env:DBX_CLI_STAGING -Destination (Join-Path $cliPackageDir 'dbx.exe') -Force
-          Copy-Item -LiteralPath 'packages\cli\README.md' -Destination (Join-Path $cliPackageDir 'README.md') -Force
-          Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $cliPackageDir 'LICENSE') -Force
-          $cliZipName = 'dbx-cli-win32-x64.zip'
-          Compress-Archive -Path (Join-Path $cliPackageDir '*') -DestinationPath $cliZipName -CompressionLevel Optimal -Force
-          $cliHash = (Get-FileHash -LiteralPath $cliZipName -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -LiteralPath 'CLI-SHA256SUMS' -Value "$cliHash  $cliZipName" -Encoding utf8NoBOM
-
-          gh release upload $tag $zipName "$zipName.sig" $rawName "$rawName.sha256" $cliZipName 'CLI-SHA256SUMS' --repo $env:GITHUB_REPOSITORY --clobber
-
-      - name: Publish the DBX-Next updater manifest
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $version = '${{ steps.release.outputs.version }}'
-          $tag = '${{ steps.release.outputs.tag }}'
-          $nsis = Get-Item -LiteralPath '${{ steps.bundles.outputs.nsis }}'
-          $signaturePath = "$($nsis.FullName).sig"
-          if (-not (Test-Path -LiteralPath $signaturePath)) { throw "Missing NSIS updater signature $signaturePath" }
-          $signature = Get-Content -Raw -LiteralPath $signaturePath
-          $assetUrl = "https://github.com/xue-ding-e/DBX-Next/releases/download/$tag/$($nsis.Name)"
-          $latest = [ordered]@{
-            version = $version
-            notes = "DBX-Next $version"
-            pub_date = (Get-Date).ToUniversalTime().ToString('o')
-            platforms = [ordered]@{
-              'windows-x86_64' = [ordered]@{
-                signature = $signature.Trim()
-                url = $assetUrl
-              }
-            }
-          } | ConvertTo-Json -Depth 6
-          $latestPath = Join-Path $env:RUNNER_TEMP 'latest.json'
-          Set-Content -LiteralPath $latestPath -Value $latest -Encoding utf8NoBOM
-          gh release upload $tag $latestPath --repo $env:GITHUB_REPOSITORY --clobber
-
-      - name: Upload checksums for release assets
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $tag = '${{ steps.release.outputs.tag }}'
-          $files = @(
-            '${{ steps.bundles.outputs.nsis }}',
-            '${{ steps.bundles.outputs.msi }}',
-            "DBX_${{ steps.release.outputs.version }}_x64-portable.zip",
-            "DBX_${{ steps.release.outputs.version }}_x64-portable.exe"
-          ) | ForEach-Object { Get-Item -LiteralPath $_ }
-          $lines = $files | ForEach-Object {
-            "$( (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($_.Name)"
-          }
-          $sumPath = Join-Path $env:RUNNER_TEMP 'SHA256SUMS'
-          $lines | Set-Content -LiteralPath $sumPath -Encoding utf8NoBOM
-          gh release upload $tag $sumPath --repo $env:GITHUB_REPOSITORY --clobber
-
-      - name: Publish the draft release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $tag = '${{ steps.release.outputs.tag }}'
-          gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --prerelease=false
-          $assets = gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
-          $required = @('latest.json', 'SHA256SUMS', 'CLI-SHA256SUMS', 'dbx-cli-win32-x64.zip')
-          foreach ($name in $required) {
-            if ($assets -notcontains $name) { throw "Published release is missing $name" }
-          }
-          if (-not ($assets -match '-setup\.exe$')) { throw 'Published release is missing the NSIS setup executable' }
-          if (-not ($assets -match '\.msi$')) { throw 'Published release is missing the MSI installer' }
-          if (-not ($assets -match '-portable\.zip$')) { throw 'Published release is missing the portable ZIP' }
-          if (-not ($assets -match '-portable\.exe$')) { throw 'Published release is missing the portable executable' }
-          Write-Host "DBX-Next release $tag is public with installers, executable, portable package, checksums, and latest.json."
+      - name: Upload Desktop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbx-next-desktop-assets
+          path: ${{ runner.temp }}\desktop-assets
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Remove the ephemeral updater key
         if: always()
         shell: pwsh
         run: |
           $keyPath = Join-Path $env:RUNNER_TEMP 'dbx-next-updater.key'
-          if (Test-Path -LiteralPath $keyPath) {
-            [IO.File]::WriteAllBytes($keyPath, [byte[]]::new(0))
-            Remove-Item -LiteralPath $keyPath -Force
-          }
+          if (Test-Path -LiteralPath $keyPath) { [IO.File]::WriteAllBytes($keyPath, [byte[]]::new(0)); Remove-Item -LiteralPath $keyPath -Force }
+
+  publish:
+    name: Publish Release
+    needs: [cli, desktop]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Check out the source ref
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: release
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid release tag: $tag" }
+          $version = $tag.Substring(1)
+          $packageVersion = (Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json).version
+          if ($packageVersion -ne $version) { throw "Version mismatch: $tag / $packageVersion" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Resolve pnpm store path
+        id: pnpm-store
+        shell: pwsh
+        run: "\"path=$(pnpm store path --silent)\" >> $env:GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: dbx-next-pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            dbx-next-pnpm-${{ runner.os }}-
+
+      - name: Install dependencies for Tauri signer
+        run: pnpm install --frozen-lockfile
+
+      - name: Download CLI and Desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dbx-next-*-assets
+          path: ${{ runner.temp }}\build-assets
+          merge-multiple: false
+
+      - name: Load Tauri updater signing key
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_BASE64: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_BASE64)) { throw 'Missing TAURI_SIGNING_PRIVATE_KEY_BASE64.' }
+          $keyBytes = [Convert]::FromBase64String($env:TAURI_SIGNING_PRIVATE_KEY_BASE64.Trim())
+          $keyPath = Join-Path $env:RUNNER_TEMP 'dbx-next-updater.key'
+          [IO.File]::WriteAllBytes($keyPath, $keyBytes)
+          $keyText = [IO.File]::ReadAllText($keyPath)
+          "TAURI_SIGNING_PRIVATE_KEY<<DBX_UPDATER_KEY" >> $env:GITHUB_ENV
+          $keyText >> $env:GITHUB_ENV
+          "DBX_UPDATER_KEY" >> $env:GITHUB_ENV
+          "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" >> $env:GITHUB_ENV
+
+      - name: Assemble and sign portable package
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.release.outputs.tag }}'
+          $version = '${{ steps.release.outputs.version }}'
+          $root = Join-Path $env:RUNNER_TEMP 'build-assets'
+          $cliRoot = Join-Path $root 'dbx-next-cli-assets'
+          $desktopRoot = Join-Path $root 'dbx-next-desktop-assets'
+          $desktopExe = Join-Path $desktopRoot 'DBX.exe'
+          $cliExe = Join-Path $cliRoot 'dbx.exe'
+          $nsis = Get-ChildItem -LiteralPath $desktopRoot -Filter '*-setup.exe' -File | Select-Object -First 1
+          $msi = Get-ChildItem -LiteralPath $desktopRoot -Filter '*.msi' -File | Select-Object -First 1
+          if (-not $nsis -or -not $msi -or -not (Test-Path -LiteralPath $desktopExe) -or -not (Test-Path -LiteralPath $cliExe)) { throw 'Build artifacts are incomplete.' }
+          $portable = Join-Path $env:RUNNER_TEMP "dbx-portable-$version"
+          $portableCli = Join-Path $portable 'cli'
+          New-Item -ItemType Directory -Force -Path $portable,$portableCli | Out-Null
+          Copy-Item -LiteralPath $desktopExe -Destination (Join-Path $portable 'DBX.exe') -Force
+          Copy-Item -LiteralPath $cliExe -Destination (Join-Path $portableCli 'dbx.exe') -Force
+          Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $portable 'LICENSE') -Force
+          Copy-Item -LiteralPath 'README.md' -Destination (Join-Path $portable 'README.md') -Force
+          Copy-Item -LiteralPath 'packages\cli\README.md' -Destination (Join-Path $portableCli 'README.md') -Force
+          Set-Content -LiteralPath (Join-Path $portable 'portable.dbx') -Value '' -NoNewline
+          @'
+          @echo off
+          set "DBX_DATA_DIR=%~dp0..\data"
+          "%~dp0dbx.exe" %*
+          '@ | Set-Content -LiteralPath (Join-Path $portableCli 'dbx-portable.cmd') -Encoding ascii
+          $manifest = [ordered]@{ schema_version = 1; version = $version; arch = 'x64'; executable = 'DBX.exe'; executable_sha256 = (Get-FileHash -LiteralPath (Join-Path $portable 'DBX.exe') -Algorithm SHA256).Hash.ToLowerInvariant(); source = 'DBX-Next GitHub Actions release'; source_commit = $env:GITHUB_SHA } | ConvertTo-Json
+          Set-Content -LiteralPath (Join-Path $portable 'portable-update.json') -Value $manifest -Encoding utf8NoBOM
+          $portableZip = "DBX_${version}_x64-portable.zip"
+          Compress-Archive -Path (Join-Path $portable '*') -DestinationPath $portableZip -CompressionLevel Optimal -Force
+          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) { pnpm tauri signer sign '--password=' $portableZip } else { pnpm tauri signer sign $portableZip }
+          if (-not (Test-Path -LiteralPath "$portableZip.sig")) { throw "Missing $portableZip.sig" }
+          $rawName = "DBX_${version}_x64-portable.exe"
+          Copy-Item -LiteralPath $desktopExe -Destination $rawName -Force
+          $rawHash = (Get-FileHash -LiteralPath $rawName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$rawName.sha256" -Value "$rawHash  $rawName" -Encoding utf8NoBOM
+          $signature = Get-Content -Raw -LiteralPath (Join-Path $desktopRoot "$($nsis.Name).sig")
+          $latest = [ordered]@{ version = $version; notes = "DBX-Next $version"; pub_date = (Get-Date).ToUniversalTime().ToString('o'); platforms = [ordered]@{ 'windows-x86_64' = [ordered]@{ signature = $signature.Trim(); url = "https://github.com/xue-ding-e/DBX-Next/releases/download/$tag/$($nsis.Name)" } } } | ConvertTo-Json -Depth 6
+          $latest | Set-Content -LiteralPath 'latest.json' -Encoding utf8NoBOM
+          $sumFiles = @((Get-Item -LiteralPath (Join-Path $desktopRoot $nsis.Name)), (Get-Item -LiteralPath (Join-Path $desktopRoot $msi.Name)), (Get-Item -LiteralPath $portableZip), (Get-Item -LiteralPath $rawName))
+          $sumFiles | ForEach-Object { "$( (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($_.Name)" } | Set-Content -LiteralPath 'SHA256SUMS' -Encoding utf8NoBOM
+
+      - name: Create or reuse draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ steps.release.outputs.tag }}'
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) { gh release create $tag --repo $env:GITHUB_REPOSITORY --draft --title "DBX-Next $tag" --notes 'DBX-Next Windows x64 release.' --target $env:GITHUB_SHA }
+
+      - name: Upload and publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ steps.release.outputs.tag }}'
+          $version = '${{ steps.release.outputs.version }}'
+          $desktopRoot = Join-Path $env:RUNNER_TEMP 'build-assets\dbx-next-desktop-assets'
+          $cliRoot = Join-Path $env:RUNNER_TEMP 'build-assets\dbx-next-cli-assets'
+          $upload = @()
+          $upload += (Get-ChildItem -LiteralPath $desktopRoot -File | ForEach-Object { $_.FullName })
+          $upload += (Get-ChildItem -LiteralPath $cliRoot -File | Where-Object { $_.Name -in @('dbx-cli-win32-x64.zip','CLI-SHA256SUMS') } | ForEach-Object { $_.FullName })
+          $upload += "DBX_${version}_x64-portable.zip", "DBX_${version}_x64-portable.zip.sig", "DBX_${version}_x64-portable.exe", "DBX_${version}_x64-portable.exe.sha256", 'latest.json', 'SHA256SUMS'
+          gh release upload $tag $upload --repo $env:GITHUB_REPOSITORY --clobber
+          gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --prerelease=false
+          $names = gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
+          $required = @('latest.json','SHA256SUMS','CLI-SHA256SUMS','dbx-cli-win32-x64.zip',"DBX_${version}_x64-setup.exe", "DBX_${version}_x64_en-US.msi", "DBX_${version}_x64-portable.zip", "DBX_${version}_x64-portable.exe")
+          foreach ($name in $required) { if ($names -notcontains $name) { throw "Published release is missing $name" } }
+          Write-Host "Published DBX-Next $tag from parallel CLI/Desktop jobs."
+
+      - name: Remove the ephemeral updater key
+        if: always()
+        shell: pwsh
+        run: |
+          $keyPath = Join-Path $env:RUNNER_TEMP 'dbx-next-updater.key'
+          if (Test-Path -LiteralPath $keyPath) { [IO.File]::WriteAllBytes($keyPath, [byte[]]::new(0)); Remove-Item -LiteralPath $keyPath -Force }
