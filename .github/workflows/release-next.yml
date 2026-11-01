@@ -63,6 +63,17 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Build the DBX CLI native binary
+        shell: pwsh
+        run: |
+          cargo build --locked --package dbx-cli --no-default-features --release --target x86_64-pc-windows-msvc
+          $cliSource = 'target\x86_64-pc-windows-msvc\release\dbx.exe'
+          if (-not (Test-Path -LiteralPath $cliSource)) { throw "Missing DBX CLI binary $cliSource" }
+          $cliStaging = Join-Path $env:RUNNER_TEMP 'dbx-next-cli.exe'
+          Copy-Item -LiteralPath $cliSource -Destination $cliStaging -Force
+          "DBX_CLI_STAGING=$cliStaging" >> $env:GITHUB_ENV
+          Write-Host "DBX CLI staged at $cliStaging"
+
       - name: Validate release signing configuration
         shell: pwsh
         env:
@@ -80,7 +91,6 @@ jobs:
           $keyPath = Join-Path $env:RUNNER_TEMP 'dbx-next-updater.key'
           [IO.File]::WriteAllBytes($keyPath, $keyBytes)
           "TAURI_SIGNING_PRIVATE_KEY_PATH=$keyPath" >> $env:GITHUB_ENV
-          "TAURI_SIGNING_PRIVATE_KEY=$keyPath" >> $env:GITHUB_ENV
           if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
             "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> $env:GITHUB_ENV
           } else {
@@ -135,9 +145,17 @@ jobs:
           $tag = '${{ steps.release.outputs.tag }}'
           $exePath = '${{ steps.bundles.outputs.exe }}'
           $portableDir = Join-Path $env:RUNNER_TEMP "dbx-portable-$version"
+          $portableCliDir = Join-Path $portableDir 'cli'
           $zipName = "DBX_${version}_x64-portable.zip"
-          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $portableDir,$portableCliDir | Out-Null
           Copy-Item -LiteralPath $exePath -Destination (Join-Path $portableDir 'DBX.exe') -Force
+          Copy-Item -LiteralPath $env:DBX_CLI_STAGING -Destination (Join-Path $portableCliDir 'dbx.exe') -Force
+          @'
+          @echo off
+          set "DBX_DATA_DIR=%~dp0..\data"
+          "%~dp0dbx.exe" %*
+          '@ | Set-Content -LiteralPath (Join-Path $portableCliDir 'dbx-portable.cmd') -Encoding ascii
+          Copy-Item -LiteralPath 'packages\cli\README.md' -Destination (Join-Path $portableCliDir 'README.md') -Force
           Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $portableDir 'LICENSE') -Force
           Copy-Item -LiteralPath 'README.md' -Destination (Join-Path $portableDir 'README.md') -Force
           Set-Content -LiteralPath (Join-Path $portableDir 'portable.dbx') -Value '' -NoNewline
@@ -165,7 +183,17 @@ jobs:
           $rawHash = (Get-FileHash -LiteralPath $rawName -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath "$rawName.sha256" -Value "$rawHash  $rawName" -Encoding utf8NoBOM
 
-          gh release upload $tag $zipName "$zipName.sig" $rawName "$rawName.sha256" --repo $env:GITHUB_REPOSITORY --clobber
+          $cliPackageDir = Join-Path $env:RUNNER_TEMP "dbx-cli-win32-x64-$version"
+          New-Item -ItemType Directory -Force -Path $cliPackageDir | Out-Null
+          Copy-Item -LiteralPath $env:DBX_CLI_STAGING -Destination (Join-Path $cliPackageDir 'dbx.exe') -Force
+          Copy-Item -LiteralPath 'packages\cli\README.md' -Destination (Join-Path $cliPackageDir 'README.md') -Force
+          Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $cliPackageDir 'LICENSE') -Force
+          $cliZipName = 'dbx-cli-win32-x64.zip'
+          Compress-Archive -Path (Join-Path $cliPackageDir '*') -DestinationPath $cliZipName -CompressionLevel Optimal -Force
+          $cliHash = (Get-FileHash -LiteralPath $cliZipName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath 'CLI-SHA256SUMS' -Value "$cliHash  $cliZipName" -Encoding utf8NoBOM
+
+          gh release upload $tag $zipName "$zipName.sig" $rawName "$rawName.sha256" $cliZipName 'CLI-SHA256SUMS' --repo $env:GITHUB_REPOSITORY --clobber
 
       - name: Publish the DBX-Next updater manifest
         shell: pwsh
@@ -221,7 +249,7 @@ jobs:
           $tag = '${{ steps.release.outputs.tag }}'
           gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --prerelease=false
           $assets = gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
-          $required = @('latest.json', 'SHA256SUMS')
+          $required = @('latest.json', 'SHA256SUMS', 'CLI-SHA256SUMS', 'dbx-cli-win32-x64.zip')
           foreach ($name in $required) {
             if ($assets -notcontains $name) { throw "Published release is missing $name" }
           }
