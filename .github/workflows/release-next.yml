@@ -93,7 +93,10 @@ jobs:
           }
           $keyPath = Join-Path $env:RUNNER_TEMP 'dbx-next-updater.key'
           [IO.File]::WriteAllBytes($keyPath, $keyBytes)
-          "TAURI_SIGNING_PRIVATE_KEY_PATH=$keyPath" >> $env:GITHUB_ENV
+          $keyText = [IO.File]::ReadAllText($keyPath)
+          "TAURI_SIGNING_PRIVATE_KEY<<DBX_UPDATER_KEY" >> $env:GITHUB_ENV
+          $keyText >> $env:GITHUB_ENV
+          "DBX_UPDATER_KEY" >> $env:GITHUB_ENV
           if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
             "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> $env:GITHUB_ENV
           } else {
