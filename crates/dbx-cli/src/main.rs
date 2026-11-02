@@ -112,6 +112,7 @@ struct Flags {
     skills_dir: Option<PathBuf>,
     allow_writes: bool,
     allow_dangerous: bool,
+    single_transaction: bool,
     force: bool,
     yes: bool,
     help: bool,
@@ -419,6 +420,7 @@ async fn run_query(backend: &dyn DbxBackend, flags: &Flags) -> Result<String, Cl
             statements.len(),
             flags.max_rows,
             timeout_secs,
+            flags.single_transaction,
             connection_name,
             flags.format,
         )
@@ -442,6 +444,10 @@ async fn run_query(backend: &dyn DbxBackend, flags: &Flags) -> Result<String, Cl
 ///
 /// Multi-statement input is therefore routed here: either all statements run, or
 /// the command fails and says which one did.
+///
+/// With `use_transaction` the whole script also commits atomically, so a failure
+/// leaves no partially applied script behind.
+#[allow(clippy::too_many_arguments)]
 async fn run_multi_statement(
     backend: &dyn DbxBackend,
     connection: &ConnectionConfig,
@@ -450,6 +456,7 @@ async fn run_multi_statement(
     statement_count: usize,
     max_rows: Option<usize>,
     timeout_secs: Option<u64>,
+    use_transaction: bool,
     connection_name: &str,
     format: OutputFormat,
 ) -> Result<String, CliError> {
@@ -459,10 +466,24 @@ async fn run_multi_statement(
             database,
             None,
             sql,
-            QueryExecutionOptions { max_rows, timeout_secs, ..Default::default() },
+            QueryExecutionOptions {
+                max_rows,
+                timeout_secs,
+                use_transaction: use_transaction.then_some(true),
+                ..Default::default()
+            },
         )
         .await
-        .map_err(command_error)?;
+        .map_err(|message| {
+            // A transaction-mode batch fails as one unit, so the backend returns a
+            // merged error instead of per-statement results. Keep one stable code
+            // so callers do not have to special-case the two modes.
+            if use_transaction {
+                CliError::new("BATCH_FAILED", message)
+            } else {
+                command_error(message)
+            }
+        })?;
 
     if let Some(index) = results.iter().position(|result| result.execution_error) {
         let detail = results[index].error_message.as_deref().unwrap_or("statement failed").trim().to_string();
@@ -472,7 +493,7 @@ async fn run_multi_statement(
         ));
     }
 
-    format_multi_statement(connection_name, &results, format)
+    format_multi_statement(connection_name, &results, use_transaction, format)
 }
 
 fn truncate_query_result(result: &mut QueryResult, max_rows: Option<usize>) {
@@ -688,6 +709,7 @@ fn parse_flags(argv: &[String]) -> Result<Flags, CliError> {
         skills_dir: None,
         allow_writes: false,
         allow_dangerous: false,
+        single_transaction: false,
         force: false,
         yes: false,
         help: false,
@@ -743,6 +765,7 @@ fn parse_flags(argv: &[String]) -> Result<Flags, CliError> {
             "--skills-dir" => flags.skills_dir = Some(PathBuf::from(option_value(argv, &mut index, "--skills-dir")?)),
             "--allow-writes" => flags.allow_writes = true,
             "--allow-dangerous-sql" => flags.allow_dangerous = true,
+            "--single-transaction" => flags.single_transaction = true,
             "--force" => flags.force = true,
             "--yes" => flags.yes = true,
             value if value.starts_with('-') => {
@@ -826,6 +849,9 @@ fn validate_agent_only_flags(flags: &Flags) -> Result<(), CliError> {
     }
     if flags.force {
         return Err(CliError::new("INVALID_OPTION", "--force is only supported by dbx agent setup."));
+    }
+    if flags.single_transaction && !flags.args.first().is_some_and(|arg| arg == "query") {
+        return Err(CliError::new("INVALID_OPTION", "--single-transaction is only supported by dbx query."));
     }
     Ok(())
 }
@@ -1009,6 +1035,7 @@ fn format_query_messages(messages: &[QueryMessage]) -> String {
 fn format_multi_statement(
     connection: &str,
     results: &[BatchStatementResult],
+    use_transaction: bool,
     format: OutputFormat,
 ) -> Result<String, CliError> {
     let statements: Vec<Value> = results
@@ -1043,6 +1070,7 @@ fn format_multi_statement(
         return json_string(&json!({
             "connection": connection,
             "statement_count": results.len(),
+            "use_transaction": use_transaction,
             "statements": statements,
         }));
     }
@@ -1068,7 +1096,14 @@ fn format_multi_statement(
     let mut output = String::new();
     for (index, entry) in results.iter().enumerate() {
         let result = &entry.result;
-        output.push_str(&format!("-- statement {}/{}\n", index + 1, results.len()));
+        // A transaction-mode batch reports one merged outcome for the whole script,
+        // so labelling it with a statement index would suggest the others were
+        // skipped. Only auto-commit mode has genuinely per-statement results.
+        if use_transaction {
+            output.push_str("-- script committed as one transaction\n");
+        } else {
+            output.push_str(&format!("-- statement {}/{}\n", index + 1, results.len()));
+        }
         if result.columns.is_empty() {
             output.push_str(&format!("Query executed. {} row(s) affected.\n", result.affected_rows));
         } else {
@@ -1251,7 +1286,7 @@ fn csv_cell(value: &str) -> String {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  dbx doctor [--json]\n  dbx capabilities [--json]\n  dbx agent setup [--skills-dir path] [--force] [--json]\n  dbx agent status [--skills-dir path] [--json]\n  dbx connections list [--json]\n  dbx connections get <id-or-name> [--json]\n  dbx connections import --file <path|-> [--passphrase-file <path|->] [--initialize] [--yes] [--json]\n  dbx connections import-meatshell --file - --plan <owner-only-plan.json> [--yes] [--json]\n  dbx connections add --file <path|-> [--json]\n  dbx connections update <id-or-name> --file <path|-> [--json]\n  dbx connections update-route --plan <owner-only.json> --file - [--yes] [--json]\n  dbx connections remove <id-or-name> --yes [--json]\n  dbx schema list <connection> [--schema name] [--json]\n  dbx schema describe <connection> <table> [--schema name] [--json]\n  dbx query <connection> <sql> [--file path] [--limit n] [--timeout 10s] [--allow-writes] [--allow-dangerous-sql] [--json]\n  dbx context <connection> [--schema name] [--tables a,b] [--max-tables n] [--json]\n  dbx dbml <connection> [--out path] [--notes path] [--schema name] [--database name] [--tables a,b]\n  dbx docs <connection> [--out path] [--notes path] [--lang code] [--schema name] [--database name] [--tables a,b]\n  dbx open <connection> <table> [--schema name] [--database name] [--json]"
+    "Usage:\n  dbx doctor [--json]\n  dbx capabilities [--json]\n  dbx agent setup [--skills-dir path] [--force] [--json]\n  dbx agent status [--skills-dir path] [--json]\n  dbx connections list [--json]\n  dbx connections get <id-or-name> [--json]\n  dbx connections import --file <path|-> [--passphrase-file <path|->] [--initialize] [--yes] [--json]\n  dbx connections import-meatshell --file - --plan <owner-only-plan.json> [--yes] [--json]\n  dbx connections add --file <path|-> [--json]\n  dbx connections update <id-or-name> --file <path|-> [--json]\n  dbx connections update-route --plan <owner-only.json> --file - [--yes] [--json]\n  dbx connections remove <id-or-name> --yes [--json]\n  dbx schema list <connection> [--schema name] [--json]\n  dbx schema describe <connection> <table> [--schema name] [--json]\n  dbx query <connection> <sql> [--file path] [--limit n] [--timeout 10s] [--allow-writes] [--allow-dangerous-sql] [--single-transaction] [--json]\n  dbx context <connection> [--schema name] [--tables a,b] [--max-tables n] [--json]\n  dbx dbml <connection> [--out path] [--notes path] [--schema name] [--database name] [--tables a,b]\n  dbx docs <connection> [--out path] [--notes path] [--lang code] [--schema name] [--database name] [--tables a,b]\n  dbx open <connection> <table> [--schema name] [--database name] [--json]"
 }
 
 #[cfg(test)]
@@ -1416,6 +1451,24 @@ mod tests {
     fn preserves_double_dash_sql() {
         let flags = parse_flags(&args(&["query", "local", "--json", "--", "-- comment\nselect 1"])).unwrap();
         assert_eq!(flags.args, args(&["query", "local", "-- comment\nselect 1"]));
+    }
+
+    #[test]
+    fn parses_single_transaction_flag_for_query() {
+        let flags = parse_flags(&args(&["query", "local", "--file", "script.sql", "--single-transaction"])).unwrap();
+        assert!(flags.single_transaction);
+        assert!(validate_agent_only_flags(&flags).is_ok());
+    }
+
+    #[test]
+    fn rejects_single_transaction_outside_query() {
+        let flags = parse_flags(&args(&["schema", "list", "local", "--single-transaction"])).unwrap();
+        assert_eq!(validate_agent_only_flags(&flags).unwrap_err().code, "INVALID_OPTION");
+    }
+
+    #[test]
+    fn single_transaction_is_documented_in_usage() {
+        assert!(usage().contains("--single-transaction"));
     }
 
     #[test]
