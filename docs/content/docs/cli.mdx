@@ -191,6 +191,22 @@ dbx query local "update users set name = 'Ada' where id = 1" --allow-writes
 
 Dangerous SQL such as `DROP`, `TRUNCATE`, and `ALTER` requires both `--allow-writes` and `--allow-dangerous-sql`. Explicit transaction statements remain blocked by CLI; use [MCP stateful sessions](/en/docs/mcp#stateful-query-sessions) or the DBX editor for pinned multi-step sessions.
 
+### Multi-statement scripts
+
+`dbx query` executes every statement in the supplied SQL, splitting with a
+dialect-aware parser so semicolons inside string literals, comments, and stored
+procedures do not break the batch. Each statement is reported separately, and a
+failing statement names its position and exits non-zero:
+
+```bash
+dbx query local --file ./migration.sql --json
+```
+
+JSON output gains `statement_count` and a `statements` array. Single-statement
+input keeps the original flat shape, so existing scripts and pipelines are
+unaffected. CSV output emits the last statement that returned columns, because a
+CSV document cannot carry several result sets.
+
 Writes and DDL against production databases remain blocked even when both flags are present. Production detection, SQL risk classification, connection read-only protection, and database privileges form independent upper bounds; the flags are not a production bypass.
 
 ## SQL Starting With a Dash

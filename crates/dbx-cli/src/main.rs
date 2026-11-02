@@ -6,12 +6,14 @@ use std::{env, path::PathBuf, process::ExitCode, sync::Arc};
 use dbx_core::{
     models::connection::{ConnectionConfig, DatabaseType},
     production_safety::{is_production_database, targets_production_database},
+    query::QueryExecutionOptions,
+    sql::split_sql_statements_for_database,
     sql_risk::{classify_sql_risk_for_database, SqlRisk},
     storage::Storage,
     types::{ColumnInfo, QueryMessage, QueryResult, TableInfo},
 };
 use dbx_mcp::{
-    backend::DocsSnapshotOptions,
+    backend::{BatchStatementResult, DocsSnapshotOptions},
     mongo::{self, MongoSafetyError},
     DbxBackend, LocalBackend, WebBackend,
 };
@@ -407,11 +409,70 @@ async fn run_query(backend: &dyn DbxBackend, flags: &Flags) -> Result<String, Cl
         return Err(CliError::new("SQL_BLOCKED", "Writes and DDL are blocked for production databases."));
     }
     let timeout_secs = flags.timeout_ms.map(|value| value.div_ceil(1000));
+    let statements = split_sql_statements_for_database(&sql, connection.db_type);
+    if statements.len() > 1 {
+        return run_multi_statement(
+            backend,
+            &connection,
+            &database,
+            &sql,
+            statements.len(),
+            flags.max_rows,
+            timeout_secs,
+            connection_name,
+            flags.format,
+        )
+        .await;
+    }
     let result = backend
         .execute_query(&connection, &database, &sql, flags.max_rows, timeout_secs)
         .await
         .map_err(command_error)?;
     format_query(connection_name, &result, flags.format)
+}
+
+/// Execute a script whose text contains more than one statement.
+///
+/// `dbx query` previously handed the whole string to [`DbxBackend::execute_query`],
+/// which runs only the first statement and discards the rest. The risk
+/// classifier, however, already scored **every** statement (`classify_sql_risk`
+/// returns the highest risk across the script). That mismatch made a script such
+/// as `select 1; insert into t ...` report success while performing only the
+/// read, so a caller could believe a migration ran when it did not.
+///
+/// Multi-statement input is therefore routed here: either all statements run, or
+/// the command fails and says which one did.
+async fn run_multi_statement(
+    backend: &dyn DbxBackend,
+    connection: &ConnectionConfig,
+    database: &str,
+    sql: &str,
+    statement_count: usize,
+    max_rows: Option<usize>,
+    timeout_secs: Option<u64>,
+    connection_name: &str,
+    format: OutputFormat,
+) -> Result<String, CliError> {
+    let results = backend
+        .execute_batch(
+            connection,
+            database,
+            None,
+            sql,
+            QueryExecutionOptions { max_rows, timeout_secs, ..Default::default() },
+        )
+        .await
+        .map_err(command_error)?;
+
+    if let Some(index) = results.iter().position(|result| result.execution_error) {
+        let detail = results[index].error_message.as_deref().unwrap_or("statement failed").trim().to_string();
+        return Err(CliError::new(
+            "BATCH_FAILED",
+            format!("Statement {} of {} failed: {detail}", index + 1, statement_count),
+        ));
+    }
+
+    format_multi_statement(connection_name, &results, format)
 }
 
 fn truncate_query_result(result: &mut QueryResult, max_rows: Option<usize>) {
@@ -940,6 +1001,99 @@ fn format_query_messages(messages: &[QueryMessage]) -> String {
     output
 }
 
+/// Render the per-statement results of a multi-statement script.
+///
+/// A single-statement script keeps its historical flat shape, so scripts that are
+/// merely terminated with `;` do not change their output. Only genuine
+/// multi-statement input switches to the per-statement envelope.
+fn format_multi_statement(
+    connection: &str,
+    results: &[BatchStatementResult],
+    format: OutputFormat,
+) -> Result<String, CliError> {
+    let statements: Vec<Value> = results
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let result = &entry.result;
+            let rows: Vec<Value> = result
+                .rows
+                .iter()
+                .map(|values| {
+                    Value::Object(
+                        result.columns.iter().cloned().zip(values.iter().cloned()).collect::<Map<String, Value>>(),
+                    )
+                })
+                .collect();
+            let row_count = if result.columns.is_empty() { result.affected_rows } else { result.rows.len() as u64 };
+            let mut statement = json!({
+                "statement_index": index,
+                "columns": result.columns,
+                "rows": rows,
+                "row_count": row_count,
+            });
+            if !result.messages.is_empty() {
+                statement["messages"] = json!(result.messages);
+            }
+            statement
+        })
+        .collect();
+
+    if format == OutputFormat::Json {
+        return json_string(&json!({
+            "connection": connection,
+            "statement_count": results.len(),
+            "statements": statements,
+        }));
+    }
+    if format == OutputFormat::Csv {
+        // CSV cannot represent several result sets; emit the last result that has
+        // columns (matching conventional script runners) or an empty table.
+        let Some(last) = results.iter().rev().find(|entry| !entry.result.columns.is_empty()) else {
+            return Ok(String::new());
+        };
+        let rows: Vec<Value> = last
+            .result
+            .rows
+            .iter()
+            .map(|values| {
+                Value::Object(
+                    last.result.columns.iter().cloned().zip(values.iter().cloned()).collect::<Map<String, Value>>(),
+                )
+            })
+            .collect();
+        return Ok(csv_table(&last.result.columns.iter().map(String::as_str).collect::<Vec<_>>(), &rows));
+    }
+
+    let mut output = String::new();
+    for (index, entry) in results.iter().enumerate() {
+        let result = &entry.result;
+        output.push_str(&format!("-- statement {}/{}\n", index + 1, results.len()));
+        if result.columns.is_empty() {
+            output.push_str(&format!("Query executed. {} row(s) affected.\n", result.affected_rows));
+        } else {
+            let rows: Vec<Value> = result
+                .rows
+                .iter()
+                .map(|values| {
+                    Value::Object(
+                        result.columns.iter().cloned().zip(values.iter().cloned()).collect::<Map<String, Value>>(),
+                    )
+                })
+                .collect();
+            output.push_str(&markdown_table(
+                &result.columns.iter().map(String::as_str).collect::<Vec<_>>(),
+                &rows,
+                &result.columns.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            output.push('\n');
+        }
+        output.push_str(&format_query_messages(&result.messages));
+        output.push('\n');
+    }
+    Ok(output)
+}
+
 fn format_capabilities(format: OutputFormat) -> Result<String, CliError> {
     match format {
         OutputFormat::Json => json_string(
@@ -1262,6 +1416,23 @@ mod tests {
     fn preserves_double_dash_sql() {
         let flags = parse_flags(&args(&["query", "local", "--json", "--", "-- comment\nselect 1"])).unwrap();
         assert_eq!(flags.args, args(&["query", "local", "-- comment\nselect 1"]));
+    }
+
+    #[test]
+    fn multi_statement_scripts_are_detected_before_execution() {
+        // The regression this guards: `dbx query` used to pass the whole string to
+        // execute_query, which runs only the first statement, while the risk
+        // classifier scored every statement. A script therefore looked successful
+        // after executing a fraction of what it contained.
+        let script = "insert into t values (1);\ninsert into t values (2);";
+        assert_eq!(split_sql_statements_for_database(script, DatabaseType::Sqlite).len(), 2);
+
+        // A single statement with a trailing semicolon must stay on the flat path
+        // so existing one-query output does not change shape.
+        assert_eq!(split_sql_statements_for_database("select 1;\n", DatabaseType::Sqlite).len(), 1);
+
+        // Semicolons inside a literal are not statement separators.
+        assert_eq!(split_sql_statements_for_database("select ';' as semi;\nselect 2", DatabaseType::Sqlite).len(), 2);
     }
 
     #[test]
