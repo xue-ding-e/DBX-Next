@@ -201,6 +201,14 @@ dbx query local --file ./migration.sql --json
 
 JSON 输出新增 `statement_count` 和 `statements` 数组。单条语句仍保持原有的扁平结构，因此现有脚本与管道不受影响。CSV 输出只返回最后一条有结果列的语句，因为一个 CSV 文档无法承载多个结果集。
 
+加上 `--single-transaction` 可让整个脚本原子提交：
+
+```bash
+dbx query local --file ./migration.sql --single-transaction --allow-writes
+```
+
+这与 psql 的同名参数一致：脚本要么全部生效，要么不留痕迹。不加该参数时每条语句独立自动提交，因此后续语句失败不会回滚此前的写入。
+
 生产数据库上的写入和 DDL 即使传入两个允许参数也会被阻止。CLI 使用连接/数据库生产识别、SQL 风险分类、连接只读保护和数据库权限形成多层边界；允许参数不是绕过生产保护的开关。
 
 ## 以短横线开头的 SQL

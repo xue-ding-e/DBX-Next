@@ -207,6 +207,16 @@ input keeps the original flat shape, so existing scripts and pipelines are
 unaffected. CSV output emits the last statement that returned columns, because a
 CSV document cannot carry several result sets.
 
+Add `--single-transaction` to commit the whole script atomically:
+
+```bash
+dbx query local --file ./migration.sql --single-transaction --allow-writes
+```
+
+This mirrors psql's flag of the same name: the script either applies completely
+or leaves nothing behind. Without it each statement auto-commits, so a later
+failure does not undo earlier writes.
+
 Writes and DDL against production databases remain blocked even when both flags are present. Production detection, SQL risk classification, connection read-only protection, and database privileges form independent upper bounds; the flags are not a production bypass.
 
 ## SQL Starting With a Dash
