@@ -1,0 +1,64 @@
+name: DBX PR1 statement index validation
+
+on:
+  push:
+    branches:
+      - ci/validate-dbx-statement-index-pr1-20261103
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dbx-statement-index-pr1-validation-20261103
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'xue-ding-e/DBX-Next' && github.ref == 'refs/heads/ci/validate-dbx-statement-index-pr1-20261103'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_MIN_STACK: '8388608'
+    steps:
+      - name: Check out the exact validation commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Record source and available resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation-evidence
+          git rev-parse HEAD HEAD^ | tee validation-evidence/source.txt
+          test "$(git show -s --format=%P HEAD | wc -w)" -eq 1
+          test "$(git rev-parse HEAD^)" = 205344aafb233d20fbefde94a9a047efe7c619da
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=no)"
+          sha256sum crates/dbx-cli/src/main.rs crates/dbx-core/src/query/mod.rs .github/workflows/validate-statement-index.yml .github/scripts/validate-statement-index.sh > validation-evidence/source-sha256.txt
+          free -h | tee validation-evidence/memory.txt
+          df -h . | tee validation-evidence/disk.txt
+      - name: Select the pinned official Rust toolchain
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
+          rustc +1.99.1 --version | tee validation-evidence/rustc.txt
+          cargo +1.99.1 --version | tee validation-evidence/cargo.txt
+      - name: Run only synthetic production-function regressions
+        shell: bash
+        run: bash .github/scripts/validate-statement-index.sh
+      - name: Upload validation evidence only
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dbx-pr1-statement-index-validation-${{ github.run_id }}
+          path: validation-evidence/
+          if-no-files-found: error
+          retention-days: 3

@@ -334,7 +334,6 @@ impl ExecuteMultiResult {
         }
     }
 
-    #[cfg(test)]
     fn execution_error_with_index(result: db::QueryResult, statement_index: usize) -> Self {
         let error = error_from_query_result(&result);
         Self {
@@ -3761,7 +3760,10 @@ where
     let table_data_preview = executor.table_data_preview();
     while statement_index < statements.len() {
         if is_canceled(&cancel_token) {
-            results.push(ExecuteMultiResult::execution_error(error_query_result(canceled_error())));
+            results.push(ExecuteMultiResult::execution_error_with_index(
+                error_query_result(canceled_error()),
+                statement_index,
+            ));
             return (results, None);
         }
 
@@ -9035,6 +9037,42 @@ for line in sys.stdin:
 
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn mysql_batch_cancellation_after_multiple_results_keeps_source_statement_index() {
+        let statements = vec!["CALL multi_results()".to_string(), "must-not-run".to_string()];
+        let mut executor = FakeMysqlBatchExecutor {
+            outcomes: std::collections::VecDeque::from([Ok(vec![
+                mysql_query_result(empty_query_result(0)),
+                mysql_query_result(empty_query_result(0)),
+            ])]),
+            executed: Vec::new(),
+        };
+        let cancel_token = CancellationToken::new();
+        let progress: ExecuteMultiProgressCallback = {
+            let cancel_token = cancel_token.clone();
+            Arc::new(move |_| cancel_token.cancel())
+        };
+        let (results, error_action) = execute_mysql_batch_statements(
+            &mut executor,
+            &statements,
+            Some(DatabaseType::Mysql),
+            db::mysql::MySqlQueryDialect::default(),
+            Some(cancel_token),
+            false,
+            None,
+            Some(&progress),
+        )
+        .await;
+
+        assert_eq!(executor.executed, vec!["CALL multi_results()"]);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].statement_index, Some(0));
+        assert_eq!(results[1].statement_index, Some(0));
+        assert!(results[2].execution_error);
+        assert_eq!(results[2].statement_index, Some(1));
+        assert_eq!(error_action, None);
     }
 
     #[tokio::test]
