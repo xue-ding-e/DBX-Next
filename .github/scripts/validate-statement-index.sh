@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+evidence_dir="${DBX_VALIDATION_EVIDENCE_DIR:-validation-evidence}"
+mkdir -p "$evidence_dir"
+
+run_checked_test() {
+  local label="$1"
+  local expected_count="$2"
+  local expected_ignored="$3"
+  shift 3
+  local log_path="$evidence_dir/$label.log"
+  local status
+  local -a pipeline_status
+  set +e
+  timeout --signal=TERM --kill-after=30s 1800 "$@" 2>&1 | tee "$log_path"
+  pipeline_status=("${PIPESTATUS[@]}")
+  status="${pipeline_status[0]}"
+  set -e
+  if [[ "$status" -eq 0 && "${pipeline_status[1]}" -ne 0 ]]; then
+    status="${pipeline_status[1]}"
+  fi
+  printf '%s\n' "$status" > "$evidence_dir/$label.exit"
+  if [[ "$status" -ne 0 ]]; then
+    return "$status"
+  fi
+  # Cargo exits successfully when a filter matches no tests. Require the
+  # reviewed test count so a typo or renamed test cannot produce a false green.
+  if ! grep -F "test result: ok. $expected_count passed; 0 failed; $expected_ignored ignored;" "$log_path" >/dev/null; then
+    printf '1\n' > "$evidence_dir/$label.exit"
+    printf 'Expected %s passing tests for %s; validation is incomplete.\n' "$expected_count" "$label" | tee -a "$log_path" >&2
+    return 1
+  fi
+}
+
+run_checked_test cli-unit 50 1 cargo +1.99.1 test --locked -p dbx-cli --no-default-features --bin dbx -- --nocapture --test-threads=1
+run_checked_test core-cancellation 1 0 cargo +1.99.1 test --locked -p dbx-core --no-default-features --features sqlite-bundled --lib query::tests::mysql_batch_cancellation_after_multiple_results_keeps_source_statement_index -- --exact --nocapture --test-threads=1
+
+if ! grep -F 'test tests::executes_legacy_mongo_insert_without_desktop_process ... ignored' "$evidence_dir/cli-unit.log" >/dev/null; then
+  printf '1\n' > "$evidence_dir/cli-unit.exit"
+  printf 'Expected external MongoDB test to stay ignored; validation is incomplete.\n' | tee -a "$evidence_dir/cli-unit.log" >&2
+  exit 1
+fi
+printf 'All 50 non-ignored CLI unit tests and the core cancellation regression passed; the external MongoDB test stayed ignored.\n' | tee "$evidence_dir/result.txt"
