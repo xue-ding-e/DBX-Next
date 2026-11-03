@@ -489,11 +489,15 @@ async fn run_multi_statement(
         let detail = results[index].error_message.as_deref().unwrap_or("statement failed").trim().to_string();
         return Err(CliError::new(
             "BATCH_FAILED",
-            format!("Statement {} of {} failed: {detail}", index + 1, statement_count),
+            format!(
+                "Statement {} of {} failed: {detail}",
+                results[index].statement_index.unwrap_or(index) + 1,
+                statement_count
+            ),
         ));
     }
 
-    format_multi_statement(connection_name, &results, use_transaction, format)
+    format_multi_statement(connection_name, &results, statement_count, use_transaction, format)
 }
 
 fn truncate_query_result(result: &mut QueryResult, max_rows: Option<usize>) {
@@ -1035,6 +1039,7 @@ fn format_query_messages(messages: &[QueryMessage]) -> String {
 fn format_multi_statement(
     connection: &str,
     results: &[BatchStatementResult],
+    statement_count: usize,
     use_transaction: bool,
     format: OutputFormat,
 ) -> Result<String, CliError> {
@@ -1054,7 +1059,7 @@ fn format_multi_statement(
                 .collect();
             let row_count = if result.columns.is_empty() { result.affected_rows } else { result.rows.len() as u64 };
             let mut statement = json!({
-                "statement_index": index,
+                "statement_index": entry.statement_index.unwrap_or(index),
                 "columns": result.columns,
                 "rows": rows,
                 "row_count": row_count,
@@ -1069,7 +1074,7 @@ fn format_multi_statement(
     if format == OutputFormat::Json {
         return json_string(&json!({
             "connection": connection,
-            "statement_count": results.len(),
+            "statement_count": statement_count,
             "use_transaction": use_transaction,
             "statements": statements,
         }));
@@ -1102,7 +1107,11 @@ fn format_multi_statement(
         if use_transaction {
             output.push_str("-- script committed as one transaction\n");
         } else {
-            output.push_str(&format!("-- statement {}/{}\n", index + 1, results.len()));
+            output.push_str(&format!(
+                "-- statement {}/{}\n",
+                entry.statement_index.unwrap_or(index) + 1,
+                statement_count
+            ));
         }
         if result.columns.is_empty() {
             output.push_str(&format!("Query executed. {} row(s) affected.\n", result.affected_rows));
@@ -1712,5 +1721,232 @@ mod tests {
     #[test]
     fn docs_appears_in_the_usage_text() {
         assert!(usage().contains("dbx docs <connection>"), "got: {}", usage());
+    }
+    struct BatchBackend {
+        results: Vec<BatchStatementResult>,
+    }
+
+    #[async_trait]
+    impl DbxBackend for BatchBackend {
+        async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicy, String> {
+            panic!("batch formatting tests must not load user policy")
+        }
+
+        async fn load_connections(&self) -> Result<Vec<ConnectionConfig>, String> {
+            panic!("batch formatting tests must not load user connections")
+        }
+
+        async fn execute_agent_tool(
+            &self,
+            _connection: &ConnectionConfig,
+            _database: &str,
+            _tool_name: &str,
+            _arguments: Value,
+            _permissions: AgentSqlPermissions,
+        ) -> ToolResult {
+            panic!("batch queries must not fall through to agent execution")
+        }
+
+        async fn execute_batch(
+            &self,
+            _connection: &ConnectionConfig,
+            database: &str,
+            schema: Option<&str>,
+            sql: &str,
+            options: QueryExecutionOptions,
+        ) -> Result<Vec<BatchStatementResult>, String> {
+            assert_eq!(database, "test");
+            assert_eq!(schema, None);
+            assert_eq!(sql, "CALL multi_results(); SELECT 2");
+            assert_eq!(options.max_rows, Some(5));
+            assert_eq!(options.timeout_secs, Some(7));
+            assert_eq!(options.use_transaction, None);
+            Ok(self.results.clone())
+        }
+
+        async fn add_connection_for_mcp(&self, _config: ConnectionConfig) -> Result<ConnectionConfig, String> {
+            panic!("batch tests must not modify connections")
+        }
+
+        async fn duplicate_connection_for_mcp(
+            &self,
+            _source_id: &str,
+            _copy_id: &str,
+            _copy_name: &str,
+        ) -> Result<ConnectionConfig, String> {
+            panic!("batch tests must not modify connections")
+        }
+
+        async fn remove_connection_for_mcp(&self, _connection_id: &str) -> Result<bool, String> {
+            panic!("batch tests must not modify connections")
+        }
+    }
+
+    fn indexed_batch_result(statement_index: Option<usize>, value: i32) -> BatchStatementResult {
+        BatchStatementResult {
+            result: QueryResult {
+                columns: vec!["value".to_string()],
+                column_types: Vec::new(),
+                column_sortables: Vec::new(),
+                spatial_columns: Vec::new(),
+                spatial_values: Vec::new(),
+                rows: vec![vec![json!(value)]],
+                affected_rows: 0,
+                execution_time_ms: 0,
+                server_execute_time_us: None,
+                query_timings_ms: None,
+                truncated: false,
+                session_id: None,
+                has_more: false,
+                elasticsearch_raw_body: None,
+                messages: Vec::new(),
+            },
+            execution_error: false,
+            statement_index,
+            error_message: None,
+            merged: false,
+            transaction_state: None,
+            transaction_outcome: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_failure_uses_source_statement_after_multiple_results() {
+        let mut failure = indexed_batch_result(Some(1), 0);
+        failure.execution_error = true;
+        failure.error_message = Some("  unknown table  ".to_string());
+        let backend = BatchBackend {
+            results: vec![indexed_batch_result(Some(0), 11), indexed_batch_result(Some(0), 12), failure],
+        };
+        let mut connection = MongoBackend::new().connection;
+        connection.db_type = DatabaseType::Mysql;
+        let error = run_multi_statement(
+            &backend,
+            &connection,
+            "test",
+            "CALL multi_results(); SELECT 2",
+            2,
+            Some(5),
+            Some(7),
+            false,
+            "local",
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "BATCH_FAILED");
+        assert_eq!(error.message, "Statement 2 of 2 failed: unknown table");
+    }
+
+    #[tokio::test]
+    async fn batch_failure_without_source_metadata_preserves_position_fallback() {
+        let mut failure = indexed_batch_result(None, 0);
+        failure.execution_error = true;
+        failure.error_message = None;
+        let backend = BatchBackend { results: vec![indexed_batch_result(None, 11), failure] };
+        let mut connection = MongoBackend::new().connection;
+        connection.db_type = DatabaseType::Mysql;
+        let error = run_multi_statement(
+            &backend,
+            &connection,
+            "test",
+            "CALL multi_results(); SELECT 2",
+            2,
+            Some(5),
+            Some(7),
+            false,
+            "local",
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "BATCH_FAILED");
+        assert_eq!(error.message, "Statement 2 of 2 failed: statement failed");
+    }
+
+    #[tokio::test]
+    async fn batch_success_keeps_result_order_and_source_statement_count() {
+        let backend = BatchBackend {
+            results: vec![
+                indexed_batch_result(Some(0), 11),
+                indexed_batch_result(Some(0), 12),
+                indexed_batch_result(Some(1), 22),
+            ],
+        };
+        let mut connection = MongoBackend::new().connection;
+        connection.db_type = DatabaseType::Mysql;
+        let output = run_multi_statement(
+            &backend,
+            &connection,
+            "test",
+            "CALL multi_results(); SELECT 2",
+            2,
+            Some(5),
+            Some(7),
+            false,
+            "local",
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["statement_count"], 2);
+        assert_eq!(parsed["statements"].as_array().unwrap().len(), 3);
+        for (result_index, (statement_index, value)) in [(0, 11), (0, 12), (1, 22)].into_iter().enumerate() {
+            assert_eq!(parsed["statements"][result_index]["statement_index"], statement_index);
+            assert_eq!(parsed["statements"][result_index]["rows"][0]["value"], value);
+        }
+        let table = format_multi_statement("local", &backend.results, 2, false, OutputFormat::Table).unwrap();
+        assert_eq!(table.matches("-- statement 1/2").count(), 2);
+        assert_eq!(table.matches("-- statement 2/2").count(), 1);
+        assert!(!table.contains("-- statement 3/"));
+    }
+
+    #[test]
+    fn batch_formatter_without_source_metadata_preserves_position_fallback() {
+        let results = vec![indexed_batch_result(None, 11), indexed_batch_result(None, 22)];
+        let output = format_multi_statement("local", &results, 2, false, OutputFormat::Json).unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["statement_count"], 2);
+        assert_eq!(parsed["statements"][0]["statement_index"], 0);
+        assert_eq!(parsed["statements"][1]["statement_index"], 1);
+    }
+
+    #[test]
+    fn empty_batch_output_preserves_source_count_without_inventing_results() {
+        let output = format_multi_statement("local", &[], 2, false, OutputFormat::Json).unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["statement_count"], 2);
+        assert_eq!(parsed["statements"], json!([]));
+        assert_eq!(format_multi_statement("local", &[], 2, false, OutputFormat::Csv).unwrap(), "");
+        assert_eq!(format_multi_statement("local", &[], 2, false, OutputFormat::Table).unwrap(), "");
+    }
+
+    #[test]
+    fn batch_csv_uses_last_column_result_without_reordering_or_selecting_trailing_dml() {
+        let first = indexed_batch_result(Some(0), 11);
+        let last_columns = indexed_batch_result(Some(0), 22);
+        let mut dml = indexed_batch_result(Some(1), 0);
+        dml.result.columns.clear();
+        dml.result.rows.clear();
+        dml.result.affected_rows = 3;
+        let expected = format_query("local", &last_columns.result, OutputFormat::Csv).unwrap();
+        let results = vec![first, last_columns, dml.clone()];
+        assert_eq!(format_multi_statement("local", &results, 2, false, OutputFormat::Csv).unwrap(), expected);
+        assert_eq!(format_multi_statement("local", &[dml], 1, false, OutputFormat::Csv).unwrap(), "");
+    }
+    #[test]
+    fn merged_transaction_output_counts_sql_not_merged_result_entries() {
+        let mut merged = indexed_batch_result(None, 22);
+        merged.merged = true;
+        let results = vec![merged];
+        let output = format_multi_statement("local", &results, 2, true, OutputFormat::Json).unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["statement_count"], 2);
+        assert_eq!(parsed["use_transaction"], true);
+        assert_eq!(parsed["statements"].as_array().unwrap().len(), 1);
+        let table = format_multi_statement("local", &results, 2, true, OutputFormat::Table).unwrap();
+        assert_eq!(table.matches("-- script committed as one transaction").count(), 1);
+        assert!(!table.contains("-- statement"));
     }
 }
