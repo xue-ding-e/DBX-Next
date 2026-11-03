@@ -1722,8 +1722,11 @@ mod tests {
     fn docs_appears_in_the_usage_text() {
         assert!(usage().contains("dbx docs <connection>"), "got: {}", usage());
     }
+    #[derive(Default)]
     struct BatchBackend {
         results: Vec<BatchStatementResult>,
+        expected_transaction: Option<bool>,
+        error: Option<String>,
     }
 
     #[async_trait]
@@ -1760,8 +1763,11 @@ mod tests {
             assert_eq!(sql, "CALL multi_results(); SELECT 2");
             assert_eq!(options.max_rows, Some(5));
             assert_eq!(options.timeout_secs, Some(7));
-            assert_eq!(options.use_transaction, None);
-            Ok(self.results.clone())
+            assert_eq!(options.use_transaction, self.expected_transaction);
+            match &self.error {
+                Some(error) => Err(error.clone()),
+                None => Ok(self.results.clone()),
+            }
         }
 
         async fn add_connection_for_mcp(&self, _config: ConnectionConfig) -> Result<ConnectionConfig, String> {
@@ -1811,12 +1817,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transaction_batch_forwards_true_and_formats_merged_result() {
+        let mut merged = indexed_batch_result(None, 42);
+        merged.merged = true;
+        let backend = BatchBackend { results: vec![merged], expected_transaction: Some(true), ..Default::default() };
+        let mut connection = MongoBackend::new().connection;
+        connection.db_type = DatabaseType::Mysql;
+        let output = run_multi_statement(
+            &backend,
+            &connection,
+            "test",
+            "CALL multi_results(); SELECT 2",
+            2,
+            Some(5),
+            Some(7),
+            true,
+            "local",
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["use_transaction"], true);
+        assert_eq!(output["statement_count"], 2);
+        assert_eq!(output["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(output["statements"][0]["rows"][0]["value"], 42);
+    }
+
+    #[tokio::test]
+    async fn transaction_batch_maps_merged_backend_error_without_losing_detail() {
+        let backend = BatchBackend {
+            expected_transaction: Some(true),
+            error: Some("transaction rolled back: second statement failed".to_string()),
+            ..Default::default()
+        };
+        let mut connection = MongoBackend::new().connection;
+        connection.db_type = DatabaseType::Mysql;
+        let error = run_multi_statement(
+            &backend,
+            &connection,
+            "test",
+            "CALL multi_results(); SELECT 2",
+            2,
+            Some(5),
+            Some(7),
+            true,
+            "local",
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "BATCH_FAILED");
+        assert_eq!(error.message, "transaction rolled back: second statement failed");
+    }
+
+    #[tokio::test]
+    async fn nontransaction_batch_preserves_backend_error_code() {
+        let backend = BatchBackend { error: Some("backend unavailable".to_string()), ..Default::default() };
+        let mut connection = MongoBackend::new().connection;
+        connection.db_type = DatabaseType::Mysql;
+        let error = run_multi_statement(
+            &backend,
+            &connection,
+            "test",
+            "CALL multi_results(); SELECT 2",
+            2,
+            Some(5),
+            Some(7),
+            false,
+            "local",
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "ERROR");
+        assert_eq!(error.message, "backend unavailable");
+    }
+
+    #[tokio::test]
     async fn batch_failure_uses_source_statement_after_multiple_results() {
         let mut failure = indexed_batch_result(Some(1), 0);
         failure.execution_error = true;
         failure.error_message = Some("  unknown table  ".to_string());
         let backend = BatchBackend {
             results: vec![indexed_batch_result(Some(0), 11), indexed_batch_result(Some(0), 12), failure],
+            ..Default::default()
         };
         let mut connection = MongoBackend::new().connection;
         connection.db_type = DatabaseType::Mysql;
@@ -1843,7 +1928,7 @@ mod tests {
         let mut failure = indexed_batch_result(None, 0);
         failure.execution_error = true;
         failure.error_message = None;
-        let backend = BatchBackend { results: vec![indexed_batch_result(None, 11), failure] };
+        let backend = BatchBackend { results: vec![indexed_batch_result(None, 11), failure], ..Default::default() };
         let mut connection = MongoBackend::new().connection;
         connection.db_type = DatabaseType::Mysql;
         let error = run_multi_statement(
@@ -1872,6 +1957,7 @@ mod tests {
                 indexed_batch_result(Some(0), 12),
                 indexed_batch_result(Some(1), 22),
             ],
+            ..Default::default()
         };
         let mut connection = MongoBackend::new().connection;
         connection.db_type = DatabaseType::Mysql;
