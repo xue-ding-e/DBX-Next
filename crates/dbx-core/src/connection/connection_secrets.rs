@@ -764,7 +764,9 @@ fn persist_mqtt_auth_secrets(store: &dyn ConnectionSecretStore, config: &Connect
     };
 
     match mqtt_auth_kind(auth).as_deref() {
-        Some("password") => replace_mqtt_auth_secret(store, &config.id, MQTT_AUTH_PASSWORD_KEY, auth, "password")?,
+        Some("password" | "certificate") => {
+            replace_mqtt_auth_secret(store, &config.id, MQTT_AUTH_PASSWORD_KEY, auth, "password")?
+        }
         _ => delete_secret_prefix(store, &config.id, MQTT_AUTH_SECRET_PREFIX)?,
     }
 
@@ -784,7 +786,7 @@ fn hydrate_mqtt_auth_secrets(
         return Ok(());
     };
 
-    if let Some("password") = mqtt_auth_kind(auth).as_deref() {
+    if let Some("password" | "certificate") = mqtt_auth_kind(auth).as_deref() {
         hydrate_json_secret(store, &config.id, MQTT_AUTH_PASSWORD_KEY, auth, "password", needs_rewrite)?
     }
 
@@ -795,7 +797,7 @@ fn scrub_mqtt_auth_secrets(config: &mut ConnectionConfig) {
     let Some(auth) = mqtt_auth_object_mut(config.external_config.as_mut()) else {
         return;
     };
-    if let Some("password") = mqtt_auth_kind(auth).as_deref() {
+    if let Some("password" | "certificate") = mqtt_auth_kind(auth).as_deref() {
         scrub_json_secret(auth, "password")
     }
 }
@@ -1514,6 +1516,56 @@ mod tests {
         assert_eq!(store.get_existing("mqtt-broker", MQTT_AUTH_PASSWORD_KEY).as_deref(), Some("mqtt-secret"));
         let persisted_json = std::fs::read_to_string(&path).unwrap();
         assert!(!persisted_json.contains("mqtt-secret"));
+    }
+
+    #[test]
+    fn certificate_mqtt_credentials_round_trip_through_secret_store() {
+        let path = temp_connections_file("mqtt-certificate-auth");
+        let store = MemorySecretStore::default();
+        let mut config = connection("mqtt-certificate", "", "");
+        config.db_type = DatabaseType::Mqtt;
+        config.external_config = Some(serde_json::json!({
+            "tls": true,
+            "auth": {
+                "kind": "certificate", "username": "device", "password": "mqtt-secret",
+                "clientCertPath": "/client.crt", "clientKeyPath": "/client.key"
+            }
+        }));
+        save_connections_to_file(&path, &[config], &store).unwrap();
+        assert_eq!(store.get_existing("mqtt-certificate", MQTT_AUTH_PASSWORD_KEY).as_deref(), Some("mqtt-secret"));
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("mqtt-secret"));
+        let loaded = load_connections_from_file(&path, &store).unwrap();
+        let auth = &loaded[0].external_config.as_ref().unwrap()["auth"];
+        assert_eq!(auth["username"], "device");
+        assert_eq!(auth["password"], "mqtt-secret");
+        assert_eq!(auth["clientCertPath"], "/client.crt");
+        assert_eq!(auth["clientKeyPath"], "/client.key");
+    }
+
+    #[test]
+    fn certificate_mqtt_sanitized_empty_or_missing_password_preserves_existing_secret() {
+        // Empty and missing fields both represent sanitized input in the existing
+        // MQTT persistence contract; they are not a request to delete a secret.
+        for password in [None, Some("")] {
+            let path = temp_connections_file("mqtt-certificate-sanitized");
+            let store = MemorySecretStore::default();
+            store.set_existing("mqtt-certificate", MQTT_AUTH_PASSWORD_KEY, "fixture-stored-secret");
+            let mut config = connection("mqtt-certificate", "", "");
+            config.db_type = DatabaseType::Mqtt;
+            let mut auth = serde_json::json!({"kind": "certificate", "username": "device"});
+            if let Some(password) = password {
+                auth["password"] = serde_json::json!(password);
+            }
+            config.external_config = Some(serde_json::json!({"tls": true, "auth": auth}));
+            save_connections_to_file(&path, &[config], &store).unwrap();
+            assert_eq!(
+                store.get_existing("mqtt-certificate", MQTT_AUTH_PASSWORD_KEY).as_deref(),
+                Some("fixture-stored-secret")
+            );
+            assert!(!std::fs::read_to_string(&path).unwrap().contains("fixture-stored-secret"));
+            let loaded = load_connections_from_file(&path, &store).unwrap();
+            assert_eq!(loaded[0].external_config.as_ref().unwrap()["auth"]["password"], "fixture-stored-secret");
+        }
     }
 
     #[test]

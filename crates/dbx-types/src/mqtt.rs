@@ -33,6 +33,10 @@ pub enum MqttAuth {
     Password { username: String, password: String },
     #[serde(rename = "certificate")]
     Certificate {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        username: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        password: String,
         #[serde(rename = "caCertPath")]
         ca_cert_path: Option<String>,
         #[serde(rename = "clientCertPath")]
@@ -49,6 +53,14 @@ pub enum MqttTlsVerificationMode {
 }
 
 impl MqttAuth {
+    pub fn credentials(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Password { username, password } => Some((username, password)),
+            Self::Certificate { username, password, .. } if !username.is_empty() => Some((username, password)),
+            _ => None,
+        }
+    }
+
     pub fn kind_str(&self) -> &'static str {
         match self {
             MqttAuth::None => "none",
@@ -335,6 +347,42 @@ pub struct MqttUnsubscribeRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_auth_round_trip_preserves_optional_credentials() {
+        let input = serde_json::json!({
+            "kind": "certificate", "username": "fixture-device", "password": "fixture-secret",
+            "caCertPath": "/fixture/ca.pem", "clientCertPath": "/fixture/client.pem",
+            "clientKeyPath": "/fixture/client.key"
+        });
+        let auth: MqttAuth = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(auth).unwrap(), input);
+    }
+
+    #[test]
+    fn certificate_auth_legacy_config_does_not_invent_credentials() {
+        let auth: MqttAuth = serde_json::from_value(serde_json::json!({"kind": "certificate"})).unwrap();
+        let output = serde_json::to_value(auth).unwrap();
+        assert!(output.get("username").is_none());
+        assert!(output.get("password").is_none());
+    }
+
+    #[test]
+    fn mqtt_credentials_keep_password_mode_and_certificate_opt_in() {
+        for (input, expected) in [
+            (serde_json::json!({"kind": "none"}), None),
+            (serde_json::json!({"kind": "certificate"}), None),
+            (serde_json::json!({"kind": "certificate", "password": "fixture-secret"}), None),
+            (serde_json::json!({"kind": "certificate", "username": "device"}), Some(("device", ""))),
+            (
+                serde_json::json!({"kind": "password", "username": "", "password": "fixture-secret"}),
+                Some(("", "fixture-secret")),
+            ),
+        ] {
+            let auth: MqttAuth = serde_json::from_value(input).unwrap();
+            assert_eq!(auth.credentials(), expected);
+        }
+    }
 
     #[test]
     fn parse_minimal_external_config() {
