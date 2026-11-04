@@ -1,0 +1,47 @@
+name: Validate MQTT certificate Storage
+
+on:
+  push:
+    branches: [ci/validate-dbx-mqtt-storage-20261104]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dbx-mqtt-storage-validation-20261104
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'xue-ding-e/DBX-Next' && github.ref == 'refs/heads/ci/validate-dbx-mqtt-storage-20261104'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 7b751fd09c33261c38b280e8f77de07a633a2485
+      BASE_SHA: 09841a819a17b2154984a8dc786642f2a4db772f
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_MIN_STACK: '8388608'
+    steps:
+      - name: Check out exact validation source without saved credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Check reviewed source and control boundary
+        timeout-minutes: 1
+        run: bash .github/scripts/validate-mqtt-storage.sh --check-sources
+      - name: Select pinned official Rust toolchain
+        timeout-minutes: 5
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
+          rustc +1.99.1 --version
+          cargo +1.99.1 --version
+      - name: Compile and run isolated actual Storage regressions
+        timeout-minutes: 37
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/dbx-mqtt-storage-target
+          DBX_VALIDATION_EVIDENCE_DIR: ${{ runner.temp }}/dbx-mqtt-storage-evidence
+        run: bash .github/scripts/validate-mqtt-storage.sh
