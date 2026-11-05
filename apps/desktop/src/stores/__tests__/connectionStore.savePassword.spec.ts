@@ -170,6 +170,75 @@ describe("connectionStore save_password opt-out", () => {
     expect(connectDb).toHaveBeenCalledWith(expect.objectContaining({ id: "impala-1", password: "", save_password: false }), expect.any(Number));
   });
 
+  it.each([
+    ["connect", false],
+    ["connect", true],
+    ["ensureConnected", false],
+    ["ensureConnected", true],
+  ] as const)("opens MQTT certificate connections via %s without a generic prompt (broker credentials: %s)", async (entry, withBrokerCredentials) => {
+    const connectDb = vi.fn().mockResolvedValue("mqtt-1");
+    installApiMocks({ connectDb });
+    installPasswordPromptMock();
+    requestPassword.mockResolvedValue(null);
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = postgresConnection({
+      id: "mqtt-1",
+      name: "MQTT",
+      db_type: "mqtt",
+      host: "localhost",
+      port: 8883,
+      username: "",
+      database: undefined,
+      save_password: false,
+      external_config: {
+        host: "localhost",
+        port: 8883,
+        clientId: "dbx-test",
+        tls: true,
+        auth: {
+          kind: "certificate",
+          caCertPath: "/ca.pem",
+          clientCertPath: "/client.pem",
+          clientKeyPath: "/client.key",
+          ...(withBrokerCredentials ? { username: "broker-user", password: ["synthetic", "broker", "password"].join("-") } : {}),
+        },
+      },
+    });
+    store.connections = [connection];
+
+    if (entry === "connect") await store.connect(connection);
+    else await store.ensureConnected(connection.id);
+
+    expect(requestPassword).not.toHaveBeenCalled();
+    expect(connectDb).toHaveBeenCalledWith(expect.objectContaining({ id: connection.id, password: "", external_config: connection.external_config }), expect.any(Number));
+    expect(store.connectedIds.has(connection.id)).toBe(true);
+  });
+
+  it.each(["connect", "ensureConnected"] as const)("preserves MQTT broker rejection via %s without a generic password prompt", async (entry) => {
+    const brokerError = new Error("MQTT broker rejected certificate authentication");
+    const connectDb = vi.fn().mockRejectedValue(brokerError);
+    installApiMocks({ connectDb });
+    installPasswordPromptMock();
+    requestPassword.mockResolvedValue(null);
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = postgresConnection({
+      id: "mqtt-1",
+      db_type: "mqtt",
+      port: 8883,
+      save_password: false,
+      external_config: { host: "localhost", port: 8883, tls: true, auth: { kind: "certificate", caCertPath: "/ca.pem", clientCertPath: "/client.pem", clientKeyPath: "/client.key" } },
+    });
+    store.connections = [connection];
+
+    await expect(entry === "connect" ? store.connect(connection) : store.ensureConnected(connection.id)).rejects.toBe(brokerError);
+
+    expect(requestPassword).not.toHaveBeenCalled();
+    expect(connectDb).toHaveBeenCalledTimes(1);
+    expect(store.connectedIds.has(connection.id)).toBe(false);
+  });
+
   it("remembers an explicitly submitted empty password", async () => {
     installApiMocks();
     installPasswordPromptMock();

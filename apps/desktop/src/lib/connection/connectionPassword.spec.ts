@@ -24,6 +24,14 @@ describe("connectionNeedsPasswordPrompt", () => {
     expect(connectionNeedsPasswordPrompt({ db_type: "postgres", save_password: false, password: "pw" } as never)).toBe(false);
     expect(connectionNeedsPasswordPrompt({ db_type: "postgres", save_password: true, password: "" } as never)).toBe(false);
   });
+
+  it.each([undefined, {}, { auth: { kind: "none" } }, { auth: { kind: "password" } }])("preserves existing MQTT prompt behavior outside certificate auth: %j", (externalConfig) => {
+    expect(connectionNeedsPasswordPrompt({ db_type: "mqtt", save_password: false, password: "", external_config: externalConfig } as never)).toBe(true);
+  });
+
+  it("does not bypass another database's prompt when its config mentions certificate auth", () => {
+    expect(connectionNeedsPasswordPrompt({ db_type: "postgres", save_password: false, password: "", external_config: { auth: { kind: "certificate" } } } as never)).toBe(true);
+  });
 });
 
 describe("pluginConnectionNeedsPasswordPrompt", () => {
