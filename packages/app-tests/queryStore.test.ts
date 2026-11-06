@@ -8469,14 +8469,20 @@ test("SQL Server keeps the requested page size when the final fetch is narrowed"
 for (const scenario of [
   { label: "TOP equal to one page", bound: 100, pageLimit: 100, pageOffset: 0, rowCount: 100, expectedTotal: 100 },
   { label: "TOP below one page", bound: 50, pageLimit: 100, pageOffset: 0, rowCount: 50, expectedTotal: 50 },
-  { label: "TOP above the first page", bound: 250, pageLimit: 100, pageOffset: 0, rowCount: 100, expectedTotal: 250 },
-  { label: "TOP above an intermediate page", bound: 250, pageLimit: 100, pageOffset: 100, rowCount: 100, expectedTotal: 250 },
+  { label: "TOP above the first page", bound: 250, pageLimit: 100, pageOffset: 0, rowCount: 100, expectedTotal: 230, countedTotal: 230 },
+  { label: "TOP above an intermediate page", bound: 250, pageLimit: 100, pageOffset: 100, rowCount: 100, expectedTotal: 230, countedTotal: 230 },
   { label: "TOP reached on the final page", bound: 250, pageLimit: 100, pageOffset: 200, rowCount: 50, expectedTotal: 250 },
   { label: "TOP above the actual matching rows", bound: 500, pageLimit: 100, pageOffset: 200, rowCount: 37, expectedTotal: 237 },
-  { label: "TOP above the enabled result cap", bound: 200_000, pageLimit: 100, pageOffset: 0, rowCount: 100, expectedTotal: 180, queryResultMaxRows: 180 },
+  { label: "TOP above the enabled result cap", bound: 200_000, pageLimit: 100, pageOffset: 0, rowCount: 100, expectedTotal: 230, countedTotal: 230, queryResultMaxRows: 180 },
+  { label: "TOP above the first page with automatic counting disabled", bound: 250, pageLimit: 100, pageOffset: 0, rowCount: 100, expectedTotal: undefined, autoCalculateTotalRows: false },
   { label: "TOP overrides an unrelated exact backend total", bound: 100, pageLimit: 100, pageOffset: 0, rowCount: 100, expectedTotal: 100, affectedRows: 500 },
-]) {
-  test(`SQL Server ${scenario.label} resolves an exact bounded total without COUNT`, async () => {
+  { label: "TOP with no matching rows", bound: 100, pageLimit: 100, pageOffset: 0, rowCount: 0, expectedTotal: 0 },
+  { label: "TOP zero", bound: 0, pageLimit: 100, pageOffset: 0, rowCount: 0, expectedTotal: 0 },
+  { label: "TOP reached with truncation", bound: 100, pageLimit: 100, pageOffset: 0, rowCount: 100, expectedTotal: undefined, autoCalculateTotalRows: false, resultFlags: { truncated: true } },
+  { label: "TOP reached with more rows", bound: 100, pageLimit: 100, pageOffset: 0, rowCount: 100, expectedTotal: undefined, autoCalculateTotalRows: false, resultFlags: { has_more: true } },
+  { label: "TOP reached with more page rows", bound: 100, pageLimit: 100, pageOffset: 0, rowCount: 100, expectedTotal: undefined, autoCalculateTotalRows: false, resultFlags: { page_has_more: true } },
+].flatMap((scenario) => (["sqlserver", "mysql"] as const).map((databaseType) => ({ ...scenario, databaseType })))) {
+  test(`${scenario.databaseType === "mysql" ? "MySQL LIMIT" : "SQL Server TOP"} ${scenario.label.replace(/^TOP /, "")} resolves totals from observed rows or the count policy`, async () => {
     const restoreStorage = installMemoryStorage();
     setActivePinia(createPinia());
     const connectionStore = useConnectionStore();
@@ -8486,12 +8492,13 @@ for (const scenario of [
     let countRequests = 0;
 
     settingsStore.updateEditorSettings({
-      autoCalculateTotalRows: true,
+      autoCalculateTotalRows: scenario.autoCalculateTotalRows ?? true,
       queryResultMaxRowsEnabled: true,
       queryResultMaxRows: scenario.queryResultMaxRows ?? 100_000,
     });
-    connectionStore.addEphemeralConnection(sqlServerConn("sqlserver-1"));
-    const tabId = store.createTab("sqlserver-1", "db", "Query", "query", "dbo");
+    connectionStore.addEphemeralConnection({ ...sqlServerConn("bounded-query-1"), db_type: scenario.databaseType, port: scenario.databaseType === "mysql" ? 3306 : 1433 });
+    const tabId = store.createTab("bounded-query-1", "db", "Query", "query", scenario.databaseType === "mysql" ? undefined : "dbo");
+    const sql = scenario.databaseType === "mysql" ? `SELECT 1 AS id LIMIT ${scenario.bound}` : `SELECT TOP ${scenario.bound} 1 AS [id]`;
     const tab = store.tabs.find((item) => item.id === tabId);
     assert.ok(tab);
 
@@ -8499,11 +8506,11 @@ for (const scenario of [
       const url = String(input);
       if (url === "/api/query/prepare-pagination-plan") {
         return Response.json({
-          sqlToExecute: `SELECT TOP ${scenario.bound} 1 AS [id]`,
-          pageSql: `SELECT TOP ${scenario.bound} 1 AS [id]`,
+          sqlToExecute: sql,
+          pageSql: sql,
           pageLimit: scenario.pageLimit,
           pageOffset: scenario.pageOffset,
-          countSql: "SELECT COUNT(*) FROM (SELECT 1 AS [id]) [dbx_count]",
+          countSql: "SELECT COUNT(*) FROM (SELECT 1 AS id) dbx_count",
           exactQueryRowBound: scenario.bound,
           useAgentResultSession: false,
         });
@@ -8515,13 +8522,16 @@ for (const scenario of [
             rows: Array.from({ length: scenario.rowCount }, (_, index) => [scenario.pageOffset + index + 1]),
             affected_rows: scenario.affectedRows ?? 0,
             execution_time_ms: 1,
+            ...scenario.resultFlags,
           },
         ]);
       }
       if (url === "/api/query/execute") {
         countRequests += 1;
-        return new Response("unexpected count", { status: 500 });
+        if (scenario.countedTotal === undefined) return new Response("unexpected count", { status: 500 });
+        return Response.json({ columns: ["total"], rows: [[scenario.countedTotal]], affected_rows: 0, execution_time_ms: 1 });
       }
+      if (url === "/api/query/close-client-session") return Response.json(null);
       if (url === "/api/query/analyze-editability") {
         return Response.json({ editable: false, reason: "complex-source" });
       }
@@ -8529,18 +8539,82 @@ for (const scenario of [
     });
 
     try {
-      await store.executeTabSql(tabId, `SELECT TOP ${scenario.bound} 1 AS [id]`, {
+      await store.executeTabSql(tabId, sql, {
         pagination: { limit: scenario.pageLimit, offset: scenario.pageOffset },
       });
 
+      await waitFor(() => tab.resultTotalRowCount === scenario.expectedTotal && tab.resultTotalRowCountLoading === false);
       assert.equal(tab.resultTotalRowCount, scenario.expectedTotal);
       assert.equal(tab.resultTotalRowCountLoading, false);
-      assert.equal(countRequests, 0);
+      assert.equal(countRequests, scenario.countedTotal === undefined ? 0 : 1);
     } finally {
       globalThis.fetch = originalFetch;
       restoreStorage();
     }
   });
+}
+
+for (const databaseType of ["sqlserver", "mysql"] as const) {
+  for (const bound of [200, 250]) {
+    test(`${databaseType} bounded append measures the ${bound}-row bound and cap from the logical origin`, async () => {
+      const restoreStorage = installMemoryStorage();
+      setActivePinia(createPinia());
+      const connectionStore = useConnectionStore();
+      const settingsStore = useSettingsStore();
+      const store = useQueryStore();
+      const originalFetch = globalThis.fetch;
+      let countRequests = 0;
+
+      settingsStore.updateEditorSettings({ autoCalculateTotalRows: true, queryResultMaxRowsEnabled: true, queryResultMaxRows: 300 });
+      connectionStore.addEphemeralConnection({ ...sqlServerConn("bounded-append"), db_type: databaseType, port: databaseType === "mysql" ? 3306 : 1433 });
+      const tabId = store.createTab("bounded-append", "db", "Query", "query", databaseType === "mysql" ? undefined : "dbo");
+      const tab = store.tabs.find((item) => item.id === tabId);
+      assert.ok(tab);
+      const sql = databaseType === "mysql" ? `SELECT 1 AS id LIMIT ${bound}` : `SELECT TOP ${bound} 1 AS [id]`;
+      tab.result = { columns: ["id"], rows: Array.from({ length: 100 }, (_, index) => [index + 1]), affected_rows: 0, execution_time_ms: 1, has_more: true };
+      tab.resultPageOffset = 0;
+      tab.resultPageLimit = 100;
+      // An intermediate append preserves an already counted total; the final
+      // append must infer its exact total even when no earlier COUNT ran.
+      tab.resultTotalRowCount = bound === 250 ? 230 : undefined;
+
+      globalThis.fetch = withConnectionHealthMock(async (input) => {
+        const url = String(input);
+        if (url === "/api/query/prepare-pagination-plan") {
+          return Response.json({ sqlToExecute: sql, pageSql: sql, pageLimit: 100, pageOffset: 100, countSql: "SELECT COUNT(*) FROM items", exactQueryRowBound: bound, useAgentResultSession: false });
+        }
+        if (url === "/api/query/execute-multi") {
+          return Response.json([{ columns: ["id"], rows: Array.from({ length: 100 }, (_, index) => [101 + index]), affected_rows: 0, execution_time_ms: 1, has_more: bound > 200 }]);
+        }
+        if (url === "/api/query/execute") {
+          countRequests += 1;
+          return new Response("unexpected count", { status: 500 });
+        }
+        if (url === "/api/query/analyze-editability") return Response.json({ editable: false, reason: "complex-source" });
+        if (url === "/api/query/close-client-session") return Response.json(null);
+        return new Response("unexpected request", { status: 500 });
+      });
+
+      try {
+        await store.executeTabSql(tabId, sql, {
+          pagination: { limit: 100, offset: 100 },
+          appendResult: { maxRows: 300 },
+          preserveResultDuringExecution: true,
+          preserveTotalRowCountDuringExecution: true,
+        });
+        assert.equal(tab.result?.rows.length, 200);
+        assert.equal(tab.resultPageOffset, 0);
+        assert.equal(tab.result?.has_more, bound > 200);
+        assert.notEqual(tab.result?.truncated, true, "200 accumulated rows have not reached the 300-row cap");
+        assert.equal(tab.resultTotalRowCount, bound === 250 ? 230 : 200);
+        assert.equal(tab.resultTotalRowCountLoading, false);
+        assert.equal(countRequests, 0, "appending must not introduce a background COUNT");
+      } finally {
+        globalThis.fetch = originalFetch;
+        restoreStorage();
+      }
+    });
+  }
 }
 
 test("inexact backend totals do not become query pagination bounds", async () => {

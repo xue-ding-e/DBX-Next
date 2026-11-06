@@ -96,7 +96,7 @@ import { beginDataGridNativeSelectionBlock, finishDataGridNativeSelectionBlock }
 import { appendLargeValueCells, canUseTableDataLargeValuePreview, remapLargeValueCells, tableDataLargeValuePreviewOptions, TABLE_DATA_RESULT_MAX_BYTES } from "@/lib/dataGrid/dataGridLargeValues";
 import { simpleDataGridOrderByReferencesMissingColumn, sortDataGridRowIndexes, type DataGridSortDirection } from "@/lib/dataGrid/dataGridSort";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
-import { agentProtocolQueryResultMaxRows, capQueryResultTotal, effectiveQueryResultMaxRows, limitQueryPagination, queryResultLimitReached } from "@/lib/dataGrid/queryResultRowLimit";
+import { agentProtocolQueryResultMaxRows, effectiveQueryResultMaxRows, limitQueryPagination, queryResultLimitReached } from "@/lib/dataGrid/queryResultRowLimit";
 import { elasticsearchRestRequestRanges, executableStatementRanges, splitSqlStatementRanges, sqlStatementParameterOptionsForCompatibility, stripMysqlClientDisplayCommand } from "@/lib/sql/sqlStatementRanges";
 import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
 import { replaceSqlServerLeadingUseQuery, sqlServerLeadingUseScript, switchesDatabaseWithUseStatement, useDatabaseFromStatement } from "@/lib/sql/sqlCompletionLookupTarget";
@@ -8054,7 +8054,7 @@ export const useQueryStore = defineStore("query", () => {
           current.resultTotalRowCount = undefined;
         }
         const resultRowCount = current.result?.rows.length ?? 0;
-        const resultLimitReached = !!current.result && queryResultLimitReached(pageOffset, resultRowCount, queryResultMaxRows);
+        const resultLimitReached = !!current.result && queryResultLimitReached(current.resultPageOffset, resultRowCount, queryResultMaxRows);
         if (resultLimitReached && current.result) {
           current.result.has_more = false;
           current.result.truncated = true;
@@ -8065,10 +8065,18 @@ export const useQueryStore = defineStore("query", () => {
         const totalKnownFromIncompletePage = typeof exactIncompletePageTotal === "number";
         let totalRowCountResolved = false;
         if (current.mode === "query" && current.result && !isQueryExecutionErrorResult(current.result) && typeof exactQueryRowBound === "number") {
-          const boundedTotal = capQueryResultTotal(exactQueryRowBound, queryResultMaxRows);
-          current.resultTotalRowCount = Math.min(boundedTotal, exactIncompletePageTotal ?? boundedTotal);
-          current.resultTotalRowCountLoading = false;
-          totalRowCountResolved = true;
+          // LIMIT/TOP is an upper bound, not a count. A full page below that
+          // bound must still follow the user's automatic/manual count policy.
+          // Appended results already include earlier segments, so measure their
+          // extent from the preserved logical page origin rather than the tail.
+          const observedExtent = (current.resultPageOffset ?? 0) + resultRowCount;
+          const reachedQueryBound = resultRowCount > 0 && current.result.truncated !== true && current.result.has_more !== true && current.result.page_has_more !== true && observedExtent === exactQueryRowBound;
+          const exactTotal = exactIncompletePageTotal ?? (reachedQueryBound ? exactQueryRowBound : undefined);
+          if (typeof exactTotal === "number") {
+            current.resultTotalRowCount = Math.min(exactQueryRowBound, exactTotal);
+            current.resultTotalRowCountLoading = false;
+            totalRowCountResolved = true;
+          }
         }
         const dataCountTarget =
           current.mode === "data"
