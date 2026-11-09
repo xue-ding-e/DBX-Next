@@ -4612,6 +4612,7 @@ export const useConnectionStore = defineStore("connection", () => {
       await ensureLocalConnectionAttemptActiveAfterConnectResult(config.id, localAttempt, id);
       ensureLocalConnectionAttemptActive(config.id, localAttempt);
       if (!isCurrentConnectionStateRevision(config.id, connectStateRevision)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+      const connectedStateRevision = connectionStateRevision(id);
       activeConnectionId.value = id;
       connectedIds.value.add(id);
       // Clear at the fenced publication boundary, before metadata awaits can race a new close.
@@ -4620,10 +4621,14 @@ export const useConnectionStore = defineStore("connection", () => {
       if (config.db_type !== "plugin") {
         void refreshConnectedDatabaseInfo(id, { ...config, id });
         await refreshConnectionIdentifierQuote(id, { ...config, id });
+        ensureLocalConnectionAttemptActive(config.id, localAttempt);
+        if (!isCurrentConnectionStateRevision(config.id, connectStateRevision) || !isCurrentConnectionStateRevision(id, connectedStateRevision) || !connectedIds.value.has(id)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
         // Compatibility modes warm asynchronously; the QueryEditor watcher and the
         // backend's own A-mode/EXISTS validation make a cold map safe.
         void refreshConnectionDatabaseModes(id, { ...config, id });
       }
+      ensureLocalConnectionAttemptActive(config.id, localAttempt);
+      if (!isCurrentConnectionStateRevision(config.id, connectStateRevision) || !isCurrentConnectionStateRevision(id, connectedStateRevision) || !connectedIds.value.has(id)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       if (id !== config.id) markSuccessfulLocalConnectionAttempt(config.id, localAttempt);
       markSuccessfulLocalConnectionAttempt(id, localAttempt);
       markConnectionHealthChecked(id);
@@ -4653,10 +4658,16 @@ export const useConnectionStore = defineStore("connection", () => {
       try {
         await persistRememberedConnectionPassword(config, rememberPassword, expectedConfigFingerprint);
       } catch (error) {
+        ensureLocalConnectionAttemptActive(config.id, localAttempt);
+        if (!isCurrentConnectionStateRevision(config.id, connectStateRevision) || !isCurrentConnectionStateRevision(id, connectedStateRevision) || !connectedIds.value.has(id)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
         setConnectionError(id, i18n.global.t("connection.rememberPasswordSaveFailed", { message: connectionErrorMessage(error) }));
       }
+      ensureLocalConnectionAttemptActive(config.id, localAttempt);
+      if (!isCurrentConnectionStateRevision(config.id, connectStateRevision) || !isCurrentConnectionStateRevision(id, connectedStateRevision) || !connectedIds.value.has(id)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       return id;
     } catch (e) {
+      // Retired work must not clear or replace a newer owner's error.
+      if (!isCurrentConnectionStateRevision(config.id, connectStateRevision) || !isCurrentLocalConnectionAttempt(config.id, localAttempt)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       if (isCancelledLocalConnectionAttempt(config.id, localAttempt)) {
         clearConnectionError(config.id);
         throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
@@ -4885,7 +4896,11 @@ export const useConnectionStore = defineStore("connection", () => {
     if (options.skipIfClosedByUser && isConnectionClosedByUser(connectionId)) throw new Error(CONNECTION_CLOSED_BY_USER_MESSAGE);
     const existingConnect = connectInFlight.get(connectionId);
     if (existingConnect) {
+      const joinedStateRevision = connectionStateRevision(connectionId);
       await existingConnect;
+      // The owner may already have retired its local attempt in finally. Its
+      // revision and connected state, not an active-attempt token, fence this join.
+      if (!isCurrentConnectionStateRevision(connectionId, joinedStateRevision) || !connectedIds.value.has(connectionId)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       if (options.activate !== false) activeConnectionId.value = connectionId;
       return;
     }
@@ -4921,6 +4936,8 @@ export const useConnectionStore = defineStore("connection", () => {
       if (config.db_type !== "plugin") {
         void refreshConnectedDatabaseInfo(connectionId, config);
         await refreshConnectionIdentifierQuote(connectionId, config);
+        ensureLocalConnectionAttemptActive(connectionId, localAttempt);
+        if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision) || !connectedIds.value.has(connectionId)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
         void refreshConnectionDatabaseModes(connectionId, config);
       }
       markSuccessfulLocalConnectionAttempt(connectionId, localAttempt);
@@ -4929,14 +4946,20 @@ export const useConnectionStore = defineStore("connection", () => {
       try {
         await persistRememberedConnectionPassword(config, rememberPassword, expectedConfigFingerprint);
       } catch (error) {
+        ensureLocalConnectionAttemptActive(connectionId, localAttempt);
+        if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision) || !connectedIds.value.has(connectionId)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
         setConnectionError(connectionId, i18n.global.t("connection.rememberPasswordSaveFailed", { message: connectionErrorMessage(error) }));
       }
     })();
     connectInFlight.set(connectionId, connectPromise);
     try {
       await connectPromise;
+      ensureLocalConnectionAttemptActive(connectionId, localAttempt);
+      if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision) || !connectedIds.value.has(connectionId)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       if (options.activate !== false) activeConnectionId.value = connectionId;
     } catch (e) {
+      // Do not let late completion erase an error published after close/reconnect.
+      if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision) || !isCurrentLocalConnectionAttempt(connectionId, localAttempt)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       if (isCancelledLocalConnectionAttempt(connectionId, localAttempt)) {
         clearConnectionError(connectionId);
         throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
@@ -4983,6 +5006,8 @@ export const useConnectionStore = defineStore("connection", () => {
     try {
       await ensureConnected(config.id, { activate: false, forceReconnect: true, allowPasswordPrompt: false, skipIfClosedByUser: true });
     } catch (error) {
+      // A retired reconnect must not tear down or relabel the newer session.
+      if (isCancelledConnectionAttempt(error) || isSupersededConnectionAttempt(error) || connectionErrorMessage(error) === CONNECTION_CLOSED_BY_USER_MESSAGE) return;
       connectedIds.value.delete(config.id);
       setConnectionError(config.id, `Plugin settings were saved, but automatic reconnection failed: ${connectionErrorMessage(error)}`);
     }

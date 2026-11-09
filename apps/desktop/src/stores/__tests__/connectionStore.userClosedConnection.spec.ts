@@ -24,6 +24,13 @@ function deferred<T>() {
 }
 
 async function setup() {
+  const connectionIdentifierQuote = vi.fn().mockResolvedValue('"');
+  // Force the real identifier-refresh await for the synthetic Postgres config;
+  // driver selection itself is outside these lifecycle scheduling regressions.
+  vi.doMock("@/lib/database/jdbcDialect", async (importOriginal) => ({
+    ...await importOriginal<typeof import("@/lib/database/jdbcDialect")>(),
+    connectionShouldLoadIdentifierQuote: () => true,
+  }));
   const checkConnectionHealth = vi.fn().mockResolvedValue(undefined);
   const connectDb = vi.fn(async (config: ConnectionConfig) => config.id);
   const disconnectDb = vi.fn().mockResolvedValue(undefined);
@@ -32,6 +39,7 @@ async function setup() {
   vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
   vi.doMock("@/lib/backend/api", () => ({
     checkConnectionHealth,
+    connectionIdentifierQuote,
     connectDb,
     disconnectDb,
     deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
@@ -51,7 +59,7 @@ async function setup() {
   const { useConnectionStore, CONNECTION_CLOSED_BY_USER_MESSAGE } = await import("@/stores/connectionStore");
   const store = useConnectionStore();
   store.connections = [pgConnection("conn-a")];
-  return { store, connectDb, disconnectDb, loadConnections, CONNECTION_CLOSED_BY_USER_MESSAGE };
+  return { store, connectDb, disconnectDb, loadConnections, connectionIdentifierQuote, CONNECTION_CLOSED_BY_USER_MESSAGE };
 }
 
 describe("connectionStore: user-closed connections do not wake up from passive paths", () => {
@@ -241,4 +249,135 @@ describe("connectionStore: user-closed connections do not wake up from passive p
     await store.removeConnection("conn-a");
     expect(store.isConnectionClosedByUser("conn-a")).toBe(false);
   }, 20_000);
+
+  it.each(["ensure", "direct"] as const)("%s rejects a close during identifier refresh without reactivating", async (entry) => {
+    const { store, connectionIdentifierQuote } = await setup();
+    const started = deferred<void>();
+    const quote = deferred<string>();
+    connectionIdentifierQuote.mockImplementationOnce(() => {
+      started.resolve();
+      return quote.promise;
+    });
+    const pending = (entry === "direct" ? store.connect(pgConnection("conn-a")) : store.ensureConnected("conn-a"))
+      .then(() => null, (error: unknown) => error);
+    try {
+      await started.promise;
+      await store.disconnect("conn-a");
+      quote.resolve('"');
+      expect(await pending).toBeInstanceOf(Error);
+      expect(store.activeConnectionId).toBeNull();
+      expect(store.connectedIds.has("conn-a")).toBe(false);
+      expect(store.isConnectionClosedByUser("conn-a")).toBe(true);
+    } finally {
+      quote.resolve('"');
+      await pending;
+    }
+  }, 20_000);
+
+  it("rejects both an owner and its joined caller when closed during metadata", async () => {
+    const { store, connectDb, connectionIdentifierQuote } = await setup();
+    const connecting = deferred<void>();
+    const connected = deferred<string>();
+    const refreshing = deferred<void>();
+    const quote = deferred<string>();
+    connectDb.mockImplementationOnce(() => { connecting.resolve(); return connected.promise; });
+    connectionIdentifierQuote.mockImplementationOnce(() => { refreshing.resolve(); return quote.promise; });
+    const owner = store.ensureConnected("conn-a", { activate: false }).then(() => null, (error: unknown) => error);
+    await connecting.promise;
+    const joined = store.ensureConnected("conn-a").then(() => null, (error: unknown) => error);
+    try {
+      connected.resolve("conn-a");
+      await refreshing.promise;
+      await store.disconnect("conn-a");
+      quote.resolve('"');
+      expect(await owner).toBeInstanceOf(Error);
+      expect(await joined).toBeInstanceOf(Error);
+      expect(store.activeConnectionId).toBeNull();
+      expect(store.connectedIds.has("conn-a")).toBe(false);
+      expect(store.isConnectionClosedByUser("conn-a")).toBe(true);
+      expect(connectDb).toHaveBeenCalledTimes(1);
+    } finally {
+      connected.resolve("conn-a");
+      quote.resolve('"');
+      await Promise.all([owner, joined]);
+    }
+  }, 20_000);
+
+  it.each(["ensure", "direct"] as const)("late %s completion preserves a newer reconnect failure", async (entry) => {
+    const { store, connectDb, connectionIdentifierQuote } = await setup();
+    const refreshing = deferred<void>();
+    const quote = deferred<string>();
+    connectionIdentifierQuote.mockImplementationOnce(() => { refreshing.resolve(); return quote.promise; });
+    const old = (entry === "direct" ? store.connect(pgConnection("conn-a")) : store.ensureConnected("conn-a"))
+      .then(() => null, (error: unknown) => error);
+    try {
+      await refreshing.promise;
+      await store.disconnect("conn-a");
+      connectDb.mockRejectedValueOnce(new Error("new reconnect failure"));
+      await expect(store.ensureConnected("conn-a")).rejects.toThrow("new reconnect failure");
+      const newerError = store.connectionErrors["conn-a"];
+      expect(newerError).toContain("new reconnect failure");
+      quote.resolve('"');
+      expect(await old).toBeInstanceOf(Error);
+      expect(store.connectionErrors["conn-a"]).toBe(newerError);
+      expect(store.activeConnectionId).toBeNull();
+      expect(store.connectedIds.has("conn-a")).toBe(false);
+      expect(store.isConnectionClosedByUser("conn-a")).toBe(true);
+    } finally {
+      quote.resolve('"');
+      await old;
+    }
+  }, 20_000);
+
+  it("a healthy joined caller activates after the owner retires its attempt", async () => {
+    const { store, connectDb } = await setup();
+    const started = deferred<void>();
+    const connected = deferred<string>();
+    connectDb.mockImplementationOnce(() => { started.resolve(); return connected.promise; });
+    const owner = store.ensureConnected("conn-a", { activate: false });
+    await started.promise;
+    const joined = store.ensureConnected("conn-a");
+    connected.resolve("conn-a");
+    await Promise.all([owner, joined]);
+    expect(connectDb).toHaveBeenCalledTimes(1);
+    expect(store.connectingIds.has("conn-a")).toBe(false);
+    expect(store.activeConnectionId).toBe("conn-a");
+    expect(store.connectedIds.has("conn-a")).toBe(true);
+    expect(store.isConnectionClosedByUser("conn-a")).toBe(false);
+  }, 20_000);
+
+  it.each(["ensure", "direct"] as const)("%s explicit reconnect still activates normally", async (entry) => {
+    const { store } = await setup();
+    await store.disconnect("conn-a");
+    if (entry === "direct") await store.connect(pgConnection("conn-a"));
+    else await store.ensureConnected("conn-a");
+    expect(store.activeConnectionId).toBe("conn-a");
+    expect(store.connectedIds.has("conn-a")).toBe(true);
+    expect(store.isConnectionClosedByUser("conn-a")).toBe(false);
+  }, 20_000);
+
+
+  it.each(["ensure", "direct"] as const)("late %s completion cannot activate over a newer successful owner", async (entry) => {
+    const { store, connectionIdentifierQuote } = await setup();
+    const refreshing = deferred<void>();
+    const quote = deferred<string>();
+    connectionIdentifierQuote.mockImplementationOnce(() => { refreshing.resolve(); return quote.promise; });
+    const old = (entry === "direct" ? store.connect(pgConnection("conn-a")) : store.ensureConnected("conn-a"))
+      .then(() => null, (error: unknown) => error);
+    try {
+      await refreshing.promise;
+      await store.disconnect("conn-a");
+      await store.ensureConnected("conn-a", { activate: false });
+      expect(store.activeConnectionId).toBeNull();
+      quote.resolve('"');
+      expect(await old).toBeInstanceOf(Error);
+      expect(store.activeConnectionId).toBeNull();
+      expect(store.connectedIds.has("conn-a")).toBe(true);
+      expect(store.isConnectionClosedByUser("conn-a")).toBe(false);
+    } finally {
+      quote.resolve('"');
+      await old;
+    }
+  }, 20_000);
+
 });
