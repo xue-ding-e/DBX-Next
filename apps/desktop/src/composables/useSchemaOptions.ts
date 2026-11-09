@@ -22,7 +22,9 @@ export function schemaOptionsForConnection(schemaNames: string[], connection: Pi
 export function useSchemaOptions() {
   const connectionStore = useConnectionStore();
 
+  // Raw compatibility ref; callers use load/get below to validate a cache entry's lifetime.
   const schemaOptions = ref<Record<string, string[]>>({});
+  const schemaOptionsRevisions = new Map<string, number>();
   const loadingSchemaOptions = ref<Record<string, boolean>>({});
   const schemaRequests = new Map<string, Promise<void>>();
 
@@ -34,13 +36,22 @@ export function useSchemaOptions() {
     return isSchemaAwareType(connectionStore.getConfig(connectionId)?.db_type);
   }
 
+  function getCachedSchemaOptions(connectionId: string, key: string): string[] | undefined {
+    // Revisions are not reactive: validate on access, not with a cached computed view.
+    if (!hasSchemaOptionsCacheEntry(schemaOptions.value, key)) return;
+    if (schemaOptionsRevisions.get(key) === connectionStore.connectionStateRevision(connectionId)) return schemaOptions.value[key];
+  }
+
   async function loadSchemaOptions(connectionId: string, database: string) {
     if (!isSchemaAware(connectionId)) return;
     const connection = connectionStore.getConfig(connectionId);
     const dbType = connection?.db_type;
     if (!database && !isSingleDatabase(dbType) && !usesTreeSchemaMode(dbType)) return;
     const key = cacheKey(connectionId, database);
-    if (hasSchemaOptionsCacheEntry(schemaOptions.value, key)) return;
+    if (getCachedSchemaOptions(connectionId, key) !== undefined) return;
+    // Only a load retires stale entries; a render-time getter must not wake load watchers.
+    schemaOptionsRevisions.delete(key);
+    if (hasSchemaOptionsCacheEntry(schemaOptions.value, key)) delete schemaOptions.value[key];
     const pending = schemaRequests.get(key);
     if (pending) return pending;
 
@@ -52,7 +63,9 @@ export function useSchemaOptions() {
         const requestRevision = connectionStore.connectionStateRevision(connectionId);
         const schemas = await api.listSchemas(connectionId, database);
         if (connectionStore.connectionStateRevision(connectionId) !== requestRevision) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
-        schemaOptions.value[key] = schemaOptionsForConnection(schemas, connection, database);
+        const options = schemaOptionsForConnection(schemas, connection, database);
+        schemaOptionsRevisions.set(key, requestRevision);
+        schemaOptions.value[key] = options;
       } finally {
         loadingSchemaOptions.value[key] = false;
         schemaRequests.delete(key);
@@ -63,7 +76,7 @@ export function useSchemaOptions() {
   }
 
   function getSchemaOptionsForDb(connectionId: string, database: string): string[] {
-    return schemaOptions.value[cacheKey(connectionId, database)] ?? [];
+    return getCachedSchemaOptions(connectionId, cacheKey(connectionId, database)) ?? [];
   }
 
   function isLoadingSchemas(connectionId: string, database: string): boolean {

@@ -1035,8 +1035,8 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   // Read-only epoch: local attempt starts and full disconnect entry advance it.
-  // A snapshot fences an issued request, not earlier ensureConnected work,
-  // already-cached metadata, or configuration/database-only changes.
+  // A snapshot does not lease earlier ensureConnected work, invalidate caches,
+  // make them reactive, or cover configuration/database-only changes.
   function connectionStateRevision(connectionId: string): number {
     return connectionStateRevisions.get(connectionId) ?? 0;
   }
