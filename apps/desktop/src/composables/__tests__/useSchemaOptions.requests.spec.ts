@@ -201,4 +201,68 @@ describe("useSchemaOptions request settlement", () => {
     expect(mocks.listSchemas).toHaveBeenCalledTimes(1);
     expect(options.getSchemaOptionsForDb(connectionId, database)).toEqual(["public"]);
   });
+
+  it("keeps distinct equal-value valid acquisitions busy when another gate rejects", async () => {
+    const response = deferred<string[]>();
+    const entered = deferred<void>();
+    const tokens: SchemaConnectionAcquisition[] = [];
+    mocks.acquireSchemaConnection.mockImplementation(async (id: string) => {
+      const token = acquisition(id);
+      tokens.push(token);
+      return token;
+    });
+    mocks.listSchemas.mockImplementationOnce(() => { entered.resolve(); return response.promise; });
+    const options = useSchemaOptions();
+    const first = options.loadSchemaOptions(connectionId, database);
+    const second = options.loadSchemaOptions(connectionId, database);
+    const settled = Promise.allSettled([first, second]);
+    try {
+      await entered.promise;
+      expect(tokens).toHaveLength(2);
+      expect(tokens[0]).not.toBe(tokens[1]);
+      expect(tokens[0]).toEqual(tokens[1]);
+      const failure = new Error("Synthetic third gate failure");
+      mocks.acquireSchemaConnection.mockRejectedValueOnce(failure);
+      await expect(options.loadSchemaOptions(connectionId, database)).rejects.toBe(failure);
+      expect(options.isLoadingSchemas(connectionId, database)).toBe(true);
+      expect(mocks.listSchemas).toHaveBeenCalledTimes(1);
+      response.resolve(["public"]);
+      expect(await settled).toEqual([{ status: "fulfilled", value: undefined }, { status: "fulfilled", value: undefined }]);
+      expect(options.isLoadingSchemas(connectionId, database)).toBe(false);
+    } finally {
+      response.resolve([]);
+      await settled;
+    }
+  });
+
+  it.each([
+    { kind: "unexpected Error", error: new Error("Synthetic unexpected assertion failure") },
+    { kind: "message-shaped object", error: { message: "Connection attempt was cancelled" } },
+    { kind: "message string", error: "Connection attempt was cancelled" },
+  ])("does not swallow or treat $kind as confirmed ticket revocation", async ({ error }) => {
+    const response = deferred<string[]>();
+    const entered = deferred<void>();
+    mocks.listSchemas.mockImplementationOnce(() => { entered.resolve(); return response.promise; });
+    const options = useSchemaOptions();
+    const pending = options.loadSchemaOptions(connectionId, database);
+    const settled = Promise.allSettled([pending]);
+    const originalAssertion = mocks.assertSchemaConnectionAcquisition.getMockImplementation()!;
+    try {
+      await entered.promise;
+      mocks.assertSchemaConnectionAcquisition.mockImplementation(() => { throw error; });
+      mocks.acquireSchemaConnection.mockRejectedValueOnce(new Error("Synthetic settling gate failure"));
+      // Fault injection only: the pinned real store currently throws no such error.
+      // Propagation may replace the settling caller's error; the other ticket stays.
+      await expect(options.loadSchemaOptions(connectionId, database)).rejects.toBe(error);
+      expect(options.isLoadingSchemas(connectionId, database)).toBe(true);
+      mocks.assertSchemaConnectionAcquisition.mockImplementation(originalAssertion);
+      response.resolve(["public"]);
+      expect(await settled).toEqual([{ status: "fulfilled", value: undefined }]);
+      expect(options.isLoadingSchemas(connectionId, database)).toBe(false);
+    } finally {
+      mocks.assertSchemaConnectionAcquisition.mockImplementation(originalAssertion);
+      response.resolve([]);
+      await settled;
+    }
+  });
 });

@@ -23,6 +23,10 @@ export interface LoadSchemaOptionsOptions {
   intent?: "explicit" | "passive";
 }
 
+interface SchemaOptionsLoadingTicket {
+  acquisition?: SchemaConnectionAcquisition;
+}
+
 interface SchemaOptionsRequest {
   acquisition: SchemaConnectionAcquisition;
   promise: Promise<void>;
@@ -40,9 +44,9 @@ export function useSchemaOptions() {
   const schemaOptionsRevisions = new Map<string, number>();
   const loadingSchemaOptions = ref<Record<string, boolean>>({});
   const schemaRequests = new Map<string, SchemaOptionsRequest>();
-  // Count unsettled calls, including gates and revoked backend work. An old
-  // never-settled await can keep this key busy after a newer result publishes.
-  const loadingTickets = new Map<string, Set<symbol>>();
+  // Count pending gates and still-valid acquired calls. Settlement can retire
+  // revoked tickets without cancelling or waiting for their backend promises.
+  const loadingTickets = new Map<string, Set<SchemaOptionsLoadingTicket>>();
 
   function cacheKey(connectionId: string, database: string) {
     return schemaOptionsCacheKey(connectionId, database, connectionStore.getConfig(connectionId)?.show_system_schemas === true);
@@ -65,8 +69,8 @@ export function useSchemaOptions() {
     const dbType = connection.db_type;
     if (!database && !isSingleDatabase(dbType) && !usesTreeSchemaMode(dbType)) return;
     const key = cacheKey(connectionId, database);
-    const tickets = loadingTickets.get(key) ?? new Set<symbol>();
-    const ticket = Symbol();
+    const tickets = loadingTickets.get(key) ?? new Set<SchemaOptionsLoadingTicket>();
+    const ticket: SchemaOptionsLoadingTicket = {};
     tickets.add(ticket);
     loadingTickets.set(key, tickets);
     let acquisition: SchemaConnectionAcquisition | undefined;
@@ -80,6 +84,7 @@ export function useSchemaOptions() {
       // gate first so that close revokes this call instead of authorizing it.
       loadingSchemaOptions.value[key] = true;
       acquisition = await acquiring;
+      ticket.acquisition = acquisition;
       connectionStore.assertSchemaConnectionAcquisition(acquisition);
       if (getCachedSchemaOptions(key, acquisition.stateRevision) !== undefined) return;
       // Only an allowed load retires stale entries; a render-time getter must
@@ -124,9 +129,23 @@ export function useSchemaOptions() {
       throw error;
     } finally {
       tickets.delete(ticket);
-      if (tickets.size === 0 && loadingTickets.get(key) === tickets) {
-        loadingTickets.delete(key);
-        loadingSchemaOptions.value[key] = false;
+      if (loadingTickets.get(key) === tickets) {
+        // A pending gate has no acquisition to validate, so it must stay busy.
+        // The store assertion is synchronous and pure: only confirmed revocation
+        // retires another display ticket, without settling its backend promise.
+        for (const pending of tickets) {
+          if (!pending.acquisition) continue;
+          try {
+            connectionStore.assertSchemaConnectionAcquisition(pending.acquisition);
+          } catch (error) {
+            if (!(error instanceof Error) || error.message !== CONNECTION_ATTEMPT_CANCELLED_MESSAGE) throw error;
+            tickets.delete(pending);
+          }
+        }
+        if (tickets.size === 0) {
+          loadingTickets.delete(key);
+          loadingSchemaOptions.value[key] = false;
+        }
       }
       // Releasing the last ticket can synchronously run reactive observers.
       // A close from such an observer must also cancel a cache-hit return.

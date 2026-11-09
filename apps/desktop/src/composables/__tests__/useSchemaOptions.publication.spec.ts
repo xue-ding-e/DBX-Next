@@ -383,8 +383,9 @@ describe("useSchemaOptions: connection revision ownership", () => {
         nextResponse.resolve(["new-schema"]);
         await current;
         const published = options.schemaOptions.value[key];
-        // A revoked backend await still owns an unsettled loading ticket.
-        expect(options.isLoadingSchemas("conn-a", "app")).toBe(true);
+        // The settled current call retires the confirmed-revoked display ticket.
+        // The old backend promise is still held until settleOld() below.
+        expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
         settleOld();
         expect(await old).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
         expect(options.schemaOptions.value[key]).toBe(published);
@@ -503,6 +504,317 @@ describe("useSchemaOptions: connection revision ownership", () => {
     } finally {
       response.resolve([]);
       await first;
+    }
+  }, 20_000);
+
+  const retiredSettlementCases = (["request only", "full close"] as const).flatMap((boundary) =>
+    (["success", "empty", "failure"] as const).map((outcome) => ({ boundary, outcome })),
+  );
+  it.each(retiredSettlementCases)("retires a held old display ticket after $boundary and protects a later Set from its $outcome", async ({ boundary, outcome }) => {
+    const { store, options, key, listSchemas, started, response, CONNECTION_ATTEMPT_CANCELLED_MESSAGE } = await setup();
+    let oldFinished = false;
+    const old = options.loadSchemaOptions("conn-a", "app").then(
+      () => { oldFinished = true; return null; },
+      (error: unknown) => { oldFinished = true; return error; },
+    );
+    const laterStarted = deferred<void>();
+    const laterResponse = deferred<string[]>();
+    let later: Promise<void> | undefined;
+    try {
+      await started.promise;
+      const oldRevision = store.connectionStateRevision("conn-a");
+      if (boundary === "request only") {
+        expect(await store.cancelConnecting("conn-a")).toBe(false);
+        expect(store.connectionStateRevision("conn-a")).toBe(oldRevision);
+      } else {
+        await store.disconnect("conn-a", { skipTabHandling: true });
+        expect(store.connectionStateRevision("conn-a")).toBeGreaterThan(oldRevision);
+      }
+      listSchemas.mockResolvedValueOnce(["new-schema"]);
+      await options.loadSchemaOptions("conn-a", "app");
+      expect(oldFinished).toBe(false);
+      expect(options.getSchemaOptionsForDb("conn-a", "app")).toEqual(["new-schema"]);
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+
+      // A real cache hit still gates independently and does not revive the old ticket.
+      const acquire = vi.spyOn(store, "acquireSchemaConnection");
+      await options.loadSchemaOptions("conn-a", "app");
+      expect(acquire).toHaveBeenCalledExactlyOnceWith("conn-a");
+      expect(listSchemas).toHaveBeenCalledTimes(2);
+      expect(oldFinished).toBe(false);
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+
+      // A new lifetime creates another metadata request and a fresh loading Set.
+      await store.disconnect("conn-a", { skipTabHandling: true });
+      listSchemas.mockImplementationOnce(() => { laterStarted.resolve(); return laterResponse.promise; });
+      later = options.loadSchemaOptions("conn-a", "app");
+      await laterStarted.promise;
+      const active = store.activeConnectionId;
+      store.connectionErrors["conn-a"] = "synthetic later-owner error";
+      if (outcome === "failure") response.reject(new Error("Synthetic retired backend failure"));
+      else response.resolve(outcome === "empty" ? [] : ["old-schema"]);
+      expect(await old).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(true);
+      expect(Object.prototype.hasOwnProperty.call(options.schemaOptions.value, key)).toBe(false);
+      expect(store.activeConnectionId).toBe(active);
+      expect(store.connectionErrors["conn-a"]).toBe("synthetic later-owner error");
+      laterResponse.resolve(["later-schema"]);
+      await later;
+      expect(options.getSchemaOptionsForDb("conn-a", "app")).toEqual(["later-schema"]);
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+      expect(listSchemas).toHaveBeenCalledTimes(3);
+    } finally {
+      response.resolve([]);
+      laterResponse.resolve([]);
+      await Promise.allSettled([old, later]);
+    }
+  }, 20_000);
+
+  it.each(["request only", "full close"] as const)("retires revoked held work when the current metadata fails after %s, then retries", async (boundary) => {
+    const { store, options, key, listSchemas, started, response, CONNECTION_ATTEMPT_CANCELLED_MESSAGE } = await setup();
+    let oldFinished = false;
+    const old = options.loadSchemaOptions("conn-a", "app").then(
+      () => { oldFinished = true; return null; },
+      (error: unknown) => { oldFinished = true; return error; },
+    );
+    try {
+      await started.promise;
+      if (boundary === "request only") await store.cancelConnecting("conn-a");
+      else await store.disconnect("conn-a", { skipTabHandling: true });
+      const failure = new Error("Synthetic current metadata failure");
+      listSchemas.mockRejectedValueOnce(failure);
+      await expect(options.loadSchemaOptions("conn-a", "app")).rejects.toBe(failure);
+      expect(oldFinished).toBe(false);
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(options.schemaOptions.value, key)).toBe(false);
+      await options.loadSchemaOptions("conn-a", "app");
+      const cached = options.schemaOptions.value[key];
+      expect(cached).toEqual(["public"]);
+      store.connectionErrors["conn-a"] = "synthetic current-owner error";
+      response.reject(new Error("Synthetic obsolete metadata failure"));
+      expect(await old).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
+      expect(options.schemaOptions.value[key]).toBe(cached);
+      expect(store.connectionErrors["conn-a"]).toBe("synthetic current-owner error");
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+    } finally {
+      response.resolve([]);
+      await old;
+    }
+  }, 20_000);
+
+  it("keeps close and getters passive, then retires a revoked held owner when a passive gate rejects", async () => {
+    const { store, options, listSchemas, started, response, CONNECTION_ATTEMPT_CANCELLED_MESSAGE } = await setup();
+    let oldFinished = false;
+    const old = options.loadSchemaOptions("conn-a", "app").then(
+      () => { oldFinished = true; return null; },
+      (error: unknown) => { oldFinished = true; return error; },
+    );
+    let stop: (() => void) | undefined;
+    try {
+      await started.promise;
+      const acquire = vi.spyOn(store, "acquireSchemaConnection");
+      const observations: boolean[] = [];
+      stop = watch(() => options.isLoadingSchemas("conn-a", "app"), (busy) => observations.push(busy), { flush: "sync" });
+      await store.disconnect("conn-a", { skipTabHandling: true });
+      // No subscription or getter sweep is added: close alone does not publish idle.
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(true);
+      expect(options.getSchemaOptionsForDb("conn-a", "app")).toEqual([]);
+      expect(observations).toEqual([]);
+      expect(acquire).not.toHaveBeenCalled();
+      expect(oldFinished).toBe(false);
+      await expect(options.loadSchemaOptions("conn-a", "app", { intent: "passive" })).rejects.toThrow("Connection was closed by the user");
+      expect(observations).toEqual([false]);
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+      expect(oldFinished).toBe(false);
+      expect(listSchemas).toHaveBeenCalledTimes(1);
+      response.resolve(["old-schema"]);
+      expect(await old).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
+      expect(observations).toEqual([false]);
+    } finally {
+      stop?.();
+      response.resolve([]);
+      await old;
+    }
+  }, 20_000);
+
+  it.each([false, true])("does not let a rejected passive gate hide an unknown explicit gate after close (cancel waiting gate: %s)", async (cancelWaitingGate) => {
+    const { store, options, connectDb, disconnectDb, listSchemas, started, response, CONNECTION_ATTEMPT_CANCELLED_MESSAGE } = await setup();
+    await store.ensureConnected("conn-a");
+    const teardownStarted = deferred<void>();
+    const teardown = deferred<void>();
+    disconnectDb.mockImplementationOnce(() => { teardownStarted.resolve(); return teardown.promise; });
+    const close = store.disconnect("conn-a", { skipTabHandling: true });
+    let explicit: Promise<unknown> | undefined;
+    let explicitFinished = false;
+    try {
+      await teardownStarted.promise;
+      explicit = options.loadSchemaOptions("conn-a", "app", { intent: "explicit" }).then(
+        () => { explicitFinished = true; return null; },
+        (error: unknown) => { explicitFinished = true; return error; },
+      );
+      if (cancelWaitingGate) expect(await store.cancelConnecting("conn-a")).toBe(false);
+      await expect(options.loadSchemaOptions("conn-a", "app", { intent: "passive" })).rejects.toThrow("Connection was closed by the user");
+      expect(store.isConnectionClosedByUser("conn-a")).toBe(true);
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(true);
+      expect(explicitFinished).toBe(false);
+      expect(connectDb).toHaveBeenCalledTimes(1);
+      expect(listSchemas).not.toHaveBeenCalled();
+      teardown.resolve();
+      await close;
+      if (cancelWaitingGate) {
+        expect(await explicit).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
+        expect(listSchemas).not.toHaveBeenCalled();
+      } else {
+        await started.promise;
+        expect(options.isLoadingSchemas("conn-a", "app")).toBe(true);
+        response.resolve(["explicit-schema"]);
+        expect(await explicit).toBeNull();
+        expect(options.getSchemaOptionsForDb("conn-a", "app")).toEqual(["explicit-schema"]);
+      }
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+    } finally {
+      teardown.resolve();
+      response.resolve([]);
+      await Promise.allSettled([close, explicit]);
+    }
+  }, 20_000);
+
+  it("isolates loading retirement by composable instance and key", async () => {
+    const { store, options, listSchemas, started, response, CONNECTION_ATTEMPT_CANCELLED_MESSAGE } = await setup();
+    const { useSchemaOptions } = await import("@/composables/useSchemaOptions");
+    const other = useSchemaOptions();
+    const otherStarted = deferred<void>();
+    const otherResponse = deferred<string[]>();
+    const keyStarted = deferred<void>();
+    const keyResponse = deferred<string[]>();
+    const connectionStarted = deferred<void>();
+    const connectionResponse = deferred<string[]>();
+    const old = options.loadSchemaOptions("conn-a", "app").then(() => null, (error: unknown) => error);
+    let otherOld: Promise<unknown> | undefined;
+    let otherKey: Promise<unknown> | undefined;
+    let otherConnection: Promise<void> | undefined;
+    try {
+      await started.promise;
+      listSchemas.mockImplementationOnce(() => { otherStarted.resolve(); return otherResponse.promise; });
+      otherOld = other.loadSchemaOptions("conn-a", "app").then(() => null, (error: unknown) => error);
+      await otherStarted.promise;
+      listSchemas.mockImplementationOnce(() => { keyStarted.resolve(); return keyResponse.promise; });
+      otherKey = options.loadSchemaOptions("conn-a", "other").then(() => null, (error: unknown) => error);
+      await keyStarted.promise;
+      listSchemas.mockImplementationOnce(() => { connectionStarted.resolve(); return connectionResponse.promise; });
+      otherConnection = options.loadSchemaOptions("conn-b", "app");
+      await connectionStarted.promise;
+      await store.cancelConnecting("conn-a");
+      await options.loadSchemaOptions("conn-a", "app");
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+      expect(other.isLoadingSchemas("conn-a", "app")).toBe(true);
+      expect(options.isLoadingSchemas("conn-a", "other")).toBe(true);
+      expect(options.isLoadingSchemas("conn-b", "app")).toBe(true);
+      expect(other.getSchemaOptionsForDb("conn-a", "app")).toEqual([]);
+      expect(options.getSchemaOptionsForDb("conn-a", "app")).toEqual(["public"]);
+      otherResponse.resolve(["obsolete-other-instance"]);
+      keyResponse.resolve(["obsolete-other-key"]);
+      expect(await otherOld).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
+      expect(await otherKey).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
+      expect(options.isLoadingSchemas("conn-b", "app")).toBe(true);
+      connectionResponse.resolve(["unrelated-schema"]);
+      await otherConnection;
+      expect(options.getSchemaOptionsForDb("conn-b", "app")).toEqual(["unrelated-schema"]);
+      response.resolve(["obsolete-original"]);
+      expect(await old).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
+      expect(options.getSchemaOptionsForDb("conn-a", "app")).toEqual(["public"]);
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+    } finally {
+      response.resolve([]);
+      otherResponse.resolve([]);
+      keyResponse.resolve([]);
+      connectionResponse.resolve([]);
+      await Promise.allSettled([old, otherOld, otherKey, otherConnection]);
+    }
+  }, 20_000);
+
+  it("gates a synchronous publication observer's Q-only cache hit without issuing more metadata", async () => {
+    const { store, options, key, listSchemas, started, response, CONNECTION_ATTEMPT_CANCELLED_MESSAGE } = await setup();
+    let cacheHit: Promise<unknown> | undefined;
+    let cancel: Promise<boolean> | undefined;
+    let reentered = false;
+    const stop = watch(() => options.schemaOptions.value[key], (schemas) => {
+      if (!schemas || reentered) return;
+      reentered = true;
+      // Synthetic reactive seam, real store actions: recent health permits the
+      // connected gate fast path. Q changes but the just-published R stamp stays.
+      cancel = store.cancelConnecting("conn-a");
+      cacheHit = options.loadSchemaOptions("conn-a", "app").then(() => null, (error: unknown) => error);
+    }, { flush: "sync" });
+    const old = options.loadSchemaOptions("conn-a", "app").then(() => null, (error: unknown) => error);
+    try {
+      await started.promise;
+      const revision = store.connectionStateRevision("conn-a");
+      response.resolve(["cached-schema"]);
+      expect(await old).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
+      expect(reentered).toBe(true);
+      expect(await cancel).toBe(false);
+      expect(await cacheHit).toBeNull();
+      expect(store.connectionStateRevision("conn-a")).toBe(revision);
+      expect(options.getSchemaOptionsForDb("conn-a", "app")).toEqual(["cached-schema"]);
+      expect(listSchemas).toHaveBeenCalledTimes(1);
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+    } finally {
+      stop();
+      response.resolve([]);
+      await Promise.allSettled([old, cacheHit, cancel]);
+    }
+  }, 20_000);
+
+  it("preserves a reentrant new loading Set when retirement publishes idle and closes the current caller", async () => {
+    const { store, options, disconnectDb, listSchemas, started, response, CONNECTION_ATTEMPT_CANCELLED_MESSAGE } = await setup();
+    const old = options.loadSchemaOptions("conn-a", "app").then(() => null, (error: unknown) => error);
+    const nextStarted = deferred<void>();
+    const nextResponse = deferred<string[]>();
+    const laterStarted = deferred<void>();
+    const laterResponse = deferred<string[]>();
+    const teardown = deferred<void>();
+    let current: Promise<unknown> | undefined;
+    let later: Promise<unknown> | undefined;
+    let close: Promise<void> | undefined;
+    let stop: (() => void) | undefined;
+    let reentered = false;
+    try {
+      await started.promise;
+      await store.cancelConnecting("conn-a");
+      listSchemas.mockImplementationOnce(() => { nextStarted.resolve(); return nextResponse.promise; });
+      listSchemas.mockImplementationOnce(() => { laterStarted.resolve(); return laterResponse.promise; });
+      current = options.loadSchemaOptions("conn-a", "app").then(() => null, (error: unknown) => error);
+      await nextStarted.promise;
+      disconnectDb.mockImplementationOnce(() => teardown.promise);
+      stop = watch(() => options.isLoadingSchemas("conn-a", "app"), (busy) => {
+        if (busy || reentered) return;
+        reentered = true;
+        close = store.disconnect("conn-a", { skipTabHandling: true });
+        later = options.loadSchemaOptions("conn-a", "app").then(() => null, (error: unknown) => error);
+      }, { flush: "sync" });
+      nextResponse.resolve(["new-schema"]);
+      // The observer's close still wins over the retiring caller's success.
+      expect(await current).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
+      expect(reentered).toBe(true);
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(true);
+      response.resolve(["old-schema"]);
+      expect(await old).toEqual(new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE));
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(true);
+      teardown.resolve();
+      await close;
+      await laterStarted.promise;
+      laterResponse.resolve(["later-schema"]);
+      expect(await later).toBeNull();
+      expect(options.getSchemaOptionsForDb("conn-a", "app")).toEqual(["later-schema"]);
+      expect(options.isLoadingSchemas("conn-a", "app")).toBe(false);
+    } finally {
+      stop?.();
+      response.resolve([]);
+      nextResponse.resolve([]);
+      teardown.resolve();
+      laterResponse.resolve([]);
+      await Promise.allSettled([old, current, later, close]);
     }
   }, 20_000);
 });
