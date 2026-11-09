@@ -1034,6 +1034,9 @@ export const useConnectionStore = defineStore("connection", () => {
     return revision;
   }
 
+  // Read-only epoch: local attempt starts and full disconnect entry advance it.
+  // A snapshot fences an issued request, not earlier ensureConnected work,
+  // already-cached metadata, or configuration/database-only changes.
   function connectionStateRevision(connectionId: string): number {
     return connectionStateRevisions.get(connectionId) ?? 0;
   }
@@ -10247,6 +10250,7 @@ export const useConnectionStore = defineStore("connection", () => {
     disconnect,
     hasDisconnectInFlight,
     markConnectionOffline,
+    connectionStateRevision,
     metadataGenerationFor,
     disconnectAndForgetConnectionPassword,
     hasSessionCredential,

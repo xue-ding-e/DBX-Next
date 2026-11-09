@@ -1,5 +1,5 @@
 import { ref } from "vue";
-import { useConnectionStore } from "@/stores/connectionStore";
+import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stores/connectionStore";
 import { isSchemaAware as isSchemaAwareType, isSingleDatabase, usesTreeSchemaMode } from "@/lib/database/databaseCapabilities";
 import { sortSidebarNames } from "@/lib/database/databaseTree";
 import { filterSchemaNamesForConnection } from "@/lib/database/visibleDatabases";
@@ -48,7 +48,11 @@ export function useSchemaOptions() {
       loadingSchemaOptions.value[key] = true;
       try {
         await connectionStore.ensureConnected(connectionId);
-        schemaOptions.value[key] = schemaOptionsForConnection(await api.listSchemas(connectionId, database), connection, database);
+        // Fence this backend request only; this is not a lease from ensureConnected.
+        const requestRevision = connectionStore.connectionStateRevision(connectionId);
+        const schemas = await api.listSchemas(connectionId, database);
+        if (connectionStore.connectionStateRevision(connectionId) !== requestRevision) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+        schemaOptions.value[key] = schemaOptionsForConnection(schemas, connection, database);
       } finally {
         loadingSchemaOptions.value[key] = false;
         schemaRequests.delete(key);
