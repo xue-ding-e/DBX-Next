@@ -429,12 +429,25 @@ watch(activeDatabaseValue, (database) => {
   if (database) databaseRequiredVisible.value = false;
 });
 
-watchEffect(() => {
-  const connection = props.activeConnection;
-  if (connection && showSchemaSelector.value) {
-    loadSchemaOptions(connection.id, schemaDatabaseKey.value).catch(() => {});
-  }
-});
+// Keep loader/gate internals out of the automatic watch dependencies.
+watch(
+  [
+    () => props.activeConnection,
+    () => props.activeConnection?.id,
+    schemaDatabaseKey,
+    showSchemaSelector,
+    () => props.activeConnection ? connectionStore.getConfig(props.activeConnection.id) : undefined,
+    () => props.activeConnection ? connectionStore.getConfig(props.activeConnection.id)?.db_type : undefined,
+    () => props.activeConnection ? connectionStore.getConfig(props.activeConnection.id)?.show_system_schemas : undefined,
+  ],
+  () => {
+    const connection = props.activeConnection;
+    if (connection && showSchemaSelector.value) {
+      loadSchemaOptions(connection.id, schemaDatabaseKey.value, { intent: "passive" }).catch(() => {});
+    }
+  },
+  { immediate: true },
+);
 watchEffect(() => {
   const connection = props.activeConnection;
   if (!connection || !connectionIsDorisFamilyCatalogCapable(connection)) return;
@@ -995,7 +1008,7 @@ async function changeCatalog(selectedCatalog: string) {
           @update:model-value="(schema) => emit('changeSchema', schema || undefined)"
           @update:open="
             (open: boolean) => {
-              if (open && activeConnection) loadSchemaOptions(activeConnection.id, schemaDatabaseKey).catch(() => {});
+              if (open && activeConnection) loadSchemaOptions(activeConnection.id, schemaDatabaseKey, { intent: "explicit" }).catch(() => {});
             }
           "
         >
