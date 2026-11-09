@@ -433,6 +433,26 @@ export const CONNECTION_ATTEMPT_CANCELLED_MESSAGE = "Connection attempt was canc
 export const CONNECTION_PASSWORD_REQUIRED_MESSAGE = "Password is required for this connection";
 /** Passive callers must leave a user-closed connection closed until explicit reconnect. */
 export const CONNECTION_CLOSED_BY_USER_MESSAGE = "Connection was closed by the user";
+/** Bounded to full close, cancel, and local attempts; not a config/database lease. */
+export interface SchemaConnectionAcquisition {
+  readonly connectionId: string;
+  readonly stateRevision: number;
+  readonly requestRevision: number;
+}
+
+export interface SchemaConnectionAcquisitionOptions {
+  activate?: boolean;
+  verifyHealth?: boolean;
+  skipIfClosedByUser?: boolean;
+}
+
+type EnsureConnectedOptions = SchemaConnectionAcquisitionOptions & { forceReconnect?: boolean; allowPasswordPrompt?: boolean };
+type SchemaConnectionRequest = { connectionId: string; requestRevision: number; stateRevision?: number; skipIfClosedByUser?: boolean };
+type FullConnectionTeardown = { settled: Promise<void> };
+
+/** Acquisition preconditions, not network errors; callers must not record them as connection loss. */
+export const CONNECTION_SCHEMA_OWNER_PENDING_MESSAGE = "Connection readiness is owned by a direct connect; retry after it finishes";
+export const CONNECTION_SCHEMA_TEARDOWN_FAILED_MESSAGE = "Connection teardown is incomplete; close the connection successfully before acquiring schemas";
 const PLUGIN_CONFIG_RECONNECT_PASSWORD_MESSAGE = "Plugin settings were saved, but the connection was disconnected because its password is not available. Reconnect manually to apply the new settings.";
 
 function metadataDriverProfile(config?: ConnectionConfig): string | undefined {
@@ -682,7 +702,14 @@ export const useConnectionStore = defineStore("connection", () => {
   const metadataTraceLogger: MetadataLoadTraceLogger = (event) => {
     console.debug("[DBX][metadata-load:trace]", event);
   };
-  const connectInFlight = new Map<string, Promise<void>>();
+  const connectInFlight = new Map<string, Promise<SchemaConnectionAcquisition>>();
+  // These are separate from backend attempt-scoping: every full close owns a
+  // barrier from entry, including trace disposal and post-disconnect cleanup.
+  const fullConnectionTeardowns = new Map<string, Set<FullConnectionTeardown>>();
+  const unsafeFullConnectionTeardowns = new Map<string, number>();
+  const schemaConnectionRequestRevisions = new Map<string, number>();
+  // Retained after failure: absence of an active owner alone is not readiness.
+  const incompleteConnectionReadiness = new Map<string, number>();
   const disconnectInFlight = new Map<string, Promise<void>>();
   const disconnectInFlightScoped = new Map<string, boolean>();
   const cancelDisconnectInFlight = new Map<string, Promise<void>>();
@@ -1009,7 +1036,7 @@ export const useConnectionStore = defineStore("connection", () => {
 
   function beginLocalConnectionAttempt(connectionId: string): number {
     const attempt = ++nextLocalConnectionAttempt;
-    bumpConnectionStateRevision(connectionId);
+    incompleteConnectionReadiness.set(connectionId, bumpConnectionStateRevision(connectionId));
     activeLocalConnectionAttempts.set(connectionId, attempt);
     connectingIds.value.add(connectionId);
     const node = findConnectionNode(connectionId);
@@ -1043,6 +1070,52 @@ export const useConnectionStore = defineStore("connection", () => {
 
   function isCurrentConnectionStateRevision(connectionId: string, revision: number): boolean {
     return connectionStateRevision(connectionId) === revision;
+  }
+
+  function schemaConnectionRequestRevision(connectionId: string): number {
+    return schemaConnectionRequestRevisions.get(connectionId) ?? 0;
+  }
+
+  function revokeSchemaConnectionRequests(connectionId: string) {
+    schemaConnectionRequestRevisions.set(connectionId, schemaConnectionRequestRevision(connectionId) + 1);
+  }
+
+  function assertSchemaConnectionRequest(request: SchemaConnectionRequest) {
+    if (schemaConnectionRequestRevision(request.connectionId) !== request.requestRevision
+      || (request.stateRevision != null && !isCurrentConnectionStateRevision(request.connectionId, request.stateRevision))) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+    if (request.skipIfClosedByUser && isConnectionClosedByUser(request.connectionId)) throw new Error(CONNECTION_CLOSED_BY_USER_MESSAGE);
+    if (unsafeFullConnectionTeardowns.has(request.connectionId)) throw new Error(CONNECTION_SCHEMA_TEARDOWN_FAILED_MESSAGE);
+  }
+
+  /** Assert again after the caller's await, immediately before its schema work. */
+  function assertSchemaConnectionAcquisition(acquisition: SchemaConnectionAcquisition): void {
+    const { connectionId, stateRevision, requestRevision } = acquisition;
+    if (schemaConnectionRequestRevision(connectionId) !== requestRevision || !isCurrentConnectionStateRevision(connectionId, stateRevision)
+      || !connectedIds.value.has(connectionId) || fullConnectionTeardowns.has(connectionId)
+      || unsafeFullConnectionTeardowns.has(connectionId) || incompleteConnectionReadiness.get(connectionId) === stateRevision) {
+      throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+    }
+  }
+
+  function capturedSchemaConnectionAcquisition(connectionId: string, stateRevision: number, requestRevision: number): SchemaConnectionAcquisition {
+    return Object.freeze({ connectionId, stateRevision, requestRevision });
+  }
+
+  function markConnectionReadinessComplete(connectionId: string, stateRevision: number) {
+    if (incompleteConnectionReadiness.get(connectionId) === stateRevision) incompleteConnectionReadiness.delete(connectionId);
+  }
+
+  async function waitForFullConnectionTeardowns(request: SchemaConnectionRequest) {
+    assertSchemaConnectionRequest(request);
+    const pending = fullConnectionTeardowns.get(request.connectionId);
+    if (pending) await Promise.all([...pending].map((entry) => entry.settled));
+    assertSchemaConnectionRequest(request);
+  }
+
+  // Direct connect does not share the ensure producer. Never trust its early
+  // connected publication while quote/password work is still in flight.
+  function assertNoDirectConnectionOwner(connectionId: string) {
+    if (activeLocalConnectionAttempts.has(connectionId) && !connectInFlight.has(connectionId)) throw new Error(CONNECTION_SCHEMA_OWNER_PENDING_MESSAGE);
   }
 
   function isCurrentLocalConnectionAttempt(connectionId: string, attempt: number): boolean {
@@ -1147,7 +1220,7 @@ export const useConnectionStore = defineStore("connection", () => {
     return bounded;
   }
 
-  function startDisconnectRequest(connectionId: string): Promise<void> {
+  function startDisconnectRequest(connectionId: string, observeRequest?: (request: Promise<void>) => void): Promise<void> {
     const clientAttempt = activeLocalConnectionAttempts.get(connectionId) ?? successfulLocalConnectionAttempts.get(connectionId);
     let request: Promise<void>;
     try {
@@ -1155,6 +1228,7 @@ export const useConnectionStore = defineStore("connection", () => {
     } catch (error) {
       request = Promise.reject(error);
     }
+    observeRequest?.(request);
     return trackDisconnectRequest(connectionId, request, clientAttempt != null);
   }
 
@@ -1440,7 +1514,7 @@ export const useConnectionStore = defineStore("connection", () => {
     return Math.max(METADATA_LOAD_MIN_TIMEOUT_MS, boundedTimeoutSecs * 1000);
   }
 
-  async function withConnectionHealthTimeout(connectionId: string, promise: Promise<void>): Promise<void> {
+  async function withConnectionHealthTimeout(connectionId: string, promise: Promise<void>, assertCurrent?: () => void): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
@@ -1452,6 +1526,7 @@ export const useConnectionStore = defineStore("connection", () => {
         }),
       ]);
     } catch (error) {
+      assertCurrent?.();
       clearConnectionNodeLoading(connectionId);
       throw error;
     } finally {
@@ -1611,7 +1686,7 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
-  async function withConnectionAttemptTimeout<T>(promise: Promise<T>, config: ConnectionConfig): Promise<T> {
+  async function withConnectionAttemptTimeout<T>(promise: Promise<T>, config: ConnectionConfig, strictAttempt?: { localAttempt: number; assertCurrent: () => void }): Promise<T> {
     const timeoutMs = connectionAttemptTimeoutMs(config, tunnelProfileStore.profileById);
     const timeoutMessage = connectionAttemptTimeoutMessage(timeoutMs);
     let timedOut = false;
@@ -1621,12 +1696,20 @@ export const useConnectionStore = defineStore("connection", () => {
         if (!timedOut) return;
         const cleanupConnectionId = typeof connectionId === "string" && connectionId ? connectionId : config.id;
         if (connectedIds.value.has(cleanupConnectionId)) return;
+        if (strictAttempt) {
+          // The async cleanup helper also contains synchronous backend throws.
+          void cleanupResolvedCancelledConnectionAttempt(cleanupConnectionId, strictAttempt.localAttempt);
+          return;
+        }
         void api.disconnectDb(cleanupConnectionId).catch((error) => {
           console.warn("[DBX][connection:timeout-cleanup-failed]", { connectionId: cleanupConnectionId, error });
         });
       },
       (error) => {
         if (!timedOut) return;
+        if (strictAttempt) {
+          try { strictAttempt.assertCurrent(); } catch { return; }
+        }
         const current = connectionErrors.value[config.id];
         if (current !== timeoutMessage) return;
         setConnectionError(config.id, connectionAttemptOriginalErrorMessage(timeoutMessage, connectionErrorMessage(error)));
@@ -4521,9 +4604,10 @@ export const useConnectionStore = defineStore("connection", () => {
    * password is used for the immediate `connectDb` call and is persisted only
    * after a successful connection when the user selects "remember password".
    */
-  async function ensureConnectionPassword(config: ConnectionConfig, force = false): Promise<{ config: ConnectionConfig; rememberPassword: boolean }> {
+  async function ensureConnectionPassword(config: ConnectionConfig, force = false, assertRequest?: () => void): Promise<{ config: ConnectionConfig; rememberPassword: boolean }> {
     if (!force && (config.save_password !== false || config.password)) return { config, rememberPassword: false };
     const { useConnectionPasswordPromptStore } = await import("@/stores/connectionPasswordPromptStore");
+    assertRequest?.();
     const result = await useConnectionPasswordPromptStore().requestPassword({
       connectionId: config.id,
       connectionName: config.name,
@@ -4573,17 +4657,24 @@ export const useConnectionStore = defineStore("connection", () => {
     rebuildTreeNodes();
   }
 
-  async function connectDbWithPasswordRetry(config: ConnectionConfig, localAttempt: number): Promise<{ config: ConnectionConfig; id: string; rememberPassword: boolean }> {
+  async function connectDbWithPasswordRetry(config: ConnectionConfig, localAttempt: number, assertRequest?: () => void): Promise<{ config: ConnectionConfig; id: string; rememberPassword: boolean }> {
+    const connectionId = config.id;
+    const strictAttempt = assertRequest ? { localAttempt, assertCurrent: () => {
+      assertRequest();
+      ensureLocalConnectionAttemptActive(connectionId, localAttempt);
+    } } : undefined;
     try {
-      const id = await withConnectionAttemptTimeout(api.connectDb(config, localAttempt), config);
+      const id = await withConnectionAttemptTimeout(api.connectDb(config, localAttempt), config, strictAttempt);
       return { config, id, rememberPassword: false };
     } catch (error) {
       const message = connectionErrorMessage(error);
       if (!isMysqlMissingPasswordFailure(config, message) && !isSqliteMissingEncryptionPasswordFailure(config, message)) throw error;
-      const prompted = await ensureConnectionPassword(config, true);
+      assertRequest?.();
+      const prompted = await ensureConnectionPassword(config, true, assertRequest);
+      assertRequest?.();
       config = prompted.config;
       ensureLocalConnectionAttemptActive(config.id, localAttempt);
-      const id = await withConnectionAttemptTimeout(api.connectDb(config, localAttempt), config);
+      const id = await withConnectionAttemptTimeout(api.connectDb(config, localAttempt), config, strictAttempt);
       return { config, id, rememberPassword: prompted.rememberPassword };
     }
   }
@@ -4667,6 +4758,7 @@ export const useConnectionStore = defineStore("connection", () => {
       }
       ensureLocalConnectionAttemptActive(config.id, localAttempt);
       if (!isCurrentConnectionStateRevision(config.id, connectStateRevision) || !isCurrentConnectionStateRevision(id, connectedStateRevision) || !connectedIds.value.has(id)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+      markConnectionReadinessComplete(config.id, connectStateRevision);
       return id;
     } catch (e) {
       // Retired work must not clear or replace a newer owner's error.
@@ -4687,6 +4779,8 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   async function cancelConnecting(connectionId: string): Promise<boolean> {
+    // Also invalidates strict requests still waiting before a local attempt exists.
+    revokeSchemaConnectionRequests(connectionId);
     const localAttempt = getLocalConnectionAttempt(connectionId);
     if (localAttempt == null) return false;
     const disconnectRequest = startCancelDisconnectRequest(connectionId, localAttempt);
@@ -4732,71 +4826,106 @@ export const useConnectionStore = defineStore("connection", () => {
    * `disconnectTabHandlingMode`，否则会把刚保留下来的 SQL 页签又关掉。
    */
   async function disconnect(connectionId: string, options: { skipTabHandling?: boolean; markClosedByUser?: boolean } = {}) {
-    // Publish user intent before any asynchronous cleanup. System cleanup never clears it.
-    if (options.markClosedByUser !== false) markConnectionClosedByUser(connectionId);
-    const stateRevision = bumpConnectionStateRevision(connectionId);
-    const shouldRemoveOneTimeConnection = getConfig(connectionId)?.one_time === true;
-    if (hasSqlServerActivityTraceForConnection(connectionId)) await disposeSqlServerActivityTracesForConnection(connectionId);
-    const disconnectRequest = startDisconnectRequest(connectionId);
-    cancelLocalConnectionAttempt(connectionId);
+    revokeSchemaConnectionRequests(connectionId);
+    const closeRevision = schemaConnectionRequestRevision(connectionId);
+    let settle!: () => void;
+    const barrier: FullConnectionTeardown = { settled: new Promise<void>((resolve) => { settle = resolve; }) };
+    const barriers = fullConnectionTeardowns.get(connectionId) ?? new Set<FullConnectionTeardown>();
+    barriers.add(barrier);
+    fullConnectionTeardowns.set(connectionId, barriers);
+    let disconnectRequest: Promise<void> | undefined;
+    let rawDisconnect: Promise<void> | undefined;
+    let backendSettled = false;
+    let completed = false;
+    const release = () => {
+      barriers.delete(barrier);
+      if (barriers.size === 0 && fullConnectionTeardowns.get(connectionId) === barriers) fullConnectionTeardowns.delete(connectionId);
+      settle();
+    };
+    try {
+      // Publish user intent before any asynchronous cleanup. System cleanup never clears it.
+      if (options.markClosedByUser !== false) markConnectionClosedByUser(connectionId);
+      const stateRevision = bumpConnectionStateRevision(connectionId);
+      const shouldRemoveOneTimeConnection = getConfig(connectionId)?.one_time === true;
+      if (hasSqlServerActivityTraceForConnection(connectionId)) await disposeSqlServerActivityTracesForConnection(connectionId);
+      disconnectRequest = startDisconnectRequest(connectionId, (request) => {
+        rawDisconnect = request;
+        // Observe rejection immediately, even if another cleanup step fails first.
+        void request.then(() => { backendSettled = true; }, () => { backendSettled = true; });
+      });
+      cancelLocalConnectionAttempt(connectionId);
 
-    connectedIds.value.delete(connectionId);
-    clearEtcdAccessCapabilities(connectionId);
-    clearSidebarStorageCaches(connectionId);
-    clearPrimaryVisibleObjectNames(connectionId);
-    clearConnectionIdentifierQuote(connectionId);
-    forgetSuccessfulLocalConnectionAttempt(connectionId);
-    clearConnectionHealthCheck(connectionId);
-    clearConnectionPrewarmState(connectionId);
-    const node = findConnectionNode(connectionId);
-    if (node) {
-      node.isLoading = false;
-      node.isExpanded = false;
-      node.children = [];
-    }
-    clearConnectionRootMetadataLoad(connectionId);
-    cancelObjectDdlLoadsForConnection(connectionId);
-    cancelObjectMetadataLoadsForConnection(connectionId);
-    clearMetadataRuntimeCacheForConnection(connectionId);
-    // Disconnecting only tears down the live session. Keep the schema snapshot so
-    // reconnecting can render databases and table names before the remote refresh.
-    clearLoadedChildrenCache(connectionId, { deletePersisted: false });
-    if (activeConnectionId.value === connectionId) {
-      activeConnectionId.value = null;
-    }
-    invalidateCompletionCache(connectionId);
-    invalidateObjectBrowserRowsCache({ connectionId });
-    await invalidateSidebarTableSearchIndexesForConnection(connectionId);
-    const { useQueryStore } = await import("@/stores/queryStore");
-    const queryStore = useQueryStore();
-    // 断开连接是明确的元数据新鲜度边界：数据标签页保留展示/编辑状态，但
-    // 其 tableMeta 不得再被视为 warm cache（issue #6623——reconnect 后重开
-    // 同表必须重新拉取结构）。completion/object-browser 缓存上面已清；
-    // 这里再走统一 helper，bump 连接代次并清 data-tab freshness。
-    invalidateConnectionMetadataLifetime(connectionId);
-    if (!options.skipTabHandling) {
-      switch (settingsStore.editorSettings.disconnectTabHandlingMode) {
-        case "close-tabs":
-          queryStore.closeConnectionTabs(connectionId);
-          break;
-        case "keep-tabs-clear-results":
-          queryStore.releaseConnectionTabs(connectionId);
-          break;
-        case "keep-tabs-keep-results":
-          queryStore.rollbackConnectionTransactions(connectionId);
-          break;
+      connectedIds.value.delete(connectionId);
+      clearEtcdAccessCapabilities(connectionId);
+      clearSidebarStorageCaches(connectionId);
+      clearPrimaryVisibleObjectNames(connectionId);
+      clearConnectionIdentifierQuote(connectionId);
+      forgetSuccessfulLocalConnectionAttempt(connectionId);
+      clearConnectionHealthCheck(connectionId);
+      clearConnectionPrewarmState(connectionId);
+      const node = findConnectionNode(connectionId);
+      if (node) {
+        node.isLoading = false;
+        node.isExpanded = false;
+        node.children = [];
       }
-    }
-    // Tab handling is synchronous in memory, but persistence is debounced. Flush
-    // the scoped tab state before disconnect returns so a quick reconnect/restart
-    // cannot restore tabs that the selected policy already removed.
-    await queryStore.flushPendingPersist().catch(() => undefined);
-    await disconnectRequest;
-    if (isCurrentConnectionStateRevision(connectionId, stateRevision)) {
-      clearConnectionError(connectionId);
-    }
-    if (shouldRemoveOneTimeConnection && isCurrentConnectionStateRevision(connectionId, stateRevision)) {
-      await removeConnection(connectionId);
+      clearConnectionRootMetadataLoad(connectionId);
+      cancelObjectDdlLoadsForConnection(connectionId);
+      cancelObjectMetadataLoadsForConnection(connectionId);
+      clearMetadataRuntimeCacheForConnection(connectionId);
+      // Disconnecting only tears down the live session. Keep the schema snapshot so
+      // reconnecting can render databases and table names before the remote refresh.
+      clearLoadedChildrenCache(connectionId, { deletePersisted: false });
+      if (activeConnectionId.value === connectionId) {
+        activeConnectionId.value = null;
+      }
+      invalidateCompletionCache(connectionId);
+      invalidateObjectBrowserRowsCache({ connectionId });
+      await invalidateSidebarTableSearchIndexesForConnection(connectionId);
+      const { useQueryStore } = await import("@/stores/queryStore");
+      const queryStore = useQueryStore();
+      // 断开连接是明确的元数据新鲜度边界：数据标签页保留展示/编辑状态，但
+      // 其 tableMeta 不得再被视为 warm cache（issue #6623——reconnect 后重开
+      // 同表必须重新拉取结构）。completion/object-browser 缓存上面已清；
+      // 这里再走统一 helper，bump 连接代次并清 data-tab freshness。
+      invalidateConnectionMetadataLifetime(connectionId);
+      if (!options.skipTabHandling) {
+        switch (settingsStore.editorSettings.disconnectTabHandlingMode) {
+          case "close-tabs":
+            queryStore.closeConnectionTabs(connectionId);
+            break;
+          case "keep-tabs-clear-results":
+            queryStore.releaseConnectionTabs(connectionId);
+            break;
+          case "keep-tabs-keep-results":
+            queryStore.rollbackConnectionTransactions(connectionId);
+            break;
+        }
+      }
+      // Tab handling is synchronous in memory, but persistence is debounced. Flush
+      // the scoped tab state before disconnect returns so a quick reconnect/restart
+      // cannot restore tabs that the selected policy already removed.
+      await queryStore.flushPendingPersist().catch(() => undefined);
+      await disconnectRequest;
+      if (isCurrentConnectionStateRevision(connectionId, stateRevision)) {
+        clearConnectionError(connectionId);
+      }
+      if (shouldRemoveOneTimeConnection && isCurrentConnectionStateRevision(connectionId, stateRevision)) {
+        await removeConnection(connectionId);
+      }
+      completed = true;
+    } finally {
+      // Preserve legacy bounded completion and early cleanup failures. The
+      // tracked bounded request already observes rejection; raw retirement is
+      // independently owned here, including after a resolving timeout.
+      if (!completed || !backendSettled) {
+        unsafeFullConnectionTeardowns.set(connectionId, Math.max(closeRevision, unsafeFullConnectionTeardowns.get(connectionId) ?? 0));
+      } else if (barriers.size === 1 && (unsafeFullConnectionTeardowns.get(connectionId) ?? 0) <= closeRevision) {
+        // An older successful close cannot acknowledge a newer failed close.
+        unsafeFullConnectionTeardowns.delete(connectionId);
+      }
+      if (rawDisconnect && !backendSettled) void rawDisconnect.then(release, release);
+      else release();
     }
   }
 
@@ -4849,22 +4978,93 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   /** Passive callers opt in; explicit navigation, execution and refresh keep reconnecting. */
-  async function ensureConnected(connectionId: string, options: { activate?: boolean; verifyHealth?: boolean; forceReconnect?: boolean; allowPasswordPrompt?: boolean; skipIfClosedByUser?: boolean } = {}) {
+  async function ensureConnected(connectionId: string, options: EnsureConnectedOptions = {}): Promise<void> {
+    await ensureConnectionReady(connectionId, options);
+  }
+
+  /**
+   * Opt-in schema gate. A fresh explicit request may reconnect after a close;
+   * a later close/cancel invalidates this request even before it owns an attempt.
+   * Prompt policy is unchanged. This is not a config/database/alias lease, and
+   * cancellation settles when the awaited backend or prerequisite settles.
+   */
+  async function acquireSchemaConnection(connectionId: string, options: SchemaConnectionAcquisitionOptions = {}): Promise<SchemaConnectionAcquisition> {
+    const request: SchemaConnectionRequest = { connectionId, requestRevision: schemaConnectionRequestRevision(connectionId), skipIfClosedByUser: options.skipIfClosedByUser };
+    try {
+      const acquired = await ensureConnectionReady(connectionId, options, request);
+      assertSchemaConnectionRequest(request);
+      if (!acquired) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+      assertSchemaConnectionAcquisition(acquired);
+      return acquired;
+    } catch (error) {
+      // Rejection also crosses an await: a revoked gate must not report an old
+      // network failure as if it belonged to the user's newer request.
+      assertSchemaConnectionRequest(request);
+      throw error;
+    }
+  }
+
+  async function joinSchemaConnectionOwner(owner: Promise<SchemaConnectionAcquisition>, request: SchemaConnectionRequest): Promise<SchemaConnectionAcquisition> {
+    const joinedStateRevision = connectionStateRevision(request.connectionId);
+    request.stateRevision = joinedStateRevision;
+    try {
+      const acquired = await owner;
+      assertSchemaConnectionRequest(request);
+      assertSchemaConnectionAcquisition(acquired);
+      return acquired;
+    } catch (error) {
+      assertSchemaConnectionRequest(request);
+      if (!isCurrentConnectionStateRevision(request.connectionId, joinedStateRevision) || isSupersededConnectionAttempt(error)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+      throw error;
+    }
+  }
+
+  async function ensureConnectionReady(connectionId: string, options: EnsureConnectedOptions, request?: SchemaConnectionRequest): Promise<SchemaConnectionAcquisition | undefined> {
+    const assertRequest = request ? () => assertSchemaConnectionRequest(request) : undefined;
+    if (request) {
+      assertRequest!();
+      if (fullConnectionTeardowns.has(connectionId)) await waitForFullConnectionTeardowns(request);
+      assertRequest!();
+      assertNoDirectConnectionOwner(connectionId);
+      // The producer carries readiness past quote/password persistence. Joining
+      // precedes the connected fast path because connected is published earlier.
+      const owner = connectInFlight.get(connectionId);
+      if (owner) {
+        const acquired = await joinSchemaConnectionOwner(owner, request);
+        assertRequest!();
+        assertSchemaConnectionAcquisition(acquired);
+        if (options.activate !== false) activeConnectionId.value = connectionId;
+        return acquired;
+      }
+    }
     if (options.skipIfClosedByUser && isConnectionClosedByUser(connectionId)) throw new Error(CONNECTION_CLOSED_BY_USER_MESSAGE);
-    if (!options.forceReconnect && connectedIds.value.has(connectionId)) {
+    if (!options.forceReconnect && connectedIds.value.has(connectionId) && (!request || incompleteConnectionReadiness.get(connectionId) !== connectionStateRevision(connectionId))) {
+      if (request) request.stateRevision = connectionStateRevision(connectionId);
+      const ready = request ? capturedSchemaConnectionAcquisition(connectionId, request.stateRevision!, request.requestRevision) : undefined;
+      const finishReady = () => {
+        if (ready) {
+          assertSchemaConnectionAcquisition(ready);
+          if (options.activate !== false) activeConnectionId.value = connectionId;
+        }
+        return ready;
+      };
       // Pure navigation can safely trust the existing connected state. Its
       // destination will perform the real API request, while blocking here on
       // a health probe makes an otherwise local tab switch take up to 5s.
-      if (options.verifyHealth === false) return;
-      if (hasRecentConnectionHealthCheck(connectionId)) return;
+      if (options.verifyHealth === false) return finishReady();
+      if (hasRecentConnectionHealthCheck(connectionId)) return finishReady();
       const stateRevision = connectionStateRevision(connectionId);
       // Optimistic: verify backend pool is actually healthy
       try {
-        await withConnectionHealthTimeout(connectionId, api.checkConnectionHealth(connectionId));
+        await withConnectionHealthTimeout(connectionId, api.checkConnectionHealth(connectionId), ready ? () => assertSchemaConnectionAcquisition(ready) : undefined);
         if (!isCurrentConnectionStateRevision(connectionId, stateRevision)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+        assertRequest?.();
+        if (ready) assertSchemaConnectionAcquisition(ready);
         markConnectionHealthChecked(connectionId);
-        return;
+        return finishReady();
       } catch {
+        assertRequest?.();
+        if (ready) assertSchemaConnectionAcquisition(ready);
         // A late probe must not undo an explicit disconnect or a newer reconnect.
         if (!isCurrentConnectionStateRevision(connectionId, stateRevision)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
         // Backend pool is dead — remove from connectedIds and reconnect.
@@ -4885,9 +5085,11 @@ export const useConnectionStore = defineStore("connection", () => {
     let config = getConfig(connectionId);
     if (!config) {
       await initFromDisk();
+      assertRequest?.();
       if (options.skipIfClosedByUser && isConnectionClosedByUser(connectionId)) throw new Error(CONNECTION_CLOSED_BY_USER_MESSAGE);
       config = getConfig(connectionId);
     }
+    assertRequest?.();
     if (!config) {
       const error = new Error("Connection config not found");
       recordConnectionError(connectionId, error);
@@ -4895,50 +5097,82 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     const expectedConfigFingerprint = connectionConfigFingerprint(config);
     if (getBlockingDisconnectInFlight(connectionId)) await waitForBlockingDisconnectInFlight(connectionId);
+    assertRequest?.();
+    if (request) {
+      if (fullConnectionTeardowns.has(connectionId)) await waitForFullConnectionTeardowns(request);
+      assertRequest!();
+      assertNoDirectConnectionOwner(connectionId);
+    }
     // Neither pre-attempt wait is owned by localAttempt yet. Recheck before joining or starting.
     if (options.skipIfClosedByUser && isConnectionClosedByUser(connectionId)) throw new Error(CONNECTION_CLOSED_BY_USER_MESSAGE);
     const existingConnect = connectInFlight.get(connectionId);
     if (existingConnect) {
       const joinedStateRevision = connectionStateRevision(connectionId);
-      await existingConnect;
+      const acquired = request ? await joinSchemaConnectionOwner(existingConnect, request) : await existingConnect;
+      assertRequest?.();
+      if (request) assertSchemaConnectionAcquisition(acquired);
       // The owner may already have retired its local attempt in finally. Its
       // revision and connected state, not an active-attempt token, fence this join.
       if (!isCurrentConnectionStateRevision(connectionId, joinedStateRevision) || !connectedIds.value.has(connectionId)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       if (options.activate !== false) activeConnectionId.value = connectionId;
-      return;
+      return request ? acquired : undefined;
     }
     const localAttempt = beginLocalConnectionAttempt(connectionId);
     const connectStateRevision = connectionStateRevision(connectionId);
+    const connectRequestRevision = schemaConnectionRequestRevision(connectionId);
+    if (request) request.stateRevision = connectStateRevision;
     const connectPromise = (async () => {
       let rememberPassword = false;
       // Fast-path the common case (password saved or no password needed) so the
       // in-flight dedup above keeps its exact microtask cadence; only await the
       // interactive prompt when the connection actually needs a typed password.
-      if (connectionNeedsPasswordPrompt(config) && (await pluginConnectionPasswordPromptNeeded(config)) && !(await hasSessionCredential(connectionId))) {
-        if (options.allowPasswordPrompt === false) throw new Error(CONNECTION_PASSWORD_REQUIRED_MESSAGE);
-        const prompted = await ensureConnectionPassword(config);
-        config = prompted.config;
-        rememberPassword = prompted.rememberPassword;
+      if (request && connectionNeedsPasswordPrompt(config)) {
+        const needsPrompt = await pluginConnectionPasswordPromptNeeded(config);
+        assertRequest!();
+        if (needsPrompt) {
+          const hasCredential = await hasSessionCredential(connectionId);
+          assertRequest!();
+          if (!hasCredential) {
+            const prompted = await ensureConnectionPassword(config, false, assertRequest);
+            assertRequest!();
+            config = prompted.config;
+            rememberPassword = prompted.rememberPassword;
+          }
+        }
+      } else if (!request) {
+        if (connectionNeedsPasswordPrompt(config) && (await pluginConnectionPasswordPromptNeeded(config)) && !(await hasSessionCredential(connectionId))) {
+          if (options.allowPasswordPrompt === false) throw new Error(CONNECTION_PASSWORD_REQUIRED_MESSAGE);
+          const prompted = await ensureConnectionPassword(config);
+          config = prompted.config;
+          rememberPassword = prompted.rememberPassword;
+        }
       }
+      assertRequest?.();
       await beforeConnectHandler?.(config);
+      assertRequest?.();
       if (config.db_type === "sqlserver") {
         await ensureSqlServerLegacyCompatibilityComponentInstalled(config);
+        assertRequest?.();
       }
       ensureLocalConnectionAttemptActive(connectionId, localAttempt);
-      const connection = await connectDbWithPasswordRetry(config, localAttempt);
+      const connection = await connectDbWithPasswordRetry(config, localAttempt, assertRequest);
       config = connection.config;
       rememberPassword ||= connection.rememberPassword;
       const id = connection.id;
       await ensureLocalConnectionAttemptActiveAfterConnectResult(connectionId, localAttempt, id);
+      assertRequest?.();
       await syncMongoLegacyDriverFallback(connectionId, config);
       await ensureLocalConnectionAttemptActiveAfterConnectResult(connectionId, localAttempt, id);
+      assertRequest?.();
       ensureLocalConnectionAttemptActive(connectionId, localAttempt);
       if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+      assertRequest?.();
       connectedIds.value.add(connectionId);
       clearConnectionClosedByUser(connectionId);
       if (config.db_type !== "plugin") {
         void refreshConnectedDatabaseInfo(connectionId, config);
         await refreshConnectionIdentifierQuote(connectionId, config);
+        assertRequest?.();
         ensureLocalConnectionAttemptActive(connectionId, localAttempt);
         if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision) || !connectedIds.value.has(connectionId)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
         void refreshConnectionDatabaseModes(connectionId, config);
@@ -4949,20 +5183,31 @@ export const useConnectionStore = defineStore("connection", () => {
       try {
         await persistRememberedConnectionPassword(config, rememberPassword, expectedConfigFingerprint);
       } catch (error) {
+        assertRequest?.();
         ensureLocalConnectionAttemptActive(connectionId, localAttempt);
         if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision) || !connectedIds.value.has(connectionId)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
         setConnectionError(connectionId, i18n.global.t("connection.rememberPasswordSaveFailed", { message: connectionErrorMessage(error) }));
       }
+      assertRequest?.();
+      ensureLocalConnectionAttemptActive(connectionId, localAttempt);
+      if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision) || !connectedIds.value.has(connectionId)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+      markConnectionReadinessComplete(connectionId, connectStateRevision);
+      return capturedSchemaConnectionAcquisition(connectionId, connectStateRevision, connectRequestRevision);
     })();
     connectInFlight.set(connectionId, connectPromise);
     try {
-      await connectPromise;
+      const acquired = await connectPromise;
+      assertRequest?.();
+      if (request) assertSchemaConnectionAcquisition(acquired);
       ensureLocalConnectionAttemptActive(connectionId, localAttempt);
       if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision) || !connectedIds.value.has(connectionId)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       if (options.activate !== false) activeConnectionId.value = connectionId;
+      return request ? acquired : undefined;
     } catch (e) {
+      assertRequest?.();
       // Do not let late completion erase an error published after close/reconnect.
       if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision) || !isCurrentLocalConnectionAttempt(connectionId, localAttempt)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
+      if (request && (isCancelledConnectionAttempt(e) || isSupersededConnectionAttempt(e))) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       if (isCancelledLocalConnectionAttempt(connectionId, localAttempt)) {
         clearConnectionError(connectionId);
         throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
@@ -10256,6 +10501,8 @@ export const useConnectionStore = defineStore("connection", () => {
     hasSessionCredential,
     closeDatabaseConnection,
     ensureConnected,
+    acquireSchemaConnection,
+    assertSchemaConnectionAcquisition,
     warmConnection,
     loadConnectedConnectionRootForSidebarSearch,
     isTreeNodeChildrenLoaded,
