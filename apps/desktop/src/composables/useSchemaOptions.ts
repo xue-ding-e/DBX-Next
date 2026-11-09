@@ -49,9 +49,6 @@ export function useSchemaOptions() {
       try {
         await connectionStore.ensureConnected(connectionId);
         schemaOptions.value[key] = schemaOptionsForConnection(await api.listSchemas(connectionId, database), connection, database);
-      } catch (e) {
-        schemaOptions.value[key] = [];
-        throw e;
       } finally {
         loadingSchemaOptions.value[key] = false;
         schemaRequests.delete(key);
