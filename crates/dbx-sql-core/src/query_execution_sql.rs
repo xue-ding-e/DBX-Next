@@ -529,44 +529,71 @@ pub fn classify_search_engine_query_risk(source: &str, database_type: DatabaseTy
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_ascii_uppercase();
     let path = parts.next()?;
-    let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
-    let segments = path.split('/').filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
-    let has_segment = |candidate: &str| segments.iter().any(|segment| segment.eq_ignore_ascii_case(candidate));
-    let has_document_id = |candidate: &str| {
-        segments
-            .iter()
-            .position(|segment| segment.eq_ignore_ascii_case(candidate))
-            .is_some_and(|index| segments.get(index + 1).is_some_and(|value| !value.is_empty()))
-    };
-
-    match method.as_str() {
-        "GET" | "HEAD" | "OPTIONS" => Some(SearchEngineQueryRisk::ReadOnly),
-        "POST"
-            if [
-                "_search",
-                "_count",
-                "_sql",
-                "_msearch",
-                "_field_caps",
-                "_terms_enum",
-                "_validate",
-                "_explain",
-                "_rank_eval",
-                "_search_shards",
-            ]
-            .iter()
-            .any(|endpoint| has_segment(endpoint)) =>
-        {
-            Some(SearchEngineQueryRisk::ReadOnly)
-        }
-        "POST" if ["_doc", "_create", "_update", "_bulk"].iter().any(|endpoint| has_segment(endpoint)) => {
-            Some(SearchEngineQueryRisk::Write)
-        }
-        "PUT" if has_document_id("_doc") || has_document_id("_create") => Some(SearchEngineQueryRisk::Write),
-        "DELETE" if has_document_id("_doc") => Some(SearchEngineQueryRisk::Write),
-        "POST" | "PUT" | "PATCH" | "DELETE" => Some(SearchEngineQueryRisk::Dangerous),
-        _ => None,
+    // The transport adds a leading slash but does not lowercase or decode paths.
+    let path = path.split('?').next().unwrap_or(path);
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let segments = path.split('/').collect::<Vec<_>>();
+    if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        return Some(SearchEngineQueryRisk::ReadOnly);
     }
+    if !matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        return None;
+    }
+    // Do not infer a safe route after URL normalization or percent decoding.
+    // Empty/dot segments and encoded paths need a separate transport-aware review.
+    if segments.iter().any(|segment| {
+        segment.is_empty() || matches!(*segment, "." | "..") || segment.contains(['%', '\\', '#'])
+    }) {
+        return Some(SearchEngineQueryRisk::Dangerous);
+    }
+    // Root resources such as /_scripts/{id} are not index-scoped endpoints.
+    let indexed = segments.len() > 1 && (!segments[0].starts_with('_') || segments[0] == "_all");
+    let route = if indexed { &segments[1..] } else { &segments[..] };
+    let endpoint = route[0];
+    let document = indexed && route.len() == 2;
+    let risk = match method.as_str() {
+        // Match complete route shapes: an ID named _search is still an ID.
+        "POST" if document && matches!(endpoint, "_doc" | "_create" | "_update") => SearchEngineQueryRisk::Write,
+        "POST"
+            if (indexed && route.len() == 1 && endpoint == "_doc") || (route.len() == 1 && endpoint == "_bulk") =>
+        {
+            SearchEngineQueryRisk::Write
+        }
+        "POST"
+            if route.len() == 1
+                && matches!(endpoint, "_search" | "_count" | "_msearch" | "_field_caps" | "_rank_eval" | "_search_shards") =>
+        {
+            SearchEngineQueryRisk::ReadOnly
+        }
+        "POST" if indexed && route.len() == 1 && endpoint == "_terms_enum" => SearchEngineQueryRisk::ReadOnly,
+        "POST" if document && endpoint == "_explain" => SearchEngineQueryRisk::ReadOnly,
+        "POST"
+            if route.len() == 2
+                && ((endpoint == "_validate" && route[1] == "query")
+                    || (matches!(endpoint, "_search" | "_msearch") && route[1] == "template")) =>
+        {
+            SearchEngineQueryRisk::ReadOnly
+        }
+        "POST"
+            if !indexed
+                && endpoint == "_sql"
+                && (route.len() == 1 || (route.len() == 2 && matches!(route[1], "translate" | "close"))) =>
+        {
+            SearchEngineQueryRisk::ReadOnly
+        }
+        "POST"
+            if !indexed && endpoint == "_search" && route.get(1) == Some(&"scroll") && matches!(route.len(), 2 | 3) =>
+        {
+            SearchEngineQueryRisk::ReadOnly
+        }
+        "PUT" if document && matches!(endpoint, "_doc" | "_create") => SearchEngineQueryRisk::Write,
+        "DELETE" if document && endpoint == "_doc" => SearchEngineQueryRisk::Write,
+        // Legacy typed, feature-flagged slice, and vendor/plugin routes are not
+        // interchangeable with these untyped routes. Unknown POSTs fail closed.
+        _ => SearchEngineQueryRisk::Dangerous,
+    };
+    Some(risk)
 }
 
 /// Solr REST 写请求集中在 `/{core}/update`（含 JSON/XML/CSV update handlers）；
@@ -2420,6 +2447,123 @@ mod tests {
                 &format!("DBX DYNAMODB {operation}\ntable: \"orders\""),
                 DatabaseType::DynamoDb
             ));
+        }
+    }
+
+    #[test]
+    fn classifies_elasticsearch_route_roles() {
+        // Keep these route-role cases aligned with elasticsearchRequestRisk.test.ts.
+        let cases = [
+            ("POST /books/_doc/_search", SearchEngineQueryRisk::Write),
+            ("POST /books/_doc/_count", SearchEngineQueryRisk::Write),
+            ("POST /books/_doc/_sql", SearchEngineQueryRisk::Write),
+            ("POST /books/_doc/_bulk", SearchEngineQueryRisk::Write),
+            ("POST /books/_doc/_doc", SearchEngineQueryRisk::Write),
+            ("POST /books/_doc/plain-id", SearchEngineQueryRisk::Write),
+            ("POST /books/_create/_search", SearchEngineQueryRisk::Write),
+            ("POST /books/_create/_count", SearchEngineQueryRisk::Write),
+            ("POST /books/_create/_sql", SearchEngineQueryRisk::Write),
+            ("POST /books/_create/_bulk", SearchEngineQueryRisk::Write),
+            ("POST /books/_create/_doc", SearchEngineQueryRisk::Write),
+            ("POST /books/_create/plain-id", SearchEngineQueryRisk::Write),
+            ("POST /books/_update/_search", SearchEngineQueryRisk::Write),
+            ("POST /books/_update/_count", SearchEngineQueryRisk::Write),
+            ("POST /books/_update/_sql", SearchEngineQueryRisk::Write),
+            ("POST /books/_update/_bulk", SearchEngineQueryRisk::Write),
+            ("POST /books/_update/_doc", SearchEngineQueryRisk::Write),
+            ("POST /books/_update/plain-id", SearchEngineQueryRisk::Write),
+            ("POST /books/_doc", SearchEngineQueryRisk::Write),
+            ("POST /_bulk", SearchEngineQueryRisk::Write),
+            ("POST /books/_bulk", SearchEngineQueryRisk::Write),
+            ("PUT /books/_doc/_search", SearchEngineQueryRisk::Write),
+            ("PUT /books/_create/_sql", SearchEngineQueryRisk::Write),
+            ("DELETE /books/_doc/_count", SearchEngineQueryRisk::Write),
+            ("post books/_doc/_search?refresh=true", SearchEngineQueryRisk::Write),
+            ("POST /books/_doc/_search/", SearchEngineQueryRisk::Write),
+            ("POST /_search", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_search", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_count", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_count", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_msearch", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_msearch", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_field_caps", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_field_caps", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_rank_eval", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_rank_eval", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_search_shards", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_search_shards", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_validate/query", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_validate/query", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_search/template", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_search/template", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_msearch/template", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_msearch/template", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_terms_enum", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_explain/_doc", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_explain/_update", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_sql", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_sql/translate", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_sql/close", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_search/scroll", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_search/scroll/_doc", SearchEngineQueryRisk::ReadOnly),
+            ("post /books/_search?pretty=true", SearchEngineQueryRisk::ReadOnly),
+            ("POST /books/_search/", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_all/_search", SearchEngineQueryRisk::ReadOnly),
+            ("POST /.internal/_search", SearchEngineQueryRisk::ReadOnly),
+            ("POST books/_search", SearchEngineQueryRisk::ReadOnly),
+            ("POST /_scripts/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /_scripts/_count", SearchEngineQueryRisk::Dangerous),
+            ("POST /_doc/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_sql", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_sql/close", SearchEngineQueryRisk::Dangerous),
+            ("POST /_sql/close/extra", SearchEngineQueryRisk::Dangerous),
+            ("POST /_sql/unknown", SearchEngineQueryRisk::Dangerous),
+            ("POST /_terms_enum", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_validate", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_explain", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_create", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_update", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_bulk/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_doc/_search/extra", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_search/extra", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_search/scroll", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/type/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/slice/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_update_by_query", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_delete_by_query", SearchEngineQueryRisk::Dangerous),
+            ("POST /_reindex", SearchEngineQueryRisk::Dangerous),
+            ("PUT /books", SearchEngineQueryRisk::Dangerous),
+            ("DELETE /books", SearchEngineQueryRisk::Dangerous),
+            ("PUT /books/_doc", SearchEngineQueryRisk::Dangerous),
+            ("DELETE /books/_doc", SearchEngineQueryRisk::Dangerous),
+            ("PATCH /books/_doc/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_SEARCH", SearchEngineQueryRisk::Dangerous),
+            ("POST /books//_search", SearchEngineQueryRisk::Dangerous),
+            ("POST //books/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_search//", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/../_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/%2e%2e/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/%5Fsearch", SearchEngineQueryRisk::Dangerous),
+            ("POST /books\\other/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /books#ignored/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_doc/%5Fsearch", SearchEngineQueryRisk::Dangerous),
+            ("POST /<logs-{now/d}>/_search", SearchEngineQueryRisk::Dangerous),
+            ("POST /_plugins/_sql", SearchEngineQueryRisk::Dangerous),
+            ("POST /books/_search/template/extra", SearchEngineQueryRisk::Dangerous),
+            ("GET /books/_doc/_update", SearchEngineQueryRisk::ReadOnly),
+            ("HEAD /books", SearchEngineQueryRisk::ReadOnly),
+            ("OPTIONS /books", SearchEngineQueryRisk::ReadOnly),
+        ];
+        for database_type in [DatabaseType::Elasticsearch, DatabaseType::Easysearch] {
+            for (request, expected) in cases {
+                assert_eq!(classify_search_engine_query_risk(request, database_type), Some(expected), "{request}");
+                assert_eq!(is_write_sql_for_database(request, database_type), expected != SearchEngineQueryRisk::ReadOnly, "{request}");
+            }
+            assert_eq!(
+                classify_search_engine_query_risk("/* comment */ POST /books/_doc/_search\n{}", database_type),
+                Some(SearchEngineQueryRisk::Write)
+            );
+            assert_eq!(classify_search_engine_query_risk("SELECT * FROM books", database_type), None);
         }
     }
 

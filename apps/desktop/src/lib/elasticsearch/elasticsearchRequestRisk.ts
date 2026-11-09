@@ -11,8 +11,6 @@
 export type ElasticsearchRequestRisk = "read" | "write" | "dangerous";
 
 const REQUEST_LINE = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)/i;
-const READ_ONLY_POST_ENDPOINTS = ["_search", "_count", "_sql", "_msearch", "_field_caps", "_terms_enum", "_validate", "_explain", "_rank_eval", "_search_shards"];
-const WRITE_POST_ENDPOINTS = ["_doc", "_create", "_update", "_bulk"];
 const RISK_ORDER: Record<ElasticsearchRequestRisk, number> = { read: 0, write: 1, dangerous: 2 };
 
 interface ParsedRequestLine {
@@ -23,24 +21,45 @@ interface ParsedRequestLine {
 function parseRequestLine(line: string): ParsedRequestLine | null {
   const match = line.trim().match(REQUEST_LINE);
   if (!match) return null;
-  const path = (match[2].split("?", 1)[0] ?? "").replace(/\/+$/, "");
-  return { method: match[1].toUpperCase(), segments: path.split("/").filter(Boolean) };
+  // The transport adds a leading slash but does not lowercase or decode paths.
+  const path = (match[2].split("?", 1)[0] ?? "").replace(/^\//, "").replace(/\/$/, "");
+  return { method: match[1].toUpperCase(), segments: path.split("/") };
 }
 
 function classifyParsedRequest({ method, segments }: ParsedRequestLine): ElasticsearchRequestRisk {
-  const hasSegment = (candidate: string) => segments.some((segment) => segment.toLowerCase() === candidate);
-  const hasDocumentId = (candidate: string) => {
-    const index = segments.findIndex((segment) => segment.toLowerCase() === candidate);
-    return index >= 0 && !!segments[index + 1];
-  };
-
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") return "read";
+
+  // Do not infer a safe route after URL normalization or percent decoding.
+  // Empty/dot segments and encoded paths need a separate transport-aware review.
+  if (segments.some((segment) => !segment || segment === "." || segment === ".." || /[%\\#]/.test(segment))) return "dangerous";
+
+  // Root resources such as /_scripts/{id} are not index-scoped endpoints.
+  const isIndex = (segment: string) => !segment.startsWith("_") || segment === "_all";
+  const indexed = segments.length > 1 && isIndex(segments[0]);
+  const route = indexed ? segments.slice(1) : segments;
+  const endpoint = route[0];
+  const document = indexed && route.length === 2;
+
   if (method === "POST") {
-    if (READ_ONLY_POST_ENDPOINTS.some((endpoint) => hasSegment(endpoint))) return "read";
-    return WRITE_POST_ENDPOINTS.some((endpoint) => hasSegment(endpoint)) ? "write" : "dangerous";
+    // Match complete route shapes: an ID named _search is still an ID.
+    if (document && ["_doc", "_create", "_update"].includes(endpoint)) return "write";
+    if ((indexed && route.length === 1 && endpoint === "_doc") ||
+        (route.length === 1 && endpoint === "_bulk")) return "write";
+    if (route.length === 1 && ["_search", "_count", "_msearch", "_field_caps", "_rank_eval", "_search_shards"].includes(endpoint)) return "read";
+    if (indexed && route.length === 1 && endpoint === "_terms_enum") return "read";
+    if (document && endpoint === "_explain") return "read";
+    if (route.length === 2 && ((endpoint === "_validate" && route[1] === "query") ||
+        (["_search", "_msearch"].includes(endpoint) && route[1] === "template"))) return "read";
+    if (!indexed && endpoint === "_sql" && (route.length === 1 ||
+        (route.length === 2 && ["translate", "close"].includes(route[1])))) return "read";
+    if (!indexed && endpoint === "_search" && route[1] === "scroll" &&
+        (route.length === 2 || route.length === 3)) return "read";
+    // Legacy typed, feature-flagged slice, and vendor/plugin routes are not
+    // interchangeable with these untyped routes. Unknown POSTs fail closed.
+    return "dangerous";
   }
-  if (method === "PUT" && (hasDocumentId("_doc") || hasDocumentId("_create"))) return "write";
-  if (method === "DELETE" && hasDocumentId("_doc")) return "write";
+  if (method === "PUT" && document && ["_doc", "_create"].includes(endpoint)) return "write";
+  if (method === "DELETE" && document && endpoint === "_doc") return "write";
   return "dangerous";
 }
 
