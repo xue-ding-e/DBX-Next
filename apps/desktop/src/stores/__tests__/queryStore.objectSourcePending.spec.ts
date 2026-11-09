@@ -64,6 +64,25 @@ describe("queryStore pending object source tab", () => {
     mocks.connectionStore.dbType = "oracle";
   });
 
+  it("background revalidation preserves content when passive reconnect is rejected", async () => {
+    const source = "CREATE OR REPLACE VIEW app.v_orders AS SELECT 1 FROM dual";
+    mocks.getObjectSource.mockResolvedValue(objectSource(source));
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const id = store.openObjectSourceTabPending(pendingOptions({ name: "v_orders", objectType: "VIEW" }));
+    await settle();
+    mocks.getObjectSource.mockClear();
+    mocks.ensureConnected.mockClear();
+    mocks.ensureConnected.mockRejectedValueOnce(new Error("Connection was closed by the user"));
+
+    expect(store.openObjectSourceTabPending(pendingOptions({ name: "v_orders", objectType: "VIEW" }))).toBe(id);
+    await settle();
+
+    expect(mocks.ensureConnected).toHaveBeenCalledWith(CONNECTION_ID, { skipIfClosedByUser: true });
+    expect(mocks.getObjectSource).not.toHaveBeenCalled();
+    expect(store.tabs.find((tab) => tab.id === id)?.sql).toBe(source);
+  });
+
   it("creates a visible loading tab before the source arrives", async () => {
     let resolveSource: ((value: unknown) => void) | undefined;
     mocks.getObjectSource.mockReturnValue(new Promise((resolve) => (resolveSource = resolve)));

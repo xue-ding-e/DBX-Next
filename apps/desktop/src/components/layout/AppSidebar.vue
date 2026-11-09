@@ -158,7 +158,7 @@ async function confirmDeleteSelectedConnections() {
     await connectionStore.removeConnections(ids);
     for (const connectionId of ids) {
       // 页签已由 removeConnections 按「删除连接」策略处理，这里只清会话。
-      connectionStore.disconnect(connectionId, { skipTabHandling: true }).catch((error) => {
+      connectionStore.disconnect(connectionId, { skipTabHandling: true, markClosedByUser: false }).catch((error) => {
         console.warn("[DBX][connection:delete:disconnect-failed]", { connectionId, error });
       });
     }

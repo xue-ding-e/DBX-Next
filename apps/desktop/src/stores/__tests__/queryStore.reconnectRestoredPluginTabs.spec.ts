@@ -43,7 +43,7 @@ describe("queryStore reconnectRestoredPluginTabs", () => {
     // conn-2 owns the active tab (last open won) so it is replayed first;
     // activate:false keeps boot restore from stealing the active connection.
     expect(ensureConnected.mock.calls.map((call) => call[0])).toEqual(["conn-2", "conn-1"]);
-    expect(ensureConnected).toHaveBeenCalledWith("conn-1", { activate: false });
+    expect(ensureConnected).toHaveBeenCalledWith("conn-1", { activate: false, skipIfClosedByUser: true });
   });
 
   it("a per-connection failure does not abort the remaining replays", async () => {
@@ -56,6 +56,21 @@ describe("queryStore reconnectRestoredPluginTabs", () => {
 
     await expect(queryStore.reconnectRestoredPluginTabs()).resolves.toBeUndefined();
     expect(ensureConnected).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps passive intent for later connections after an earlier replay waits", async () => {
+    const queryStore = useQueryStore();
+    queryStore.openPluginWorkbench("io.dbx.ssh", "workbench", { connectionId: "conn-1", context: { connectionId: "conn-1" } });
+    queryStore.openPluginWorkbench("io.dbx.ssh", "workbench", { connectionId: "conn-2", context: { connectionId: "conn-2" } });
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    ensureConnected.mockImplementationOnce(() => waiting);
+    const pending = queryStore.reconnectRestoredPluginTabs();
+    expect(ensureConnected).toHaveBeenCalledTimes(1);
+    ensureConnected.mockRejectedValueOnce(new Error("Connection was closed by the user"));
+    release();
+    await expect(pending).resolves.toBeUndefined();
+    expect(ensureConnected).toHaveBeenLastCalledWith("conn-1", { activate: false, skipIfClosedByUser: true });
   });
 
   it("no plugin tabs means no replay", async () => {

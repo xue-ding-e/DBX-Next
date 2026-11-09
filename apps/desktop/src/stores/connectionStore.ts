@@ -431,6 +431,8 @@ type BeforeConnectHandler = (config: ConnectionConfig) => Promise<void>;
 export const CONNECTION_ATTEMPT_CANCELLED_MESSAGE = "Connection attempt was cancelled";
 /** Thrown when a no-save-password connection is connected without a typed password. */
 export const CONNECTION_PASSWORD_REQUIRED_MESSAGE = "Password is required for this connection";
+/** Passive callers must leave a user-closed connection closed until explicit reconnect. */
+export const CONNECTION_CLOSED_BY_USER_MESSAGE = "Connection was closed by the user";
 const PLUGIN_CONFIG_RECONNECT_PASSWORD_MESSAGE = "Plugin settings were saved, but the connection was disconnected because its password is not available. Reconnect manually to apply the new settings.";
 
 function metadataDriverProfile(config?: ConnectionConfig): string | undefined {
@@ -496,6 +498,9 @@ export const useConnectionStore = defineStore("connection", () => {
   const activePinnedTreeNodeReorderKey = ref<string | null>(null);
   let pinnedTreeNodePersistQueue: Promise<void> = Promise.resolve();
   const connectedIds = ref<Set<string>>(new Set());
+  /** Session-only intent, consumed only by skipIfClosedByUser callers. Explicit
+   * reconnect remains allowed; system cleanup and configuration edits retain intent. */
+  const userClosedConnectionIds = ref<Set<string>>(new Set());
   const etcdAccessCapabilities = ref<Record<string, EtcdAccessCapabilities>>({});
   const etcdAccessCapabilityGenerations = new Map<string, number>();
   const etcdAccessCapabilityLoads = new Map<string, Promise<EtcdAccessCapabilities>>();
@@ -1092,6 +1097,29 @@ export const useConnectionStore = defineStore("connection", () => {
   /** True while any disconnect for the connection is in flight (full or scoped). */
   function hasDisconnectInFlight(connectionId: string): boolean {
     return disconnectInFlight.has(connectionId);
+  }
+
+  /** 用户显式关闭过、且此后没有重新连上的连接（见 `userClosedConnectionIds`）。 */
+  function isConnectionClosedByUser(connectionId: string): boolean {
+    return !!connectionId && userClosedConnectionIds.value.has(connectionId);
+  }
+
+  function markConnectionClosedByUser(connectionId: string): void {
+    if (!connectionId || userClosedConnectionIds.value.has(connectionId)) return;
+    const next = new Set(userClosedConnectionIds.value);
+    next.add(connectionId);
+    userClosedConnectionIds.value = next;
+  }
+
+  /**
+   * 连接真的连上之后标记必须消失，否则页签界面会一直停在"连接已关闭"的空态：
+   * 用户点侧栏重连、按 Run、或在对话框里补上密码后，标记不能再拦后续的被动唤醒。
+   */
+  function clearConnectionClosedByUser(connectionId: string): void {
+    if (!connectionId || !userClosedConnectionIds.value.has(connectionId)) return;
+    const next = new Set(userClosedConnectionIds.value);
+    next.delete(connectionId);
+    userClosedConnectionIds.value = next;
   }
 
   async function waitForBlockingDisconnectInFlight(connectionId: string): Promise<void> {
@@ -4004,6 +4032,7 @@ export const useConnectionStore = defineStore("connection", () => {
     for (const id of removedIds) void api.deleteTableVGroupsForConnection(id).catch(() => {});
   }
   function applyConnectionRemoval(removedIds: ReadonlySet<string>, nextConnections: ConnectionConfig[], nextLayout: SidebarLayout) {
+    for (const id of removedIds) clearConnectionClosedByUser(id);
     connections.value = nextConnections;
     syncTimeoutInheritanceBackup();
     let nextPinnedOrder = pinnedTreeNodeOrder.value;
@@ -4561,6 +4590,7 @@ export const useConnectionStore = defineStore("connection", () => {
     const expectedConfigFingerprint = connectionConfigFingerprint(getConfig(config.id) ?? config);
     if (getBlockingDisconnectInFlight(config.id)) await waitForBlockingDisconnectInFlight(config.id);
     const localAttempt = beginLocalConnectionAttempt(config.id);
+    const connectStateRevision = connectionStateRevision(config.id);
     try {
       let rememberPassword = false;
       if (connectionNeedsPasswordPrompt(config) && (await pluginConnectionPasswordPromptNeeded(config)) && !(await hasSessionCredential(config.id))) {
@@ -4580,8 +4610,13 @@ export const useConnectionStore = defineStore("connection", () => {
       await ensureLocalConnectionAttemptActiveAfterConnectResult(config.id, localAttempt, id);
       await syncMongoLegacyDriverFallback(id, config);
       await ensureLocalConnectionAttemptActiveAfterConnectResult(config.id, localAttempt, id);
+      ensureLocalConnectionAttemptActive(config.id, localAttempt);
+      if (!isCurrentConnectionStateRevision(config.id, connectStateRevision)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       activeConnectionId.value = id;
       connectedIds.value.add(id);
+      // Clear at the fenced publication boundary, before metadata awaits can race a new close.
+      clearConnectionClosedByUser(config.id);
+      clearConnectionClosedByUser(id);
       if (config.db_type !== "plugin") {
         void refreshConnectedDatabaseInfo(id, { ...config, id });
         await refreshConnectionIdentifierQuote(id, { ...config, id });
@@ -4682,7 +4717,9 @@ export const useConnectionStore = defineStore("connection", () => {
    * `deleteConnectionTabHandlingMode` 处理过，这里只做会话清理，不能再套用
    * `disconnectTabHandlingMode`，否则会把刚保留下来的 SQL 页签又关掉。
    */
-  async function disconnect(connectionId: string, options: { skipTabHandling?: boolean } = {}) {
+  async function disconnect(connectionId: string, options: { skipTabHandling?: boolean; markClosedByUser?: boolean } = {}) {
+    // Publish user intent before any asynchronous cleanup. System cleanup never clears it.
+    if (options.markClosedByUser !== false) markConnectionClosedByUser(connectionId);
     const stateRevision = bumpConnectionStateRevision(connectionId);
     const shouldRemoveOneTimeConnection = getConfig(connectionId)?.one_time === true;
     if (hasSqlServerActivityTraceForConnection(connectionId)) await disposeSqlServerActivityTracesForConnection(connectionId);
@@ -4797,7 +4834,9 @@ export const useConnectionStore = defineStore("connection", () => {
     invalidateConnectionMetadataLifetime(connectionId, database);
   }
 
-  async function ensureConnected(connectionId: string, options: { activate?: boolean; verifyHealth?: boolean; forceReconnect?: boolean; allowPasswordPrompt?: boolean } = {}) {
+  /** Passive callers opt in; explicit navigation, execution and refresh keep reconnecting. */
+  async function ensureConnected(connectionId: string, options: { activate?: boolean; verifyHealth?: boolean; forceReconnect?: boolean; allowPasswordPrompt?: boolean; skipIfClosedByUser?: boolean } = {}) {
+    if (options.skipIfClosedByUser && isConnectionClosedByUser(connectionId)) throw new Error(CONNECTION_CLOSED_BY_USER_MESSAGE);
     if (!options.forceReconnect && connectedIds.value.has(connectionId)) {
       // Pure navigation can safely trust the existing connected state. Its
       // destination will perform the real API request, while blocking here on
@@ -4832,6 +4871,7 @@ export const useConnectionStore = defineStore("connection", () => {
     let config = getConfig(connectionId);
     if (!config) {
       await initFromDisk();
+      if (options.skipIfClosedByUser && isConnectionClosedByUser(connectionId)) throw new Error(CONNECTION_CLOSED_BY_USER_MESSAGE);
       config = getConfig(connectionId);
     }
     if (!config) {
@@ -4841,6 +4881,8 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     const expectedConfigFingerprint = connectionConfigFingerprint(config);
     if (getBlockingDisconnectInFlight(connectionId)) await waitForBlockingDisconnectInFlight(connectionId);
+    // Neither pre-attempt wait is owned by localAttempt yet. Recheck before joining or starting.
+    if (options.skipIfClosedByUser && isConnectionClosedByUser(connectionId)) throw new Error(CONNECTION_CLOSED_BY_USER_MESSAGE);
     const existingConnect = connectInFlight.get(connectionId);
     if (existingConnect) {
       await existingConnect;
@@ -4848,6 +4890,7 @@ export const useConnectionStore = defineStore("connection", () => {
       return;
     }
     const localAttempt = beginLocalConnectionAttempt(connectionId);
+    const connectStateRevision = connectionStateRevision(connectionId);
     const connectPromise = (async () => {
       let rememberPassword = false;
       // Fast-path the common case (password saved or no password needed) so the
@@ -4871,7 +4914,10 @@ export const useConnectionStore = defineStore("connection", () => {
       await ensureLocalConnectionAttemptActiveAfterConnectResult(connectionId, localAttempt, id);
       await syncMongoLegacyDriverFallback(connectionId, config);
       await ensureLocalConnectionAttemptActiveAfterConnectResult(connectionId, localAttempt, id);
+      ensureLocalConnectionAttemptActive(connectionId, localAttempt);
+      if (!isCurrentConnectionStateRevision(connectionId, connectStateRevision)) throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       connectedIds.value.add(connectionId);
+      clearConnectionClosedByUser(connectionId);
       if (config.db_type !== "plugin") {
         void refreshConnectedDatabaseInfo(connectionId, config);
         await refreshConnectionIdentifierQuote(connectionId, config);
@@ -4935,7 +4981,7 @@ export const useConnectionStore = defineStore("connection", () => {
     }
 
     try {
-      await ensureConnected(config.id, { activate: false, forceReconnect: true, allowPasswordPrompt: false });
+      await ensureConnected(config.id, { activate: false, forceReconnect: true, allowPasswordPrompt: false, skipIfClosedByUser: true });
     } catch (error) {
       connectedIds.value.delete(config.id);
       setConnectionError(config.id, `Plugin settings were saved, but automatic reconnection failed: ${connectionErrorMessage(error)}`);
@@ -4965,7 +5011,7 @@ export const useConnectionStore = defineStore("connection", () => {
     // every realistic reload path still re-pushes.
     if (hasRecentConnectionHealthCheck(connectionId)) return;
     if (!(await canReconnectPluginConnectionWithoutPrompt(config))) return;
-    await ensureConnected(connectionId, { activate: false, forceReconnect: true, allowPasswordPrompt: false });
+    await ensureConnected(connectionId, { activate: false, forceReconnect: true, allowPasswordPrompt: false, skipIfClosedByUser: true });
   }
 
   /**
@@ -10107,6 +10153,8 @@ export const useConnectionStore = defineStore("connection", () => {
     refreshDatabaseTreeNode,
     refreshObjectListTreeNode,
     connectedIds,
+    isConnectionClosedByUser,
+    userClosedConnectionIds,
     connectingIds,
     connectionErrors,
     setConnectionError,

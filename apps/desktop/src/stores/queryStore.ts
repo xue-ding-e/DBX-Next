@@ -2961,7 +2961,7 @@ export const useQueryStore = defineStore("query", () => {
     sourceRevalidateInFlight.add(id);
     try {
       const connectionStore = useConnectionStore();
-      await connectionStore.ensureConnected(connectionId);
+      await connectionStore.ensureConnected(connectionId, { skipIfClosedByUser: true });
       const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(connectionId));
       if (!databaseType) return;
       const {
@@ -3991,7 +3991,7 @@ export const useQueryStore = defineStore("query", () => {
       try {
         // activate:false keeps the boot restore from overriding the last
         // active connection already chosen by restoreActiveConnectionContext().
-        await connectionStore.ensureConnected(connectionId, { activate: false });
+        await connectionStore.ensureConnected(connectionId, { activate: false, skipIfClosedByUser: true });
       } catch (error) {
         console.warn("[DBX][plugin-tab-restore:reconnect]", connectionId, error);
       }
@@ -4338,7 +4338,7 @@ export const useQueryStore = defineStore("query", () => {
           // A user-initiated disconnect that closed these tabs already owns
           // the teardown — don't stack a second one on top of it.
           if (connectionStore.hasDisconnectInFlight(connectionId)) return;
-          await connectionStore.disconnect(connectionId);
+          await connectionStore.disconnect(connectionId, { markClosedByUser: false });
         } catch (error) {
           console.warn("[DBX][plugin-tab-close:disconnect]", connectionId, error);
         } finally {
