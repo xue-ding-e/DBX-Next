@@ -1,5 +1,5 @@
 import * as api from "@/lib/backend/api";
-import { ActiveCacheReadTracker } from "./activeCacheReadTracker";
+import { ActiveCacheReadTracker, throwIfCacheLoadCancelled, type ActiveCacheReadToken } from "./activeCacheReadTracker";
 import type { MetadataCacheInvalidation } from "./metadataResultCache";
 import type { ObjectDdlRequest } from "./objectDdlCache";
 import { toObjectCacheInvalidationError, type ObjectCacheInvalidationOptions } from "./objectCacheInvalidationError";
@@ -23,6 +23,7 @@ interface InFlightLoad<T> {
 
 const inFlightLoads = new Map<string, InFlightLoad<unknown>>();
 const activeCacheReads = new ActiveCacheReadTracker();
+const activeLoads = new ActiveCacheReadTracker();
 const pendingInvalidations = new Map<string, Promise<void>>();
 const pendingWrites = new Map<string, Promise<void>>();
 
@@ -122,6 +123,17 @@ function invalidatePersistedPrefix(prefix: string): Promise<void> {
 }
 
 export async function loadObjectMetadataFacet<T>(request: ObjectDdlRequest, facet: ObjectMetadataFacet, loader: () => Promise<T>, options?: { force?: boolean }): Promise<{ value: T; cacheStatus: "memory" | "disk" | "remote" }> {
+  // Keep one token through preflight, L2 reads and retries. A later user load
+  // gets its own token and is never cancelled by an older load finishing.
+  const token = activeLoads.begin(facetKey(request, facet));
+  try {
+    return await loadObjectMetadataFacetInternal(request, facet, loader, token, options);
+  } finally {
+    activeLoads.finish(token);
+  }
+}
+
+async function loadObjectMetadataFacetInternal<T>(request: ObjectDdlRequest, facet: ObjectMetadataFacet, loader: () => Promise<T>, token: ActiveCacheReadToken, options?: { force?: boolean }): Promise<{ value: T; cacheStatus: "memory" | "disk" | "remote" }> {
   const cacheKey = facetKey(request, facet);
   if (options?.force) {
     const existing = inFlightLoads.get(cacheKey);
@@ -137,6 +149,7 @@ export async function loadObjectMetadataFacet<T>(request: ObjectDdlRequest, face
     await waitForPendingInvalidations(cacheKey);
   }
 
+  throwIfCacheLoadCancelled(token);
   if (!options?.force) {
     const runtime = getMetadataRuntimeCache<T>(cacheKey);
     if (runtime) return { value: runtime.value, cacheStatus: "memory" };
@@ -147,8 +160,9 @@ export async function loadObjectMetadataFacet<T>(request: ObjectDdlRequest, face
     } finally {
       activeCacheReads.finish(readToken);
     }
+    throwIfCacheLoadCancelled(token);
     if (readToken.invalidated) {
-      const value = await loadObjectMetadataFacet(request, facet, loader, { force: false });
+      const value = await loadObjectMetadataFacetInternal(request, facet, loader, token, { force: false });
       return { value: value.value, cacheStatus: "remote" };
     }
     if (cached?.hit) {
@@ -158,6 +172,7 @@ export async function loadObjectMetadataFacet<T>(request: ObjectDdlRequest, face
     }
   }
 
+  throwIfCacheLoadCancelled(token);
   const existing = inFlightLoads.get(cacheKey);
   if (existing && (!options?.force || existing.force)) return { value: (await existing.promise) as T, cacheStatus: "remote" };
   if (existing) invalidateInFlightLoad(cacheKey);
@@ -171,18 +186,19 @@ export async function loadObjectMetadataFacet<T>(request: ObjectDdlRequest, face
       // transient failure into a successful cache hit.
       if (value === undefined) return value;
       const serialized = JSON.stringify(value);
-      const current = !entry.invalidated;
+      const current = !entry.invalidated && !token.cancelled;
       if (current) setMetadataRuntimeCache(cacheKey, value, request.connectionId);
       if (current && serialized !== undefined && serialized.length <= MAX_PERSISTED_METADATA_CHARS) {
         const envelope: ObjectMetadataCacheEnvelope<T> = { version: 1, cachedAt: new Date().toISOString(), value };
-        persistSchemaCache(cacheKey, envelope, () => entry.invalidated);
+        persistSchemaCache(cacheKey, envelope, () => entry.invalidated || token.cancelled);
       }
       return value;
     })
     .finally(() => {
       if (inFlightLoads.get(cacheKey) === entry) inFlightLoads.delete(cacheKey);
     });
-  inFlightLoads.set(cacheKey, entry as InFlightLoad<unknown>);
+  // A synchronous loader can cancel and start a newer request before returning.
+  if (!token.cancelled && !inFlightLoads.has(cacheKey)) inFlightLoads.set(cacheKey, entry as InFlightLoad<unknown>);
   return { value: await entry.promise, cacheStatus: "remote" };
 }
 
@@ -207,6 +223,7 @@ export async function invalidateObjectMetadataCache(match: MetadataCacheInvalida
 /** Invalidate active loads for a disconnected connection without deleting its persisted snapshot. */
 export function cancelObjectMetadataLoadsForConnection(connectionId: string): void {
   const prefix = `${OBJECT_METADATA_CACHE_PREFIX}:${cacheSegment(connectionId)}:`;
+  activeLoads.cancelPrefix(prefix);
   activeCacheReads.invalidatePrefix(prefix);
   for (const cacheKey of [...inFlightLoads.keys()]) if (cacheKey.startsWith(prefix)) invalidateInFlightLoad(cacheKey);
   invalidateMetadataRuntimeCachePrefix(prefix);
@@ -214,11 +231,12 @@ export function cancelObjectMetadataLoadsForConnection(connectionId: string): vo
 
 export function cancelObjectMetadataLoadsForDatabase(connectionId: string, database: string): void {
   const prefix = `${OBJECT_METADATA_CACHE_PREFIX}:${cacheSegment(connectionId)}:${cacheSegment(database)}:`;
+  activeLoads.cancelPrefix(prefix);
   activeCacheReads.invalidatePrefix(prefix);
   for (const cacheKey of [...inFlightLoads.keys()]) if (cacheKey.startsWith(prefix)) invalidateInFlightLoad(cacheKey);
   invalidateMetadataRuntimeCachePrefix(prefix);
 }
 
-export function getObjectMetadataCacheDebugStateForTests(): { activeReads: number } {
-  return { activeReads: activeCacheReads.activeCount };
+export function getObjectMetadataCacheDebugStateForTests(): { activeReads: number; activeLoads: number } {
+  return { activeReads: activeCacheReads.activeCount, activeLoads: activeLoads.activeCount };
 }

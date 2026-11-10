@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/backend/api", () => mocks);
 
-import { cancelObjectDdlLoadsForConnection, getObjectDdlCacheDebugStateForTests, invalidateObjectDdl, invalidateObjectDdlCache, loadObjectDdl, objectDdlCacheKey } from "@/lib/metadata/objectDdlCache";
+import { cancelObjectDdlLoadsForConnection, cancelObjectDdlLoadsForDatabase, getObjectDdlCacheDebugStateForTests, invalidateObjectDdl, invalidateObjectDdlCache, loadObjectDdl, objectDdlCacheKey } from "@/lib/metadata/objectDdlCache";
 import { isObjectCacheInvalidationError } from "@/lib/metadata/objectCacheInvalidationError";
 import { clearMetadataRuntimeCache } from "@/lib/metadata/metadataRuntimeCache";
 
@@ -221,7 +221,7 @@ describe("objectDdlCache", () => {
       await invalidateObjectDdlCache({ ...request, tableName: `history_${index}` });
     }
 
-    expect(getObjectDdlCacheDebugStateForTests()).toEqual({ activeReads: 0 });
+    expect(getObjectDdlCacheDebugStateForTests()).toEqual({ activeReads: 0, activeLoads: 0 });
   });
 
   it("makes a concurrent normal read wait for a force refresh", async () => {
@@ -416,4 +416,125 @@ describe("objectDdlCache", () => {
       expect(mocks.deleteSchemaCachePrefix).toHaveBeenCalledWith("object-meta:v1:a%3Ab%20c%25%E4%B8%AD:");
     });
   });
+  describe("local cancellation lifecycle", () => {
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((done) => { resolve = done; });
+      return { promise, resolve };
+    }
+
+    it.each([true, false])("stops a held L2 read (hit=%s), preserves disk and permits a fresh load", async (hit) => {
+      const loader = mocks.getTableDisplayDdl;
+      const disk = deferred<unknown>();
+      mocks.loadSchemaCache.mockReturnValueOnce(disk.promise);
+      const pending = loadObjectDdl(request);
+      const rejected = expect(pending).rejects.toMatchObject({ name: "AbortError", code: "OBJECT_CACHE_LOAD_CANCELLED" });
+      await vi.waitFor(() => expect(mocks.loadSchemaCache).toHaveBeenCalledTimes(1));
+      cancelObjectDdlLoadsForConnection(request.connectionId);
+      disk.resolve(hit ? { version: 1, cachedAt: new Date().toISOString(), ddl: "old" } : null);
+      await rejected;
+      expect(loader).not.toHaveBeenCalled();
+      expect(mocks.saveSchemaCache).not.toHaveBeenCalled();
+      expect(mocks.deleteSchemaCachePrefix).not.toHaveBeenCalled();
+      expect(getObjectDdlCacheDebugStateForTests()).toEqual({ activeReads: 0, activeLoads: 0 });
+      mocks.loadSchemaCache.mockResolvedValue({ version: 1, cachedAt: new Date().toISOString(), ddl: "fresh" });
+      await expect(loadObjectDdl(request)).resolves.toMatchObject({ ddl: "fresh", cacheStatus: "disk" });
+    });
+
+    it.each([false, true])("does not start work after cancellation during deletion preflight (force=%s)", async (force) => {
+      const loader = mocks.getTableDisplayDdl;
+      const deletion = deferred<void>();
+      mocks.deleteSchemaCachePrefix.mockReturnValue(deletion.promise);
+      const invalidation = force ? Promise.resolve() : invalidateObjectDdlCache({ connectionId: request.connectionId });
+      const pending = loadObjectDdl(request, { force });
+      const rejected = expect(pending).rejects.toMatchObject({ code: "OBJECT_CACHE_LOAD_CANCELLED" });
+      await vi.waitFor(() => expect(mocks.deleteSchemaCachePrefix).toHaveBeenCalled());
+      cancelObjectDdlLoadsForConnection(request.connectionId);
+      deletion.resolve(undefined);
+      await rejected;
+      await invalidation;
+      expect(mocks.loadSchemaCache).not.toHaveBeenCalled();
+      expect(loader).not.toHaveBeenCalled();
+      expect(mocks.saveSchemaCache).not.toHaveBeenCalled();
+      expect(getObjectDdlCacheDebugStateForTests()).toEqual({ activeReads: 0, activeLoads: 0 });
+    });
+
+
+    it("retains cancellation identity after an invalidated read enters its retry wait", async () => {
+      const loader = mocks.getTableDisplayDdl;
+      const disk = deferred<unknown>();
+      const deletion = deferred<void>();
+      mocks.loadSchemaCache.mockReturnValueOnce(disk.promise);
+      const pending = loadObjectDdl(request);
+      const rejected = expect(pending).rejects.toMatchObject({ code: "OBJECT_CACHE_LOAD_CANCELLED" });
+      await vi.waitFor(() => expect(mocks.loadSchemaCache).toHaveBeenCalledTimes(1));
+      mocks.deleteSchemaCachePrefix.mockReturnValue(deletion.promise);
+      const invalidation = invalidateObjectDdlCache({ connectionId: request.connectionId });
+      disk.resolve({ version: 1, cachedAt: new Date().toISOString(), ddl: "stale" });
+      await vi.waitFor(() => expect(getObjectDdlCacheDebugStateForTests()).toEqual({ activeReads: 0, activeLoads: 1 }));
+      cancelObjectDdlLoadsForDatabase(request.connectionId, request.database);
+      deletion.resolve(undefined);
+      await rejected;
+      await invalidation;
+      expect(mocks.loadSchemaCache).toHaveBeenCalledTimes(1);
+      expect(loader).not.toHaveBeenCalled();
+      expect(mocks.saveSchemaCache).not.toHaveBeenCalled();
+      expect(getObjectDdlCacheDebugStateForTests()).toEqual({ activeReads: 0, activeLoads: 0 });
+    });
+    it("does not cancel another database's held read", async () => {
+      const loader = mocks.getTableDisplayDdl;
+      const disk = deferred<unknown>();
+      mocks.loadSchemaCache.mockReturnValueOnce(disk.promise);
+      const pending = loadObjectDdl(request);
+      await vi.waitFor(() => expect(mocks.loadSchemaCache).toHaveBeenCalledTimes(1));
+      cancelObjectDdlLoadsForDatabase(request.connectionId, request.database + "2");
+      disk.resolve({ version: 1, cachedAt: new Date().toISOString(), ddl: "kept" });
+      await expect(pending).resolves.toMatchObject({ ddl: "kept", cacheStatus: "disk" });
+      expect(loader).not.toHaveBeenCalled();
+      expect(getObjectDdlCacheDebugStateForTests()).toEqual({ activeReads: 0, activeLoads: 0 });
+    });
+
+    it("keeps a newer remote owner when the cancelled old remote completes", async () => {
+      const loader = mocks.getTableDisplayDdl;
+      const oldRemote = deferred<string>();
+      const newRemote = deferred<string>();
+      loader.mockReturnValueOnce(oldRemote.promise).mockReturnValueOnce(newRemote.promise);
+      const oldLoad = loadObjectDdl(request);
+      await vi.waitFor(() => expect(loader).toHaveBeenCalledTimes(1));
+      cancelObjectDdlLoadsForConnection(request.connectionId);
+      const newLoad = loadObjectDdl(request);
+      await vi.waitFor(() => expect(loader).toHaveBeenCalledTimes(2));
+      oldRemote.resolve("old");
+      await expect(oldLoad).resolves.toMatchObject({ ddl: "old" });
+      expect(mocks.saveSchemaCache).not.toHaveBeenCalled();
+      const joined = loadObjectDdl(request);
+      await vi.waitFor(() => expect(mocks.loadSchemaCache).toHaveBeenCalledTimes(3));
+      newRemote.resolve("new");
+      await expect(newLoad).resolves.toMatchObject({ ddl: "new" });
+      await expect(joined).resolves.toMatchObject({ ddl: "new" });
+      expect(loader).toHaveBeenCalledTimes(2);
+      expect(mocks.saveSchemaCache).toHaveBeenCalledTimes(1);
+      expect(getObjectDdlCacheDebugStateForTests()).toEqual({ activeReads: 0, activeLoads: 0 });
+    });
+
+    it("does not register a remote cancelled synchronously inside its loader", async () => {
+      const loader = mocks.getTableDisplayDdl;
+      const oldRemote = deferred<string>();
+      loader.mockImplementationOnce(() => {
+        cancelObjectDdlLoadsForConnection(request.connectionId);
+        return oldRemote.promise;
+      }).mockResolvedValueOnce("new");
+      const oldLoad = loadObjectDdl(request);
+      await vi.waitFor(() => expect(loader).toHaveBeenCalledTimes(1));
+      await expect(loadObjectDdl(request)).resolves.toMatchObject({ ddl: "new" });
+      oldRemote.resolve("old");
+      await expect(oldLoad).resolves.toMatchObject({ ddl: "old" });
+      await expect(loadObjectDdl(request)).resolves.toMatchObject({ ddl: "new", cacheStatus: "memory" });
+      expect(loader).toHaveBeenCalledTimes(2);
+      expect(mocks.saveSchemaCache).toHaveBeenCalledTimes(1);
+      expect(getObjectDdlCacheDebugStateForTests()).toEqual({ activeReads: 0, activeLoads: 0 });
+    });
+  });
+
 });
+
