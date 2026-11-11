@@ -2255,6 +2255,47 @@ WHERE t2.product_name = '12345'
   });
 });
 
+describe("SQL Server control-flow trailing trivia", () => {
+  it.each([
+    ["nested block comment", "END", "/* outer /* inner */ SELECT 999 -- */"],
+    ["flat block comment", "END", "/* SELECT 999 */"],
+    ["nested block comment after a semicolon", "END;", "/* outer /* inner */ SELECT 999 -- */"],
+  ])("keeps %s out of the following execution target", (_name, end, comment) => {
+    const batch = "IF 1=1 BEGIN SELECT 1;\nEND";
+    const sql = `IF 1=1 BEGIN SELECT 1;\n${end}\n${comment}\nSELECT 2;`;
+    const cursor = indexOf(sql, "SELECT 2") + 3;
+    const commentCursor = indexOf(sql, "SELECT 999") + 3;
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual([batch, "SELECT 2"]);
+    expect(currentExecutableStatementRange(sql, cursor, "sqlserver")?.sql.trim()).toBe("SELECT 2");
+    expect(candidateSummaries(buildExecutionCandidates(sql, cursor, "sqlserver"))).toEqual(["cursor:SELECT 2", `all:${sql}`]);
+    expect(currentExecutableStatementRange(sql, commentCursor, "sqlserver")).toBeNull();
+    expect(candidateSummaries(buildExecutionCandidates(sql, commentCursor, "sqlserver"))).toEqual([`all:${sql}`]);
+  });
+
+  it.each([
+    ["WHILE block", "WHILE 1=0 BEGIN SELECT 1;\nEND", "/* outer /* inner */ SELECT 999 -- */"],
+    ["consecutive trivia and three nested levels", "IF 1=1 BEGIN SELECT 1;\nEND", "-- line\n/* plain */\n/* outer /* middle /* inner */ SELECT 999 -- */ tail */"],
+  ])("skips trailing nested comments after %s", (_name, batch, comment) => {
+    const sql = `${batch}\n${comment}\nSELECT 2;`;
+    const cursor = indexOf(sql, "SELECT 2") + 3;
+    const commentCursor = indexOf(sql, "SELECT 999") + 3;
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual([batch, "SELECT 2"]);
+    expect(currentExecutableStatementRange(sql, cursor, "sqlserver")?.sql.trim()).toBe("SELECT 2");
+    expect(candidateSummaries(buildExecutionCandidates(sql, cursor, "sqlserver"))).toEqual(["cursor:SELECT 2", `all:${sql}`]);
+    expect(currentExecutableStatementRange(sql, commentCursor, "sqlserver")).toBeNull();
+    expect(candidateSummaries(buildExecutionCandidates(sql, commentCursor, "sqlserver"))).toEqual([`all:${sql}`]);
+  });
+
+  it("does not create a target from nested comment-only trailing trivia", () => {
+    const batch = "IF 1=1 BEGIN SELECT 1;\nEND";
+    const sql = `${batch}\n/* outer /* inner */ SELECT 999 -- */`;
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual([batch]);
+  });
+});
+
 describe("hasMultipleExecutionTargets", () => {
   it("returns false for a single SQL statement", () => {
     expect(hasMultipleExecutionTargets("SELECT 1;")).toBe(false);

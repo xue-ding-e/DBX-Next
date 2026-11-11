@@ -1071,7 +1071,7 @@ function skipSqlTrivia(sql: string, from: number, to: number, databaseType?: Dat
       continue;
     }
     if (startsBlockComment(sql, index)) {
-      const close = sql.indexOf("*/", index + 2);
+      const close = findSqlBlockCommentEnd(sql, index, databaseType);
       if (close === -1 || close + 2 > to) return to;
       index = close + 2;
       continue;
