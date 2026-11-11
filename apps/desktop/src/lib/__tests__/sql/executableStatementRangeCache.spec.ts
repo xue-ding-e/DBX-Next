@@ -71,6 +71,17 @@ describe("executableStatementRangeCacheForDoc", () => {
     expect(executableStatementRangeStartingAt(cache, doc.line(1).from)?.sql).toBe(sql.slice(0, -1));
   });
 
+  it.each(["-- 存储过程说明\n-- 作者 : 张三", "/* 说明 /* 内部说明 */\nGO\n保留完整注释 */"])("includes SQL Server procedure header comments when running from the CREATE line: %s", (header) => {
+    const procedure = `${header}\nCREATE PROCEDURE dbo.p AS\nBEGIN\n    SELECT 1;\n    SELECT 2;\nEND;`;
+    const sql = `${procedure}\nGO\nSELECT 3;`;
+    const doc = Text.of(sql.split("\n"));
+    const cache = executableStatementRangeCacheForDoc(null, doc, "sqlserver");
+
+    expect(executableStatementRangeStartingAt(cache, doc.lineAt(sql.indexOf("CREATE PROCEDURE")).from)?.sql).toBe(procedure);
+    expect(executableStatementRangeStartingAt(cache, doc.lineAt(sql.indexOf("SELECT 1")).from)).toBeNull();
+    expect(executableStatementRangeAtCursor(cache, sql.indexOf("SELECT 2"))?.sql).toBe(procedure);
+  });
+
   it("keeps a valid placeholder-only line executable and respects disabled MyBatis syntax", () => {
     const sql = ["SELECT *", "FROM t", "#{where_clause};"].join("\n");
     const doc = Text.of(sql.split("\n"));
@@ -275,3 +286,35 @@ describe("statementGutterStartIndex", () => {
     expect(statementGutterStartIndexHasStartAt(afterDelete, 0)).toBe(true);
   });
 });
+
+
+describe("SQL Server module cache headers", () => {
+  it.each(["CREATE PROCEDURE", "ALTER PROC", "CREATE OR ALTER PROCEDURE"])("maps the %s line but not internal statement starts", (operation) => {
+    const module = "/* outer /* inner */\nGO\nouter */\n" + operation + " dbo.p AS\nBEGIN\n SELECT 1;\n SELECT 2;\nEND;";
+    const sql = "SELECT 0;\nGO\n" + module + "\nGO\nSELECT 3;";
+    const doc = Text.of(sql.split("\n"));
+    const cache = executableStatementRangeCacheForDoc(null, doc, "sqlserver");
+    expect(cache.ranges.map((range) => range.sql)).toEqual(["SELECT 0", module, "SELECT 3"]);
+    expect(executableStatementRangeStartingAt(cache, doc.lineAt(sql.indexOf(operation)).from)?.sql).toBe(module);
+    for (const marker of ["SELECT 1", "SELECT 2"]) {
+      expect(executableStatementRangeStartingAt(cache, doc.lineAt(sql.indexOf(marker)).from)).toBeNull();
+      expect(executableStatementRangeAtCursor(cache, sql.indexOf(marker))?.sql).toBe(module);
+    }
+    expect(executableStatementRangeStartingAt(cache, doc.lineAt(sql.indexOf("SELECT 3")).from)?.sql).toBe("SELECT 3");
+  });
+});
+
+
+describe("SQL Server GO comment cache boundaries", () => {
+  it.each(["GO--note", "GO/*note*/", "GO /* outer /* inner */ outer */ -- note", "GO /* one */ /* two */", "GO /* first\nsecond */", "\tgo /* first\r\nsecond */ -- note"])("maps the following batch separately after %s", (separator) => {
+    for (const first of ["SELECT 1;", "-- header\nCREATE PROC dbo.p AS SELECT 1;"]) {
+      const sql = first + "\n" + separator + "\nSELECT 3;";
+      const doc = Text.of(sql.split("\n"));
+      const cache = executableStatementRangeCacheForDoc(null, doc, "sqlserver");
+      const cursor = sql.indexOf("SELECT 3");
+      expect(executableStatementRangeStartingAt(cache, doc.lineAt(cursor).from)?.sql).toBe("SELECT 3");
+      expect(executableStatementRangeAtCursor(cache, cursor)?.sql).toBe("SELECT 3");
+    }
+  });
+});
+

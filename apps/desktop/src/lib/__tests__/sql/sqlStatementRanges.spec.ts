@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { executionCandidateForMode } from "@/lib/sql/sqlExecutionTarget";
-import { buildExecutionCandidates, currentExecutableStatementRange, executableStatementRanges, fullSqlRange, hasMultipleExecutionTargets, splitSqlStatementRanges, statementRangeAtCursor, stripMysqlClientDisplayCommand, supportsExecutionTargetPicker } from "@/lib/sql/sqlStatementRanges";
+import { buildExecutionCandidates, currentExecutableStatementRange, executableStatementRanges, findSqlBlockCommentEnd, fullSqlRange, hasMultipleExecutionTargets, splitSqlStatementRanges, statementRangeAtCursor, stripMysqlClientDisplayCommand, supportsExecutionTargetPicker } from "@/lib/sql/sqlStatementRanges";
 
 function indexOf(sql: string, needle: string, occurrence = 1): number {
   let from = 0;
@@ -641,6 +641,50 @@ describe("splitSqlStatementRanges", () => {
   it("does not treat GO inside strings or comments as a SQL Server batch delimiter", () => {
     const sql = "SELECT 'GO'\n-- GO\nSELECT 2\nGO\nSELECT 3";
     expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 'GO'\n-- GO\nSELECT 2", "SELECT 3"]);
+  });
+
+  it("preserves the SQL Server procedure documentation header in execution ranges", () => {
+    const procedure = `-- =============================================================
+-- 存储过程名 : usp_GetUserById
+-- 功能描述   : 根据用户ID查询单个用户信息
+-- 参数说明   : @UserId  INT  用户唯一标识
+-- 返回值     : 结果集(UserId, UserName, Email, CreatedAt)
+-- 作者       : 张三
+-- 创建日期   : 2026-11-10
+-- 修改记录   : 2026-11-10  张三  初始创建
+-- 备注       : 无
+-- =============================================================
+CREATE PROCEDURE usp_GetUserById
+    @UserId INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- 查询用户信息
+    SELECT UserId, UserName, Email, CreatedAt
+    FROM dbo.Users
+    WHERE UserId = @UserId;
+END`;
+    const sql = `SELECT 0;\nGO\n\n${procedure}\nGO\nSELECT 2;`;
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 0", procedure, "SELECT 2"]);
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 0", procedure, "SELECT 2"]);
+    for (const marker of ["CREATE PROCEDURE", "SET NOCOUNT", "WHERE UserId"]) {
+      const cursor = sql.indexOf(marker);
+      expect(currentExecutableStatementRange(sql, cursor, "sqlserver")?.sql).toBe(procedure);
+      expect(buildExecutionCandidates(sql, cursor, "sqlserver")[0]?.sql).toBe(procedure);
+    }
+  });
+
+  it.each(["CREATE PROCEDURE", "ALTER PROC", "CREATE OR ALTER PROCEDURE"])("keeps header comments and internal semicolons in a SQL Server %s batch", (operation) => {
+    for (const header of ["-- 作者 : 张三", "/* 根据用户ID查询\nGO\n保留完整注释 */", "/* 说明 /* 内部说明 */\nGO\n保留完整注释 */"]) {
+      const procedure = `${header}\n${operation} dbo.p AS\nBEGIN\n    SELECT 1;\n    SELECT 2;\nEND;`;
+      expect(rangeSqlTexts(executableStatementRanges(`${procedure}\nGO\nSELECT 3;`, "sqlserver"))).toEqual([procedure, "SELECT 3"]);
+    }
+  });
+
+  it("keeps SQL Server nested comment-only batches non-executable", () => {
+    const sql = "/* 说明 /* CREATE PROCEDURE fake AS SELECT 0; */\nGO\n仍是注释 */\nGO\n-- 普通查询说明\nSELECT 1;";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 1"]);
   });
 
   it("keeps Oracle PL/SQL blocks together and treats slash lines as delimiters", () => {
@@ -2272,3 +2316,108 @@ describe("supportsExecutionTargetPicker", () => {
     expect(supportsExecutionTargetPicker(undefined)).toBe(false);
   });
 });
+
+
+describe("SQL Server module batch boundaries", () => {
+  it.each([
+    "CREATE PROC dbo.p AS BEGIN SELECT 1; SELECT 2; END;",
+    "ALTER PROCEDURE dbo.p AS BEGIN SELECT 1; SELECT 2; END;",
+    "CREATE OR ALTER PROC dbo.p AS BEGIN SELECT 1; SELECT 2; END;",
+    "CREATE FUNCTION dbo.f() RETURNS int AS BEGIN RETURN 1; END;",
+    "ALTER TRIGGER dbo.tr ON dbo.t AFTER INSERT AS BEGIN SELECT 1; END;",
+    "CREATE OR ALTER VIEW dbo.v AS SELECT 1 AS n;",
+  ])("keeps the complete module with and without a leading header: %s", (definition) => {
+    for (const header of ["", "-- module documentation\n", "/* outer /* inner */ tail */\n"]) {
+      const module = header + definition;
+      const sql = "SELECT 0;\nGO\n" + module + "\nGO\nSELECT 3;";
+      expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 0", module, "SELECT 3"]);
+      expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 0", module, "SELECT 3"]);
+      expect(currentExecutableStatementRange(sql, sql.indexOf(definition) + definition.length - 2, "sqlserver")?.sql).toBe(module);
+    }
+  });
+
+  it.each(["CREATE TABLE dbo.t (id int)", "ALTER TABLE dbo.t ADD n int", "SELECT 'CREATE PROCEDURE dbo.fake'"])("does not treat non-module SQL as a module: %s", (statement) => {
+    const sql = "-- ordinary header\n" + statement + ";\nSELECT 2;";
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual([statement, "SELECT 2"]);
+  });
+
+  it("recognizes nested comments between module keywords", () => {
+    const module = "/* header */\nCREATE /* outer /* inner */ tail */ OR ALTER PROCEDURE dbo.p AS\nSELECT 1;\nSELECT 2;";
+    expect(rangeSqlTexts(executableStatementRanges(module + "\nGO\nSELECT 3;", "sqlserver"))).toEqual([module, "SELECT 3"]);
+  });
+
+  it.each(["GO", "go", "  GO  ", "GO 2"])("ends the module at a supported GO line: %s", (separator) => {
+    // GO repeat counts are only range separators here, not an execution-count assertion.
+    const module = "-- header\nCREATE PROCEDURE dbo.p AS SELECT 1;";
+    expect(rangeSqlTexts(executableStatementRanges(module + "\n" + separator + "\nSELECT 2;", "sqlserver"))).toEqual([module, "SELECT 2"]);
+  });
+
+  it("keeps GO inside strings and nested body comments in the module", () => {
+    const module = "-- header\nCREATE PROC dbo.p AS\nSELECT 'GO';\n/* outer /* inner */\nGO\nouter */\nSELECT 2;";
+    expect(rangeSqlTexts(executableStatementRanges(module + "\nGO\nSELECT 3;", "sqlserver"))).toEqual([module, "SELECT 3"]);
+  });
+
+  it("does not execute an unterminated nested header", () => {
+    expect(executableStatementRanges("/* outer /* inner */\nCREATE PROC dbo.p AS SELECT 1;", "sqlserver")).toEqual([]);
+  });
+
+  it("limits nested block-comment scanning to SQL Server", () => {
+    const comment = "/* outer /* inner */ tail */";
+    expect(findSqlBlockCommentEnd(comment, 0, "sqlserver")).toBe(comment.lastIndexOf("*/"));
+    for (const databaseType of ["mysql", "postgres", "oracle", "sqlite"] as const) {
+      expect(findSqlBlockCommentEnd(comment, 0, databaseType)).toBe(comment.indexOf("*/"));
+    }
+    expect(findSqlBlockCommentEnd(comment, 0)).toBe(comment.indexOf("*/"));
+    expect(findSqlBlockCommentEnd("/* outer /* inner */", 0, "sqlserver")).toBe(-1);
+  });
+});
+
+
+describe("SQL Server GO command comments", () => {
+  const separators = [
+    "GO--note",
+    "GO/*note*/",
+    "GO -- note",
+    "GO /* outer /* inner */ outer */ -- note",
+    "GO /* first */ /* second */",
+    "GO 2 /* repeat-count separator only */",
+    "GO /* first line\nsecond line */",
+    "GO /* outer\n/* inner */\nouter */ /* another */ -- note",
+    " \tgo\t/* indented */",
+  ];
+
+  it.each(separators)("separates module and ordinary batches after %s", (separator) => {
+    for (const first of ["SELECT 1;", "-- header\nCREATE PROC dbo.p AS\nBEGIN\nSELECT 1;\nSELECT 2;\nEND;"]) {
+      const expectedFirst = first.startsWith("SELECT") ? "SELECT 1" : first;
+      const sql = first + "\n" + separator + "\nSELECT 3;";
+      expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual([expectedFirst, "SELECT 3"]);
+      expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual([expectedFirst, "SELECT 3"]);
+      expect(currentExecutableStatementRange(sql, sql.indexOf("SELECT 3"), "sqlserver")?.sql).toBe("SELECT 3");
+    }
+  });
+
+  it.each(["GO", "GO--note", "GO/*note*/", "GO /* line one\r\nline two */ -- note"])("consumes %s at EOF or before a CRLF batch", (separator) => {
+    const module = "-- header\r\nCREATE PROC dbo.p AS SELECT 1;";
+    expect(rangeSqlTexts(splitSqlStatementRanges(module + "\r\n" + separator, "sqlserver"))).toEqual([module]);
+    const sql = module + "\r\n" + separator + "\r\nSELECT 3;";
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual([module, "SELECT 3"]);
+    expect(currentExecutableStatementRange(sql, sql.indexOf("SELECT 3"), "sqlserver")?.sql).toBe("SELECT 3");
+  });
+
+  it.each([
+    "GOTO", "GO2", "GO_name", "GO +2", "GO 2x", "GO 2 3", "G/*x*/O",
+    "GO /*x*/ SELECT 9", "GO /* first\nsecond */ SELECT 9", "GO /*x*/ 2",
+  ])("does not recognize the non-command %s", (nonCommand) => {
+    const module = "CREATE PROC dbo.p AS SELECT 1;";
+    const sql = module + "\n" + nonCommand + "\nSELECT 3;";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual([sql]);
+  });
+
+  it("does not consume an unterminated GO block comment as a delimiter", () => {
+    const module = "CREATE PROC dbo.p AS SELECT 1;";
+    const sql = module + "\nGO /* outer /* inner */\nSELECT 3;";
+    // This only checks delimiter recognition, not whether malformed SQL is safe to execute.
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual([module + "\nGO"]);
+  });
+});
+
