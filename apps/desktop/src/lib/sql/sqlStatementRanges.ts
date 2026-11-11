@@ -1089,6 +1089,7 @@ function topLevelSoftStatementLineStarts(sql: string, statement: RawStatement, d
   const unclosedExplainOptionsStart = explainOptionsStart !== null && skipBalancedParens(sql, explainOptionsStart, databaseType, parameterOptions) === null ? explainOptionsStart : null;
   const backslashEscapes = allowsBackslashStringEscape(databaseType);
   let state: QuoteState | "lineComment" | "blockComment" = "none";
+  let blockCommentEnd = -1;
   let dollarTag = "";
   let parenDepth = 0;
   let lineStart = statement.from;
@@ -1123,7 +1124,7 @@ function topLevelSoftStatementLineStarts(sql: string, statement: RawStatement, d
     }
 
     if (state === "blockComment") {
-      if (ch === "*" && next === "/") {
+      if (i === blockCommentEnd) {
         state = "none";
         i += 2;
         continue;
@@ -1204,6 +1205,7 @@ function topLevelSoftStatementLineStarts(sql: string, statement: RawStatement, d
       continue;
     }
     if (ch === "/" && next === "*") {
+      blockCommentEnd = findSqlBlockCommentEnd(sql, i, databaseType);
       state = "blockComment";
       i += 2;
       continue;
@@ -1339,6 +1341,7 @@ function topLevelWordsInRange(sql: string, from: number, to: number, databaseTyp
   const ends: number[] = [];
   const backslashEscapes = allowsBackslashStringEscape(databaseType);
   let state: QuoteState | "lineComment" | "blockComment" = "none";
+  let blockCommentEnd = -1;
   let dollarTag = "";
   let parenDepth = 0;
   let i = from;
@@ -1354,7 +1357,7 @@ function topLevelWordsInRange(sql: string, from: number, to: number, databaseTyp
     }
 
     if (state === "blockComment") {
-      if (ch === "*" && next === "/") {
+      if (i === blockCommentEnd) {
         state = "none";
         i += 2;
         continue;
@@ -1434,6 +1437,7 @@ function topLevelWordsInRange(sql: string, from: number, to: number, databaseTyp
       continue;
     }
     if (ch === "/" && next === "*") {
+      blockCommentEnd = findSqlBlockCommentEnd(sql, i, databaseType);
       state = "blockComment";
       i += 2;
       continue;
@@ -1703,6 +1707,7 @@ function trimRangeEnd(sql: string, from: number, to: number): number {
 function trimRangeEndBeforeNextBoundary(sql: string, from: number, nextBoundaryFrom: number, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions): number {
   const backslashEscapes = allowsBackslashStringEscape(databaseType);
   let state: QuoteState | "lineComment" | "blockComment" = "none";
+  let blockCommentEnd = -1;
   let dollarTag = "";
   let lastContentEnd = from;
   let i = from;
@@ -1718,7 +1723,7 @@ function trimRangeEndBeforeNextBoundary(sql: string, from: number, nextBoundaryF
     }
 
     if (state === "blockComment") {
-      if (ch === "*" && next === "/") {
+      if (i === blockCommentEnd) {
         state = "none";
         i += 2;
         continue;
@@ -1808,6 +1813,7 @@ function trimRangeEndBeforeNextBoundary(sql: string, from: number, nextBoundaryF
       continue;
     }
     if (ch === "/" && next === "*") {
+      blockCommentEnd = findSqlBlockCommentEnd(sql, i, databaseType);
       state = "blockComment";
       i += 2;
       continue;

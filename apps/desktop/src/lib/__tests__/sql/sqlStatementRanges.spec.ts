@@ -2462,3 +2462,57 @@ describe("SQL Server GO command comments", () => {
   });
 });
 
+describe("SQL Server nested comments in boundary scanners", () => {
+  it("ignores ELSE inside a nested comment after the closing END", () => {
+    const batch = "IF 1=1 BEGIN SELECT 1;\nEND";
+    const sql = `${batch} /* outer /* inner */ ELSE */\nSELECT 2;`;
+    const cursor = indexOf(sql, "SELECT 2") + 3;
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual([batch, "SELECT 2"]);
+    expect(currentExecutableStatementRange(sql, cursor, "sqlserver")?.sql).toBe("SELECT 2");
+    expect(candidateSummaries(buildExecutionCandidates(sql, cursor, "sqlserver"))).toEqual(["cursor:SELECT 2", `all:${sql}`]);
+  });
+
+  it("ignores a line-start SELECT inside a nested comment", () => {
+    const sql = "SELECT 1\n/* outer /* inner */\nSELECT 999 -- */\nSELECT 2;";
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 1", "SELECT 2"]);
+  });
+
+  it("trims a nested trailing comment without retaining its hidden SELECT", () => {
+    const sql = "SELECT 1 /* outer /* inner */ SELECT 999 -- */\nSELECT 2;";
+    const cursor = indexOf(sql, "SELECT 1") + 3;
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 1", "SELECT 2"]);
+    expect(currentExecutableStatementRange(sql, cursor, "sqlserver")?.sql).toBe("SELECT 1");
+    expect(candidateSummaries(buildExecutionCandidates(sql, cursor, "sqlserver"))).toEqual(["cursor:SELECT 1", `all:${sql}`]);
+  });
+
+  it.each([
+    ["control-flow words", "IF 1=1 BEGIN SELECT 1;\nEND /* outer inner ELSE */\nSELECT 2;", ["IF 1=1 BEGIN SELECT 1;\nEND", "SELECT 2"]],
+    ["soft line starts", "SELECT 1\n/* outer inner\nSELECT 999 -- */\nSELECT 2;", ["SELECT 1", "SELECT 2"]],
+    ["trailing comment trimming", "SELECT 1 /* outer inner SELECT 999 -- */\nSELECT 2;", ["SELECT 1", "SELECT 2"]],
+  ] as const)("preserves flat SQL Server comments for %s", (_name, sql, expected) => {
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual(expected);
+  });
+
+  it.each(["mysql", undefined] as const)("keeps first-close comment semantics for %s", (databaseType) => {
+    const sql = "SELECT 1\n/* outer /* inner */\nSELECT 999 -- */\nSELECT 2;";
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, databaseType))).toEqual(["SELECT 1", "SELECT 999", "SELECT 2"]);
+  });
+
+  it.each(["\n", "\r\n"])("tracks %j inside nested comments before same-line SQL", (newline) => {
+    const sql = ["SELECT 1 /* outer", "/* inner */", "outer */ SELECT 2;"].join(newline);
+    const cursor = indexOf(sql, "SELECT 2") + 3;
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 1", "SELECT 2"]);
+    expect(currentExecutableStatementRange(sql, cursor, "sqlserver")?.sql).toBe("SELECT 2");
+  });
+
+  it("does not recover statements inside an unterminated outer comment", () => {
+    const sql = "SELECT 1\n/* outer /*/ inner */\nSELECT 999;";
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 1"]);
+  });
+});
