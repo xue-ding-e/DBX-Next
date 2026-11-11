@@ -393,6 +393,49 @@ describe("useSidebarDataOpenRuntime", () => {
     expect(mocks.tabs).toHaveLength(2);
   });
 
+  it.each(["cancelled", "superseded"] as const)("does not publish a %s HBase request after connecting", async (reason) => {
+    mocks.databaseType = "hbase";
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    mocks.ensureConnected.mockReturnValueOnce(gate);
+    const controller = new AbortController();
+    let current = true;
+    const request = { signal: controller.signal, isCurrent: () => current, registerCancel: () => {} };
+    const result = useSidebarDataOpenRuntime().openData(tableNode, request).then(
+      (value) => ({ status: "fulfilled", value }),
+      (error: unknown) => ({ status: "rejected", error }),
+    );
+    try {
+      expect(mocks.ensureConnected).toHaveBeenCalledTimes(1);
+      expect(mocks.tabs).toHaveLength(0);
+      current = false;
+      if (reason === "cancelled") controller.abort();
+    } finally { release(); }
+    expect(await result).toEqual({ status: "fulfilled", value: undefined });
+    expect(mocks.tabs).toHaveLength(0);
+    expect(mocks.activeTabId).toBeNull();
+    expect(mocks.executeTabSql).not.toHaveBeenCalled();
+  });
+
+  it("publishes a current HBase request after connecting", async () => {
+    mocks.databaseType = "hbase";
+    let release!: () => void;
+    mocks.ensureConnected.mockReturnValueOnce(new Promise<void>((resolve) => { release = resolve; }));
+    const request = { signal: new AbortController().signal, isCurrent: () => true, registerCancel: () => {} };
+    const result = useSidebarDataOpenRuntime().openData(tableNode, request).then(
+      (value) => ({ status: "fulfilled", value }),
+      (error: unknown) => ({ status: "rejected", error }),
+    );
+    try {
+      expect(mocks.ensureConnected).toHaveBeenCalledTimes(1);
+      expect(mocks.tabs).toHaveLength(0);
+    } finally { release(); }
+    expect(await result).toEqual({ status: "fulfilled", value: undefined });
+    expect(mocks.tabs).toHaveLength(1);
+    expect(mocks.tabs[0]).toMatchObject({ mode: "hbase", title: "users", sql: "users" });
+    expect(mocks.activeTabId).toBe(mocks.tabs[0]!.id);
+  });
+
   it("keeps different HBase tables independent in same-table mode", async () => {
     mocks.databaseType = "hbase";
 
