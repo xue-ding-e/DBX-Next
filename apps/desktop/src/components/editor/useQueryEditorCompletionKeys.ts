@@ -153,6 +153,20 @@ export function useQueryEditorCompletionKeys(options: QueryEditorCompletionKeysO
     if (completionType !== "keyword" && completionType !== "table" && completionType !== "column") return false;
     // Batch-selection rows own Space for checkbox toggling; this Prec.highest binding outranks their keymap.
     if (selected?.dbxBatchColumnSelection || selected?.dbxBatchColumnSelectionAction) return false;
+    // Space should not replace a typed word with an unrelated fuzzy match (#14698).
+    // Labels describe the candidate; apply may be a function that quotes or qualifies
+    // it. Only compare simple names with at most one dot. More complex names keep
+    // their existing behavior, including partially typed quoted dotted names.
+    const typedLine = view.state.doc.lineAt(view.state.selection.main.head);
+    const beforeCursor = typedLine.text.slice(0, view.state.selection.main.head - typedLine.from);
+    const typedSegment = /[\p{L}\p{M}\p{N}_$#@]+$/u.exec(beforeCursor)?.[0] ?? "";
+    const completionText = selected?.displayLabel ?? selected?.label;
+    if (typedSegment && typeof completionText === "string" && /^[\p{L}\p{M}\p{N}_$#@]+(?:\.[\p{L}\p{M}\p{N}_$#@]+)?$/u.test(completionText)) {
+      const typedWord = typedSegment.normalize("NFC").toLowerCase();
+      const candidate = completionText.normalize("NFC").toLowerCase();
+      const finalSegment = candidate.split(".").pop() ?? "";
+      if (!candidate.startsWith(typedWord) && !finalSegment.startsWith(typedWord)) return false;
+    }
     if (!(codeMirrorRuntime.codeMirrorAcceptCompletion?.(view) ?? false)) return false;
 
     const selection = view.state.selection.main;

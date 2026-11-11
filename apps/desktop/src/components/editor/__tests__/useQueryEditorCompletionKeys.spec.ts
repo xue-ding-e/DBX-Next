@@ -175,3 +175,52 @@ describe("QueryEditor completion-key ownership", () => {
     expect(view.state.selection.main.head).toBe(6);
   });
 });
+
+// Acceptance is a boundary mock: these cases test Space policy and its trailing
+// whitespace edit, not CodeMirror filtering or execution of completion.apply.
+describe("SQL Server Space selected-name compatibility", () => {
+  const cases = [
+    // Unrelated fuzzy matches must leave the typed SQL untouched.
+    ["unrelated column", "column", "inner join t on", "tbml.FMEMONICCODE", undefined, false],
+    ["unrelated keyword", "keyword", "inner join t on", "SELECT", undefined, false],
+    ["production display label", "column", "inner join t on", "FMEMONICCODE tbml.FMEMONICCODE", "tbml.FMEMONICCODE", false],
+    ["earlier literal", "column", "select 'literal' from t on", "FMEMONICCODE", undefined, false],
+    ["earlier quoted table", "column", "select * from [table] t inner join t2 on", "FMEMONICCODE", undefined, false],
+    // Matching labels remain usable when apply is a production-shaped function.
+    ["keyword prefix", "keyword", "SeL", "SELECT", undefined, true],
+    ["matching ON", "keyword", "on", "ON", undefined, true],
+    ["qualified display label", "column", "select tbml.f", "FMEMONICCODE tbml.FMEMONICCODE", "tbml.FMEMONICCODE", true],
+    ["empty segment", "column", "select tbml.", "tbml.FMEMONICCODE", undefined, true],
+    ["quoted apply name", "table", "Ord", "Order", undefined, true],
+    ["two-part name", "table", "Order", "Order.History", undefined, true],
+    ["Unicode prefix", "column", "select 用户", "用户名", undefined, true],
+    ["Unicode normalization", "column", "select e\u0301", "éclair", undefined, true],
+    ["at-sign continuation", "column", "foo@", "foo@bar", undefined, true],
+    // Complex and multi-dot names intentionally retain their previous behavior.
+    ["quoted complex prefix", "table", "[Customer Na", "Customer Name", undefined, true],
+    ["complex fuzzy name", "table", "on", "Customer Name", undefined, true],
+    ["quoted candidate", "table", "on", "[Order]", undefined, true],
+    ["three-part quoted prefix", "table", "[Order.Hi", "Order.History.Archive", undefined, true],
+    ["three-part short prefix", "table", "[A.B", "A.B.C", undefined, true],
+    ["three-part fuzzy name", "column", "on", "dbo.tbml.FMEMONICCODE", undefined, true],
+  ] as const;
+
+  it.each(cases)("%s", (_name, completionType, sql, label, displayLabel, shouldAccept) => {
+    const { keys, view, runtime, status, accept, batch, snippet, indent, newline } = createHarness({ modelValue: sql, databaseType: "sqlserver" });
+    const apply = vi.fn();
+    status.mockReturnValue("active");
+    runtime.codeMirrorSelectedCompletion = () => ({ label, displayLabel, type: completionType, apply });
+    accept.mockReturnValue(true);
+
+    expect(keys.acceptSqlServerCompletionOnSpace(view)).toBe(shouldAccept);
+    expect(accept).toHaveBeenCalledTimes(shouldAccept ? 1 : 0);
+    expect(view.state.doc.toString()).toBe(shouldAccept ? `${sql} ` : sql);
+    expect(view.state.selection.main.head).toBe(sql.length + (shouldAccept ? 1 : 0));
+    expect(apply).not.toHaveBeenCalled();
+    expect(batch).not.toHaveBeenCalled();
+    expect(snippet).not.toHaveBeenCalled();
+    expect(indent).not.toHaveBeenCalled();
+    expect(newline).not.toHaveBeenCalled();
+    expect(runtime.codeMirrorSelectFirstCompletion).not.toHaveBeenCalled();
+  });
+});
