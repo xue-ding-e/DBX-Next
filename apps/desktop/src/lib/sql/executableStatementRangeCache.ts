@@ -168,7 +168,7 @@ function isCursorOnLeadingBlockComment(lineText: string, lineOffset: number): bo
   const afterComment = lineText.slice(commentEnd + 2);
   if (!afterComment.trim()) return true;
 
-  return lineOffset <= commentEnd + 2;
+  return lineOffset < commentEnd + 2;
 }
 
 function isCursorOnRangeEndLine(doc: Text, pos: number, rangeTo: number): boolean {

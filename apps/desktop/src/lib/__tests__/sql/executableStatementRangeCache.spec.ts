@@ -1,5 +1,6 @@
 import { ChangeSet, Text } from "@codemirror/state";
 import { describe, expect, it, vi } from "vitest";
+import { currentExecutableStatementRange } from "@/lib/sql/sqlStatementRanges";
 import {
   executableStatementRangeAtCursor,
   executableStatementRangeCacheForDoc,
@@ -231,6 +232,44 @@ describe("executableStatementRangeCacheForDoc", () => {
 
     expect(executableStatementRangeAtCursor(cache, sql.indexOf("SELECT"))?.sql).toBe(sql.slice(0, -1));
     expect(executableStatementRangeAtCursor(cache, sql.indexOf("sets"))).toBeNull();
+  });
+
+  it.each(["sqlserver", "mysql", "postgres"] as const)("includes the first SQL character after an ordinary leading comment for %s", (databaseType) => {
+    for (const gap of ["", " "]) {
+      const sql = `/*h*/${gap}UPDATE t SET x=1;`;
+      const doc = Text.of([sql]);
+      const cache = executableStatementRangeCacheForDoc(null, doc, databaseType);
+      const commentEnd = sql.indexOf("*/");
+      const from = sql.indexOf("UPDATE");
+      const expected = databaseType === "mysql"
+        ? { from: 0, to: sql.indexOf(";"), sql: sql.slice(0, -1) }
+        : { from, to: sql.indexOf(";"), sql: "UPDATE t SET x=1" };
+
+      expect(executableStatementRangeAtCursor(cache, commentEnd)).toBeNull();
+      expect(executableStatementRangeAtCursor(cache, commentEnd + 1)).toBeNull();
+      expect(executableStatementRangeAtCursor(cache, commentEnd + 2)).toEqual(expected);
+      expect(executableStatementRangeAtCursor(cache, from)).toEqual(expected);
+      expect(executableStatementRangeAtCursor(cache, from + 1)).toEqual(expected);
+      expect(currentExecutableStatementRange(sql, from, databaseType)).toEqual(expected);
+    }
+  });
+
+  it.each(["sqlserver", "mysql", "postgres"] as const)("keeps ordinary statements and comment-only lines unchanged for %s", (databaseType) => {
+    const sql = "UPDATE t SET x=1;\n/*h*/\n-- h\n\nSELECT 1;";
+    const doc = Text.of(sql.split("\n"));
+    const cache = executableStatementRangeCacheForDoc(null, doc, databaseType);
+    const expected = { from: 0, to: sql.indexOf(";"), sql: "UPDATE t SET x=1" };
+    const commentEnd = sql.indexOf("*/");
+    const selectFrom = sql.indexOf("SELECT");
+
+    expect(executableStatementRangeAtCursor(cache, 0)).toEqual(expected);
+    expect(currentExecutableStatementRange(sql, 0, databaseType)).toEqual(expected);
+    expect(executableStatementRangeStartingAt(cache, 0)).toEqual(expected);
+    expect(executableStatementRangeAtCursor(cache, commentEnd)).toBeNull();
+    expect(executableStatementRangeAtCursor(cache, commentEnd + 1)).toBeNull();
+    expect(executableStatementRangeAtCursor(cache, doc.line(3).from)).toBeNull();
+    expect(executableStatementRangeAtCursor(cache, doc.line(4).from)).toBeNull();
+    expect(executableStatementRangeAtCursor(cache, selectFrom)).toEqual({ from: selectFrom, to: sql.length - 1, sql: "SELECT 1" });
   });
 
   it("rebuilds the cache when the document instance changes", () => {
