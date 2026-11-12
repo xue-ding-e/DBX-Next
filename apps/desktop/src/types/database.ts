@@ -1324,6 +1324,8 @@ export interface QueryResult {
   large_value_cells?: Array<{ row_index: number; column_index: number; original_bytes: number }>;
   session_id?: string | null;
   has_more?: boolean;
+  /** Optional page continuation hint honored by the SQL row-bound guard. */
+  page_has_more?: boolean;
   /** For Elasticsearch REST search results parsed into a _source table,
    *  this carries the raw HTTP response body so the UI can toggle between
    *  the tabular view and the original JSON. */
