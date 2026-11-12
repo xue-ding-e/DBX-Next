@@ -1837,24 +1837,29 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
 
     let execution: ConditionalUpdateExecution;
     const preflightTarget = { connectionId: connectionId.value, database: database.value, tableMeta: tableMeta.value, rows: result.value.rows, columns: result.value.columns };
+    function isConditionalUpdateTargetCurrent() {
+      return editable.value && connectionId.value === preflightTarget.connectionId && database.value === preflightTarget.database
+        && tableMeta.value === preflightTarget.tableMeta && result.value.rows === preflightTarget.rows && result.value.columns === preflightTarget.columns;
+    }
     savePreflightReserved = true;
     try {
       saveError.value = "";
       const connection = connectionStore.getConfig(connectionId.value);
       if (!(await ensureReadOnlyWriteAccess({ connection, sql: statement, source: i18n.global.t("readOnlyUnlock.sourceDataEditor") }))) return null;
-      const productionAssessment = assessProductionSql(statement, connection, database.value);
+      if (!isConditionalUpdateTargetCurrent()) return null;
+      const productionAssessment = assessProductionSql(statement, connection, preflightTarget.database);
       if (productionAssessment.active && productionAssessment.isMutation) {
         const confirmed = await productionSafetyStore.requestConfirmation({
           sql: statement,
           connectionName: connection?.name,
-          database: database.value,
+          database: preflightTarget.database,
           productionDatabases: productionAssessment.databases,
           source: i18n.global.t("readOnlyUnlock.sourceDataEditor"),
         });
         if (!confirmed) return null;
       }
 
-      if (!editable.value || connectionId.value !== preflightTarget.connectionId || database.value !== preflightTarget.database || tableMeta.value !== preflightTarget.tableMeta || result.value.rows !== preflightTarget.rows || result.value.columns !== preflightTarget.columns) return null;
+      if (!isConditionalUpdateTargetCurrent()) return null;
       // Edits remain available while approval is open; never reload over them.
       if (editingCell.value) commitEdit();
       if (hasPendingChanges.value) {
@@ -2003,8 +2008,9 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         if (!(await ensureReadOnlyWriteAccess({ connection, sql: describeDataGridChanges(snapshot), source: i18n.global.t("readOnlyUnlock.sourceDataEditor"), treatAsMutation: true }))) {
           return;
         }
+        if (retireIfSaveSnapshotChanged()) return;
       }
-      const customHandlerProductionContext = productionContextForDatabase(connection, database.value);
+      const customHandlerProductionContext = productionContextForDatabase(connection, preflightTarget.database);
       if (customHandler && customHandlerProductionContext.active) {
         // Custom data sources may not expose SQL, but their row mutations still need the same production interlock.
         if (saveOptions.autoSave) {
@@ -2013,7 +2019,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         const confirmed = await productionSafetyStore.requestConfirmation({
           sql: describeDataGridChanges(snapshot),
           connectionName: connection?.name,
-          database: database.value,
+          database: preflightTarget.database,
           productionDatabases: customHandlerProductionContext.databases,
           source: i18n.global.t("readOnlyUnlock.sourceDataEditor"),
         });

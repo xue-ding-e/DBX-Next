@@ -1058,6 +1058,7 @@ describe("useDataGridEditor saveChanges reload", () => {
       refreshSavedRows?: ReturnType<typeof vi.fn>;
       onManualTransactionMutation?: ReturnType<typeof vi.fn>;
       connectionId?: string;
+      databaseRef?: Ref<string | undefined>;
       databaseType?: import("@/types/database").DatabaseType;
       quickEntry?: boolean;
       editable?: Ref<boolean>;
@@ -1085,7 +1086,7 @@ describe("useDataGridEditor saveChanges reload", () => {
       editable: computed(() => options.editable?.value ?? true),
       databaseType: computed(() => options.databaseType ?? "mysql"),
       connectionId: computed(() => ("connectionId" in options ? options.connectionId : "connection-1")),
-      database: computed(() => "app"),
+      database: computed(() => options.databaseRef ? options.databaseRef.value : "app"),
       tableMeta: computed(() => ({
         tableName: "orders_test",
         columns: [
@@ -1634,6 +1635,116 @@ describe("useDataGridEditor saveChanges reload", () => {
       mocks.executeBatch.mockResolvedValue({ affected_rows: 1 });
       mocks.executeConditionalUpdate.mockResolvedValue({ affected_rows: 1 });
       mocks.addHistory.mockResolvedValue(undefined);
+    });
+
+    describe("initial approval target context", () => {
+      // SOURCE ONLY / UNRUN: real composable entry points with synthetic targets.
+      const paths = ["conditional", "custom"] as const;
+      function fixture(path: typeof paths[number], production = true) {
+        const database = ref<string | undefined>("fixture_a");
+        const save = vi.fn().mockResolvedValue(undefined);
+        mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Synthetic initial approval", db_type: "mysql", read_only: true, is_production: production });
+        const { editor, emit } = createSaveTestEditor({ databaseRef: database, resolveExistingRowItems: true, customSaveHandler: path === "custom" ? { save } : undefined });
+        if (path === "custom") editor.applyCellValue(0, 1, "changed");
+        const run = () => path === "conditional" ? editor.executeConditionalUpdate(conditionalSql) : editor.saveChanges();
+        return { editor, emit, database, run, dispatch: path === "conditional" ? mocks.executeConditionalUpdate : save };
+      }
+
+      it.each(paths)("retires %s before a second approval can use B and later dispatch A", async (path) => {
+        const { editor, emit, database, run, dispatch } = fixture(path);
+        const unlock = deferredBoolean();
+        const production = deferredBoolean();
+        const entered = deferredBoolean();
+        mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(unlock.promise);
+        mocks.requestProductionConfirmation.mockImplementationOnce(() => {
+          entered.resolve(true);
+          return production.promise;
+        });
+        // Attach both outcomes immediately, including on the broken baseline.
+        const observed = run().then(() => ({ kind: "settled" as const }), (error: unknown) => ({ kind: "rejected" as const, error }));
+        try {
+          database.value = "fixture_b";
+          unlock.resolve(true);
+          // A fixed save settles without entering the second prompt. Waiting
+          // only for that prompt would deadlock the very behavior being tested.
+          const first = await Promise.race([entered.promise.then(() => ({ kind: "entered" as const })), observed]);
+          expect.soft(first.kind).toBe("settled");
+          expect.soft(mocks.requestProductionConfirmation).not.toHaveBeenCalled();
+          database.value = "fixture_a";
+          production.resolve(true);
+          expect.soft((await observed).kind).toBe("settled");
+          expect.soft(dispatch).not.toHaveBeenCalled();
+          expect.soft(editor.isSaving.value).toBe(false);
+          expect.soft(mocks.addHistory).not.toHaveBeenCalled();
+          expect.soft(emit.mock.calls.some(([event]) => event === "reload")).toBe(false);
+          expect.soft(editor.isConditionalUpdateActive.value).toBe(false);
+          expect.soft(editor.conditionalUpdateExecution.value).toBeUndefined();
+          if (path === "custom") expect.soft(editor.dirtyRows.value.get(0)?.get(1)).toBe("changed");
+        } finally {
+          unlock.resolve(true);
+          production.resolve(true);
+          await observed;
+        }
+        // Retirement releases the reservation; only a fresh action may save A.
+        await run();
+        expect(dispatch).toHaveBeenCalledOnce();
+        expect(mocks.requestProductionConfirmation).toHaveBeenLastCalledWith(expect.objectContaining({ database: "fixture_a" }));
+      });
+
+      it.each(paths)("accepts both initial approvals for unchanged %s target A", async (path) => {
+        const { run, dispatch } = fixture(path);
+        const unlock = deferredBoolean();
+        const production = deferredBoolean();
+        const entered = deferredBoolean();
+        mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(unlock.promise);
+        mocks.requestProductionConfirmation.mockImplementationOnce(() => {
+          entered.resolve(true);
+          return production.promise;
+        });
+        const observed = run().then(() => ({ kind: "settled" as const }), (error: unknown) => ({ kind: "rejected" as const, error }));
+        try {
+          expect(dispatch).not.toHaveBeenCalled();
+          unlock.resolve(true);
+          const first = await Promise.race([entered.promise.then(() => ({ kind: "entered" as const })), observed]);
+          expect(first.kind).toBe("entered");
+          expect(mocks.requestProductionConfirmation).toHaveBeenCalledWith(expect.objectContaining({ database: "fixture_a" }));
+          expect(dispatch).not.toHaveBeenCalled();
+          production.resolve(true);
+          expect((await observed).kind).toBe("settled");
+          expect(dispatch).toHaveBeenCalledOnce();
+        } finally {
+          unlock.resolve(true);
+          production.resolve(true);
+          await observed;
+        }
+      });
+
+      it.each(paths)("keeps non-production %s approval behavior", async (path) => {
+        const { run, dispatch } = fixture(path, false);
+        await run();
+        expect(mocks.ensureReadOnlyWriteAccess).toHaveBeenCalledOnce();
+        expect(mocks.requestProductionConfirmation).not.toHaveBeenCalled();
+        expect(dispatch).toHaveBeenCalledOnce();
+      });
+
+      for (const path of paths) {
+        it.each(["unlock", "production"] as const)(`preserves declined and rejected ${path} %s approvals`, async (boundary) => {
+          const { editor, run, dispatch } = fixture(path);
+          const approval = boundary === "unlock" ? mocks.ensureReadOnlyWriteAccess : mocks.requestProductionConfirmation;
+          approval.mockResolvedValueOnce(false);
+          await run();
+          expect(dispatch).not.toHaveBeenCalled();
+          expect(editor.isSaving.value).toBe(false);
+          const failure = new Error("synthetic initial approval rejection");
+          approval.mockRejectedValueOnce(failure);
+          await expect(run()).rejects.toBe(failure);
+          expect(dispatch).not.toHaveBeenCalled();
+          expect(editor.isSaving.value).toBe(false);
+          if (path === "custom") expect(editor.hasPendingChanges.value).toBe(true);
+          await run();
+          expect(dispatch).toHaveBeenCalledOnce();
+        });
+      }
     });
 
     it.each([false, true])("does not recapture P while read-only unlock is pending (second autoSave=%s)", async (autoSave) => {
