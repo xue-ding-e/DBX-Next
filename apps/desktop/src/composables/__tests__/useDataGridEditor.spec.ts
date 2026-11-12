@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { computed, nextTick, ref, type Ref } from "vue";
+import { computed, nextTick, ref, toRaw, type Ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { clearDataGridPendingSnapshot, DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID, useDataGridEditor, type CustomSaveHandler } from "@/composables/useDataGridEditor";
 import { clearDataGridClipboardCopy, parseDataGridClipboard, rememberDataGridClipboardCopy } from "@/lib/dataGrid/dataGridClipboard";
@@ -1053,6 +1053,7 @@ describe("useDataGridEditor saveChanges reload", () => {
       confirmSaveRequest?: (request: import("@/composables/useDataGridEditor").DataGridSaveConfirmationRequest) => Promise<boolean>;
       confirmSaveRequestRef?: Ref<((request: import("@/composables/useDataGridEditor").DataGridSaveConfirmationRequest) => Promise<boolean>) | undefined>;
       manualTransactionSessionId?: string;
+      manualTransactionSessionIdRef?: Ref<string | undefined>;
       ensureManualTransactionSession?: () => Promise<string>;
       refreshSavedRows?: ReturnType<typeof vi.fn>;
       onManualTransactionMutation?: ReturnType<typeof vi.fn>;
@@ -1098,7 +1099,7 @@ describe("useDataGridEditor saveChanges reload", () => {
       onExecuteSql: computed(() => options.onExecuteSql),
       customSaveHandler: computed(() => options.customSaveHandler),
       confirmSaveRequest: computed(() => options.confirmSaveRequestRef ? options.confirmSaveRequestRef.value : options.confirmSaveRequest),
-      manualTransactionSessionId: computed(() => options.manualTransactionSessionId),
+      manualTransactionSessionId: computed(() => options.manualTransactionSessionIdRef ? options.manualTransactionSessionIdRef.value : options.manualTransactionSessionId),
       ensureManualTransactionSession: computed(() => ensureManualTransactionSession.value),
       onManualTransactionMutation: options.onManualTransactionMutation,
       sql: computed(() => undefined),
@@ -1149,8 +1150,256 @@ describe("useDataGridEditor saveChanges reload", () => {
       refreshSavedRows: options.refreshSavedRows,
       emit,
     });
-    return { editor, emit, currentPage, ensureManualTransactionSession };
+    return { editor, emit, currentPage, ensureManualTransactionSession, result };
   }
+
+  describe("pre-dispatch snapshot retirement", () => {
+    // SOURCE ONLY / UNRUN. These gates exercise the composable, not a model of it.
+    const boundaries = ["custom-preview", "custom-confirm", "sql-prepare", "manual-session", "keyless", "sql-production", "sql-confirm"] as const;
+    type Boundary = typeof boundaries[number];
+    const statement = "UPDATE orders_test SET status='P' WHERE id=1";
+
+    function fixture(boundary: Boundary) {
+      let release!: () => void;
+      let reject!: (reason: unknown) => void;
+      let enter!: () => void;
+      const entered = new Promise<void>((done) => { enter = done; });
+      const gate = new Promise<void>((yes, no) => { release = yes; reject = no; });
+      // Observe even a gate whose boundary is unexpectedly not reached.
+      const gateObserved = gate.then(() => undefined, () => undefined);
+      const pause = () => { enter(); return gate; };
+      const prepared = { statements: [statement], rollbackStatements: [], keylessGuards: boundary === "keyless" ? [keylessGuard] : [] };
+      const save = vi.fn().mockResolvedValue(undefined);
+      const preview = vi.fn(() => boundary === "custom-preview" ? pause().then(() => [statement]) : Promise.resolve([statement]));
+      const confirm = vi.fn(() => boundary === "custom-confirm" || boundary === "sql-confirm" ? pause().then(() => true) : Promise.resolve(true));
+      mocks.getConfig.mockReturnValue(boundary === "sql-production" ? { id: "connection-1", db_type: "mysql", is_production: true } : undefined);
+      mocks.prepareDataGridSave.mockResolvedValue(prepared);
+      if (boundary === "sql-prepare") mocks.prepareDataGridSave.mockImplementationOnce(() => pause().then(() => prepared));
+      if (boundary === "sql-production") mocks.requestProductionConfirmation.mockImplementationOnce(() => pause().then(() => true));
+      mocks.executeQuery.mockImplementationOnce(() => pause().then(() => ({ columns: ["matches"], rows: [[1]] })));
+      mocks.executeBatch.mockResolvedValue({ affected_rows: 1 });
+      mocks.executeInManualTransaction.mockResolvedValue([{ affected_rows: 1 }]);
+      mocks.addHistory.mockResolvedValue(undefined);
+      const created = createSaveTestEditor({
+        customSaveHandler: boundary.startsWith("custom") ? { save, preview, supportsInsert: true } : undefined,
+        confirmSaveRequest: boundary.startsWith("custom") || boundary === "sql-confirm" ? confirm : undefined,
+        ensureManualTransactionSession: boundary === "manual-session" ? () => pause().then(() => "txn-1") : undefined,
+        quickEntry: true, resolveExistingRowItems: true, resolveNewRowItems: true,
+      });
+      return { ...created, save, release, reject, entered, gateObserved };
+    }
+
+    async function waitForGate(entered: Promise<void>, settled: Promise<unknown>) {
+      const winner = await Promise.race([entered.then(() => "entered"), settled.then(() => "settled", () => "settled")]);
+      if (winner !== "entered") throw new Error("Dispatch fence boundary not reached before save settled");
+    }
+
+    for (const boundary of boundaries) {
+      it.each(["replace-P", "reverse-P", "append-Q", "replace-rows", "reactive-rows", "replace-columns", "open-batch"] as const)(`retires accepted ${boundary} without dispatch/replay after %s`, async (change) => {
+        const f = fixture(boundary);
+        f.editor.applyCellValue(0, 1, "P");
+        const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+        try {
+          await waitForGate(f.entered, observed);
+          // Raw identity seam avoids the separate reactive rows watcher, whose
+          // established policy is to discard edits on an actual replacement.
+          if (change === "replace-rows") toRaw(f.result.value).rows = [[1, "replacement"], [2, "pending"]];
+          else if (change === "reactive-rows") {
+            f.result.value.rows = [[1, "replacement"], [2, "pending"]];
+            await nextTick();
+            expect(f.editor.hasPendingChanges.value).toBe(false);
+          }
+          else if (change === "replace-columns") f.result.value.columns = ["id", "replacement"];
+          else if (change === "open-batch") {
+            f.editor.beginBatch();
+            f.editor.applyCellValue(0, 1, "R");
+          } else if (change === "append-Q") f.editor.addRows(1);
+          else {
+            f.editor.startEdit(0, 1);
+            f.editor.editValue.value = "Q";
+            await f.editor.commitEditFromBlur();
+            f.editor.applyCellValue(0, 1, change === "reverse-P" ? "pending" : "R");
+          }
+          await f.editor.saveChanges({ autoSave: true });
+          f.release();
+          expect(await observed).toBeUndefined();
+          expect(f.save).not.toHaveBeenCalled();
+          expect(mocks.executeBatch).not.toHaveBeenCalled();
+          expect(mocks.executeInTransaction).not.toHaveBeenCalled();
+          expect(mocks.executeInManualTransaction).not.toHaveBeenCalled();
+          expect(mocks.addHistory).not.toHaveBeenCalled();
+          expect(f.emit).not.toHaveBeenCalled();
+          expect(f.editor.isSaving.value).toBe(false);
+          expect(f.editor.dirtyRows.value.get(0)?.get(1)).toBe(change === "reverse-P" || change === "reactive-rows" ? undefined : change === "replace-P" || change === "open-batch" ? "R" : "P");
+          if (change === "append-Q") expect(f.editor.newRows.value).toHaveLength(1);
+        } finally {
+          f.release();
+          await observed;
+          await f.gateObserved;
+          f.editor.commitBatch();
+        }
+      });
+
+      it(`preserves unchanged accepted ${boundary} dispatch`, async () => {
+        const f = fixture(boundary);
+        f.editor.applyCellValue(0, 1, "P");
+        const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+        try {
+          await waitForGate(f.entered, observed);
+          f.release();
+          expect(await observed).toBeUndefined();
+          expect(boundary.startsWith("custom") ? f.save : boundary === "manual-session" ? mocks.executeInManualTransaction : mocks.executeBatch).toHaveBeenCalledOnce();
+          expect(f.editor.hasPendingChanges.value).toBe(false);
+          expect(f.editor.isSaving.value).toBe(false);
+        } finally {
+          f.release();
+          await observed;
+          await f.gateObserved;
+        }
+      });
+    }
+
+    it.each(["returned-session", "unrelated-session"] as const)("handles initializer publication of %s", async (published) => {
+      let release!: () => void;
+      let enter!: () => void;
+      const gate = new Promise<void>((done) => { release = done; });
+      const entered = new Promise<void>((done) => { enter = done; });
+      const session = ref<string | undefined>(undefined);
+      mocks.prepareDataGridSave.mockResolvedValue({ statements: [statement], rollbackStatements: [] });
+      mocks.executeInManualTransaction.mockResolvedValue([{ affected_rows: 1 }]);
+      mocks.addHistory.mockResolvedValue(undefined);
+      const f = createSaveTestEditor({
+        manualTransactionSessionIdRef: session,
+        ensureManualTransactionSession: () => {
+          enter();
+          return gate.then(() => { session.value = published; return "returned-session"; });
+        },
+        resolveExistingRowItems: true,
+      });
+      f.editor.applyCellValue(0, 1, "P");
+      const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+      try {
+        await waitForGate(entered, observed);
+        release();
+        expect(await observed).toBeUndefined();
+        expect(session.value).toBe(published);
+        expect(mocks.executeBatch).not.toHaveBeenCalled();
+        expect(f.editor.isSaving.value).toBe(false);
+        if (published === "returned-session") {
+          expect(mocks.executeInManualTransaction).toHaveBeenCalledWith("returned-session", statement, "app", undefined);
+          expect(f.editor.hasPendingChanges.value).toBe(false);
+        } else {
+          expect(mocks.executeInManualTransaction).not.toHaveBeenCalled();
+          expect(mocks.addHistory).not.toHaveBeenCalled();
+          expect(f.editor.dirtyRows.value.get(0)?.get(1)).toBe("P");
+        }
+      } finally {
+        release();
+        await observed;
+      }
+    });
+
+    for (const restoreTarget of [false, true]) {
+      it.each(["joined-prepare", "keyless-guards"] as const)(`stops subsequent %s calls after helper invalidation (restore target: ${restoreTarget})`, async (boundary) => {
+        let release!: () => void;
+        let enter!: () => void;
+        const gate = new Promise<void>((done) => { release = done; });
+        const entered = new Promise<void>((done) => { enter = done; });
+        const targets = [
+          { tableMeta: { tableName: "users", primaryKeys: ["id"], columns: [] }, sourceColumns: ["id", "name", undefined, undefined] },
+          { tableMeta: { tableName: "papers", primaryKeys: ["id"], columns: [] }, sourceColumns: [undefined, undefined, "id", "title"] },
+        ];
+        const prepared = { statements: [statement], rollbackStatements: [], keylessGuards: boundary === "keyless-guards" ? [keylessGuard, keylessGuard] : [] };
+        mocks.prepareDataGridSave.mockResolvedValue(prepared);
+        if (boundary === "joined-prepare") mocks.prepareDataGridSave.mockResolvedValueOnce(prepared).mockImplementationOnce(() => { enter(); return gate.then(() => prepared); });
+        if (boundary === "keyless-guards") mocks.executeQuery.mockImplementationOnce(() => { enter(); return gate.then(() => ({ columns: ["matches"], rows: [[1]] })); });
+        const f = createSaveTestEditor({
+          joinedWriteTargets: boundary === "joined-prepare" ? targets : undefined,
+          queryResult: { columns: ["id", "name", "paper_id", "title"], rows: [[1, "old", 20, "old"]] },
+        });
+        f.editor.dirtyRows.value.set(0, new Map([[1, "P"], [3, "P"]]));
+        const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+        let restoration: Promise<void> | undefined;
+        try {
+          await waitForGate(entered, observed);
+          const originalRows = toRaw(f.result.value).rows;
+          // Raw identity seam isolates the fence from the normal discard watcher.
+          toRaw(f.result.value).rows = [[2, "replacement", 21, "replacement"]];
+          release();
+          if (restoreTarget) {
+            // Gate reaction resolves the API promise; helper then observes stale
+            // identity. Restore in the following microtask, before outer await
+            // continuation. A non-sticky outer recheck would accept partial work.
+            restoration = Promise.resolve().then(() => Promise.resolve().then(() => {
+              toRaw(f.result.value).rows = originalRows;
+            }));
+          }
+          expect(await observed).toBeUndefined();
+          await restoration;
+          if (restoreTarget) expect(toRaw(f.result.value).rows).toBe(originalRows);
+          expect(boundary === "joined-prepare" ? mocks.prepareDataGridSave : mocks.executeQuery).toHaveBeenCalledTimes(boundary === "joined-prepare" ? 2 : 1);
+          expect(mocks.executeBatch).not.toHaveBeenCalled();
+          expect(mocks.executeInTransaction).not.toHaveBeenCalled();
+          expect(mocks.addHistory).not.toHaveBeenCalled();
+          expect(f.editor.dirtyRows.value.get(0)?.size).toBe(2);
+          expect(f.editor.isSaving.value).toBe(false);
+        } finally {
+          release();
+          await observed;
+          await restoration;
+        }
+      });
+    }
+
+    it.each(["custom-confirm", "sql-confirm"] as const)("releases saved-insert locks when accepted %s becomes stale", async (boundary) => {
+      const f = fixture(boundary);
+      f.editor.newRows.value = [[3, "P"]];
+      const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+      try {
+        await waitForGate(f.entered, observed);
+        f.editor.applyCellValue(-1, 1, "blocked");
+        expect(f.editor.newRows.value[0]).toEqual([3, "P"]);
+        f.result.value.columns = ["id", "replacement"];
+        f.release();
+        expect(await observed).toBeUndefined();
+        expect(f.save).not.toHaveBeenCalled();
+        expect(mocks.executeBatch).not.toHaveBeenCalled();
+        expect(f.editor.newRows.value[0]).toEqual([3, "P"]);
+        f.editor.applyCellValue(-1, 1, "fresh");
+        expect(f.editor.newRows.value[0]).toEqual([3, "fresh"]);
+        expect(f.editor.isSaving.value).toBe(false);
+      } finally {
+        f.release();
+        await observed;
+        await f.gateObserved;
+      }
+    });
+
+    it.each(["custom-preview", "sql-prepare", "manual-session", "keyless"] as const)("retires %s rejection without replaying queued Q over R", async (boundary) => {
+      const f = fixture(boundary);
+      f.editor.applyCellValue(0, 1, "P");
+      const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+      try {
+        await waitForGate(f.entered, observed);
+        f.editor.startEdit(0, 1);
+        f.editor.editValue.value = "Q";
+        await f.editor.commitEditFromBlur();
+        f.editor.applyCellValue(0, 1, "R");
+        f.reject(new Error("synthetic preparation failure"));
+        expect(await observed).toBeUndefined();
+        expect(f.editor.saveError.value).toContain("synthetic preparation failure");
+        expect(f.editor.dirtyRows.value.get(0)?.get(1)).toBe("R");
+        expect(f.editor.isSaving.value).toBe(false);
+        expect(f.save).not.toHaveBeenCalled();
+        expect(mocks.executeBatch).not.toHaveBeenCalled();
+        expect(mocks.addHistory).not.toHaveBeenCalled();
+      } finally {
+        f.release();
+        await observed;
+        await f.gateObserved;
+      }
+    });
+  });
 
   describe("later approval interruption cleanup", () => {
     // SOURCE ONLY: none of these regressions has been executed.
@@ -1310,6 +1559,41 @@ describe("useDataGridEditor saveChanges reload", () => {
         f.disableApproval();
         f.reject(failure);
         expect(await observed).toBe(failure);
+        expect(f.editor.hasPendingChanges.value).toBe(false);
+        expect(f.editor.manualSaveRequired.value).toBe(true);
+        expect(f.editor.isSaving.value).toBe(false);
+        f.editor.applyCellValue(0, 1, "fresh");
+        await f.editor.saveChanges({ autoSave: true });
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+        expect(f.editor.dirtyRows.value.get(0)?.get(1)).toBe("fresh");
+        await f.editor.saveChanges();
+        expect(mocks.executeBatch).toHaveBeenCalledTimes(2);
+        expect(f.editor.manualSaveRequired.value).toBe(false);
+      } finally {
+        f.resolve(false);
+        await observed;
+      }
+    });
+    it.each(["sql-production", "sql-confirm"] as const)("preserves F after accepted stale %s during explicit batch retry", async (boundary) => {
+      const f = approvalFixture(boundary);
+      // First establish F via an actual mocked non-transactional batch failure.
+      const approval = f.callback.value;
+      f.disableApproval();
+      mocks.executeBatch.mockRejectedValueOnce(new Error("synthetic partial batch failure"));
+      f.editor.applyCellValue(0, 1, "P");
+      await f.editor.saveChanges();
+      expect(f.editor.manualSaveRequired.value).toBe(true);
+      if (boundary === "sql-confirm") f.callback.value = approval;
+      else mocks.getConfig.mockReturnValue({ id: "connection-1", db_type: "mysql", is_production: true });
+      const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+      try {
+        await waitForApproval(f.started, observed);
+        f.editor.startEdit(0, 1);
+        f.editor.editValue.value = "pending";
+        await f.editor.commitEditFromBlur();
+        f.disableApproval();
+        f.resolve(true);
+        expect(await observed).toBeUndefined();
         expect(f.editor.hasPendingChanges.value).toBe(false);
         expect(f.editor.manualSaveRequired.value).toBe(true);
         expect(f.editor.isSaving.value).toBe(false);

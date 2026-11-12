@@ -1617,21 +1617,22 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     await finishSaveChanges();
   }
 
+  function retireUndispatchedSave(snapshot: PendingSaveSnapshot) {
+    snapshot.newRowRefs.forEach((row) => savingNewRows.delete(row));
+    // Live edits remain authoritative. Never replay a stale shadow or drain an
+    // autosave after pre-dispatch retirement, and never acknowledge P or F.
+    queuedAutoSaveChanges.clear();
+    pendingAutoSaveRequested = false;
+    isSaving.value = false;
+  }
+
   async function confirmPendingSave(snapshot: PendingSaveSnapshot, request: () => Promise<boolean>) {
     let confirmed = false;
     try {
       confirmed = await request();
       return confirmed;
     } finally {
-      if (!confirmed) {
-        snapshot.newRowRefs.forEach((row) => savingNewRows.delete(row));
-        // Nothing was dispatched. Queued edits already live in dirtyRows; only
-        // their post-write replay bookkeeping is obsolete. Do not drain an
-        // autosave after a declined or rejected approval, or acknowledge P/F.
-        queuedAutoSaveChanges.clear();
-        pendingAutoSaveRequested = false;
-        isSaving.value = false;
-      }
+      if (!confirmed) retireUndispatchedSave(snapshot);
     }
   }
 
@@ -1652,7 +1653,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     };
   }
 
-  async function prepareSaveStatements(stmtOptions: NonNullable<ReturnType<typeof saveStatementOptions>>) {
+  async function prepareSaveStatements(stmtOptions: NonNullable<ReturnType<typeof saveStatementOptions>>, isCurrent?: () => boolean) {
     const targets = joinedWriteTargets.value;
     if (!targets?.length) return api.prepareDataGridSave(stmtOptions, saveDriverProfile());
     const groups = joinedSaveOptions(targets, {
@@ -1662,7 +1663,9 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     });
     const prepared: Awaited<ReturnType<typeof api.prepareDataGridSave>> = { statements: [], rollbackStatements: [], keylessGuards: [] };
     for (const group of groups) {
+      if (isCurrent && !isCurrent()) return prepared;
       const part = await api.prepareDataGridSave(group, saveDriverProfile());
+      if (isCurrent && !isCurrent()) return prepared;
       if (part.validationError) return part;
       prepared.statements.push(...part.statements);
       prepared.rollbackStatements.unshift(...part.rollbackStatements);
@@ -1676,12 +1679,13 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   // A keyless save can only be trusted once the server confirms that each
   // predicate it sends addresses a single physical row; the loaded page cannot
   // see rows outside it. Returns the error to fail with, or undefined to allow.
-  async function verifyKeylessGuards(guards: DataGridSaveGuard[], executionSchema?: string, txnSessionId = manualTransactionSessionId.value) {
+  async function verifyKeylessGuards(guards: DataGridSaveGuard[], executionSchema?: string, txnSessionId = manualTransactionSessionId.value, isCurrent?: () => boolean) {
     if (!guards.length) return undefined;
     // Without a connection to count against there is no way to verify the
     // predicate, and an unverified keyless write is exactly what must not run.
     if (!hasBackendSaveTarget.value) return KEYLESS_GUARD_UNVERIFIED_ERROR;
     for (const guard of guards) {
+      if (isCurrent && !isCurrent()) return undefined;
       let matched: unknown;
       if (txnSessionId) {
         const results = await api.executeInManualTransaction(txnSessionId, guard.sql, database.value ?? "", executionSchema, 1);
@@ -1690,6 +1694,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         const result = await api.executeQuery(connectionId.value!, database.value ?? "", guard.sql, executionSchema);
         matched = result?.rows?.[0]?.[0];
       }
+      if (isCurrent && !isCurrent()) return undefined;
       const count = Number(matched);
       if (!Number.isFinite(count)) return KEYLESS_GUARD_UNVERIFIED_ERROR;
       if (count > guard.maxMatchedRows) return guard.message;
@@ -1958,7 +1963,39 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const customHandler = customSaveHandler?.value;
     const connection = connectionStore.getConfig(connectionId.value ?? "");
     const preflightVersion = pendingChangesVersion.value;
-    const preflightTarget = { connectionId: connectionId.value, database: database.value, tableMeta: tableMeta.value, rows: result.value.rows, columns: result.value.columns };
+    const preflightTarget = {
+      connectionId: connectionId.value, database: database.value, tableMeta: tableMeta.value,
+      rows: result.value.rows, columns: result.value.columns,
+      sourceColumns: sourceColumns.value, joinedWriteTargets: joinedWriteTargets.value,
+      databaseType: resolvedDatabaseType.value, executeSql: onExecuteSql.value,
+      ensureSession: options.ensureManualTransactionSession?.value,
+    };
+    let expectedSession = manualTransactionSessionId.value;
+    let snapshotInvalidated = false;
+    function isSaveSnapshotCurrent() {
+      // Helper-loop retirement is sticky: an observed target ABA cannot turn a
+      // partial preparation or interrupted guard sequence into a valid save.
+      if (snapshotInvalidated) return false;
+      // Version tracks editor operations, not arbitrary direct ref/map writes.
+      // An open batch has not necessarily published its version yet.
+      const current = editable.value === true && !isBatching && pendingChangesVersion.value === preflightVersion
+        && connectionId.value === preflightTarget.connectionId && database.value === preflightTarget.database
+        && tableMeta.value === preflightTarget.tableMeta && result.value.rows === preflightTarget.rows
+        && result.value.columns === preflightTarget.columns && customSaveHandler?.value === customHandler
+        && sourceColumns.value === preflightTarget.sourceColumns && joinedWriteTargets.value === preflightTarget.joinedWriteTargets
+        && resolvedDatabaseType.value === preflightTarget.databaseType && onExecuteSql.value === preflightTarget.executeSql
+        && options.ensureManualTransactionSession?.value === preflightTarget.ensureSession
+        && manualTransactionSessionId.value === expectedSession;
+      if (!current) snapshotInvalidated = true;
+      return current;
+    }
+    function retireIfSaveSnapshotChanged() {
+      if (isSaveSnapshotCurrent()) return false;
+      // Even independent tracked Q retires P: preserve both for a fresh action.
+      // Quick-entry does not silently continue after this review becomes stale.
+      retireUndispatchedSave(snapshot);
+      return true;
+    }
     savePreflightReserved = true;
     try {
       if (connection?.read_only) {
@@ -1982,8 +2019,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         });
         if (!confirmed) return;
       }
-      if (!editable.value || pendingChangesVersion.value !== preflightVersion) return;
-      if (connectionId.value !== preflightTarget.connectionId || database.value !== preflightTarget.database || tableMeta.value !== preflightTarget.tableMeta || result.value.rows !== preflightTarget.rows || result.value.columns !== preflightTarget.columns || customSaveHandler?.value !== customHandler) return;
+      if (retireIfSaveSnapshotChanged()) return;
       if (customHandler && snapshot.newRows.length > 0 && customHandler.supportsInsert !== true && customHandler.canInsert !== true) {
         saveError.value = i18n.global.t("grid.insertRowsNotSupported");
         return;
@@ -2014,7 +2050,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       const confirmSaveRequest = options.confirmSaveRequest?.value;
       if (confirmSaveRequest) {
         if (saveOptions.autoSave) {
-          await finishInterruptedSaveChanges(snapshot);
+          retireUndispatchedSave(snapshot);
           return;
         }
         let statements: string[];
@@ -2024,9 +2060,10 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
           if (statements.length === 0) throw new Error("This data source did not produce a safe mutation preview.");
         } catch (e: any) {
           saveError.value = normalizeDataGridSaveError(databaseType.value, e);
-          await finishInterruptedSaveChanges(snapshot);
+          retireUndispatchedSave(snapshot);
           return;
         }
+        if (retireIfSaveSnapshotChanged()) return;
         const saveConfirmed = await confirmPendingSave(snapshot, () => confirmSaveRequest({
           updates: snapshot.dirtyRows.size,
           inserts: snapshot.newRows.length,
@@ -2036,6 +2073,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         }));
         if (!saveConfirmed) return;
       }
+      if (retireIfSaveSnapshotChanged()) return;
       try {
         await customHandler.save(customChanges);
       } catch (e: any) {
@@ -2062,22 +2100,23 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     let preparedSave: Awaited<ReturnType<typeof api.prepareDataGridSave>> | undefined;
     if (stmtOptions) {
       try {
-        preparedSave = await prepareSaveStatements(stmtOptions);
+        preparedSave = await prepareSaveStatements(stmtOptions, isSaveSnapshotCurrent);
       } catch (e: any) {
         saveError.value = normalizeDataGridSaveError(databaseType.value, e);
-        await finishInterruptedSaveChanges(snapshot);
+        retireUndispatchedSave(snapshot);
         return;
       }
     }
+    if (retireIfSaveSnapshotChanged()) return;
     if (preparedSave?.validationError) {
       saveError.value = preparedSave.validationError;
-      await finishInterruptedSaveChanges(snapshot);
+      retireUndispatchedSave(snapshot);
       return;
     }
 
     const stmts = preparedSave?.statements ?? [];
     if (stmts.length === 0) {
-      await finishInterruptedSaveChanges(snapshot);
+      retireUndispatchedSave(snapshot);
       return;
     }
     const rollbackStmts = preparedSave?.rollbackStatements ?? [];
@@ -2085,30 +2124,39 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     if (options.ensureManualTransactionSession?.value && hasBackendSaveTarget.value) {
       try {
         txnSessionId = await options.ensureManualTransactionSession.value();
+        // The initializer may publish the session it just returned. Reject a
+        // different replacement, without rejecting that expected publication.
+        if (manualTransactionSessionId.value !== expectedSession && manualTransactionSessionId.value !== txnSessionId) {
+          retireUndispatchedSave(snapshot);
+          return;
+        }
+        expectedSession = manualTransactionSessionId.value;
+        if (retireIfSaveSnapshotChanged()) return;
         if (!txnSessionId) throw new Error("Manual transaction session was not initialized");
       } catch (error) {
         saveError.value = normalizeDataGridSaveError(databaseType.value, error);
-        await finishInterruptedSaveChanges(snapshot);
+        retireUndispatchedSave(snapshot);
         return;
       }
     }
     try {
-      const guardError = await verifyKeylessGuards(preparedSave?.keylessGuards ?? [], preparedSave?.executionSchema, txnSessionId);
+      const guardError = await verifyKeylessGuards(preparedSave?.keylessGuards ?? [], preparedSave?.executionSchema, txnSessionId, isSaveSnapshotCurrent);
       if (guardError) {
         saveError.value = guardError;
-        await finishInterruptedSaveChanges(snapshot);
+        retireUndispatchedSave(snapshot);
         return;
       }
     } catch (e: any) {
       saveError.value = normalizeDataGridSaveError(databaseType.value, e);
-      await finishInterruptedSaveChanges(snapshot);
+      retireUndispatchedSave(snapshot);
       return;
     }
+    if (retireIfSaveSnapshotChanged()) return;
     const productionAssessment = assessProductionSql(stmts.join(";\n"), connection, database.value);
     if (productionAssessment.active && productionAssessment.isMutation) {
       // Autosave must never write production data without an operator reviewing the generated statements.
       if (saveOptions.autoSave) {
-        await finishInterruptedSaveChanges(snapshot);
+        retireUndispatchedSave(snapshot);
         return;
       }
       const confirmed = await confirmPendingSave(snapshot, () => productionSafetyStore.requestConfirmation({
@@ -2119,6 +2167,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         source: i18n.global.t("readOnlyUnlock.sourceDataEditor"),
       }));
       if (!confirmed) return;
+      if (retireIfSaveSnapshotChanged()) return;
     }
     // Engines without transactional rollback (Salesforce: one REST call per record,
     // a failure leaves earlier records applied) let the host review the operation
@@ -2127,7 +2176,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const confirmSaveRequest = options.confirmSaveRequest?.value;
     if (confirmSaveRequest) {
       if (saveOptions.autoSave) {
-        await finishInterruptedSaveChanges(snapshot);
+        retireUndispatchedSave(snapshot);
         return;
       }
       const saveConfirmed = await confirmPendingSave(snapshot, () => confirmSaveRequest({
@@ -2139,10 +2188,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       }));
       if (!saveConfirmed) return;
     }
-    if (!editable.value || stmtOptions?.tableMeta !== tableMeta.value) {
-      await finishInterruptedSaveChanges(snapshot);
-      return;
-    }
+    if (retireIfSaveSnapshotChanged()) return;
     const start = Date.now();
     let apiResult: { affected_rows?: number } | undefined;
     let successfulBatch = false;
@@ -2154,6 +2200,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     });
     if (txnSessionId && hasBackendSaveTarget.value) {
       options.onManualTransactionMutation?.();
+      if (retireIfSaveSnapshotChanged()) return;
       try {
         const results = await api.executeInManualTransaction(txnSessionId, stmts.join(";\n"), database.value ?? "", preparedSave?.executionSchema);
         apiResult = {
