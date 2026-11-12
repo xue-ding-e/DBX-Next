@@ -1617,6 +1617,24 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     await finishSaveChanges();
   }
 
+  async function confirmPendingSave(snapshot: PendingSaveSnapshot, request: () => Promise<boolean>) {
+    let confirmed = false;
+    try {
+      confirmed = await request();
+      return confirmed;
+    } finally {
+      if (!confirmed) {
+        snapshot.newRowRefs.forEach((row) => savingNewRows.delete(row));
+        // Nothing was dispatched. Queued edits already live in dirtyRows; only
+        // their post-write replay bookkeeping is obsolete. Do not drain an
+        // autosave after a declined or rejected approval, or acknowledge P/F.
+        queuedAutoSaveChanges.clear();
+        pendingAutoSaveRequested = false;
+        isSaving.value = false;
+      }
+    }
+  }
+
   function saveStatementOptions(snapshot = snapshotPendingSaveChanges()) {
     if (!tableMeta.value) return null;
     return {
@@ -2009,17 +2027,14 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
           await finishInterruptedSaveChanges(snapshot);
           return;
         }
-        const saveConfirmed = await confirmSaveRequest({
+        const saveConfirmed = await confirmPendingSave(snapshot, () => confirmSaveRequest({
           updates: snapshot.dirtyRows.size,
           inserts: snapshot.newRows.length,
           deletes: snapshot.deletedRows.size,
           targetLabel: customHandler.targetLabel,
           statements,
-        });
-        if (!saveConfirmed) {
-          await finishInterruptedSaveChanges(snapshot);
-          return;
-        }
+        }));
+        if (!saveConfirmed) return;
       }
       try {
         await customHandler.save(customChanges);
@@ -2096,17 +2111,14 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         await finishInterruptedSaveChanges(snapshot);
         return;
       }
-      const confirmed = await productionSafetyStore.requestConfirmation({
+      const confirmed = await confirmPendingSave(snapshot, () => productionSafetyStore.requestConfirmation({
         sql: stmts.join("\n"),
         connectionName: connection?.name,
         database: database.value,
         productionDatabases: productionAssessment.databases,
         source: i18n.global.t("readOnlyUnlock.sourceDataEditor"),
-      });
-      if (!confirmed) {
-        await finishInterruptedSaveChanges(snapshot);
-        return;
-      }
+      }));
+      if (!confirmed) return;
     }
     // Engines without transactional rollback (Salesforce: one REST call per record,
     // a failure leaves earlier records applied) let the host review the operation
@@ -2118,17 +2130,14 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         await finishInterruptedSaveChanges(snapshot);
         return;
       }
-      const saveConfirmed = await confirmSaveRequest({
+      const saveConfirmed = await confirmPendingSave(snapshot, () => confirmSaveRequest({
         updates: snapshot.dirtyRows.size,
         inserts: snapshot.newRows.length,
         deletes: snapshot.deletedRows.size,
         targetLabel: tableMeta.value?.tableName,
         statements: stmts,
-      });
-      if (!saveConfirmed) {
-        await finishInterruptedSaveChanges(snapshot);
-        return;
-      }
+      }));
+      if (!saveConfirmed) return;
     }
     if (!editable.value || stmtOptions?.tableMeta !== tableMeta.value) {
       await finishInterruptedSaveChanges(snapshot);
