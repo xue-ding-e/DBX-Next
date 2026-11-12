@@ -1,0 +1,38 @@
+name: Grid save checks
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/desktop/src/**'
+      - 'packages/**'
+      - 'pnpm-lock.yaml'
+      - 'package.json'
+      - 'vitest.config.ts'
+      - '.github/workflows/grid-save-checks.yml'
+  push:
+    branches: [review/grid-save-lifecycle-20261112]
+permissions:
+  contents: read
+concurrency:
+  group: grid-save-checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.27.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Grid lifecycle regressions (mock backend)
+        run: pnpm exec vitest run apps/desktop/src/composables/__tests__/useDataGridEditor.spec.ts apps/desktop/src/composables/__tests__/useDataGridEditor.saveSqlDatabaseName.spec.ts apps/desktop/src/composables/__tests__/useDataGridResultLifecycle.spec.ts --maxWorkers=1
+      - name: Frontend typecheck
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: pnpm typecheck
