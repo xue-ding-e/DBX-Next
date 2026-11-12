@@ -1944,6 +1944,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       }
       return completeConditionalUpdate(execution);
     } catch (error) {
+      if (conditionalUpdateExecution.value !== execution) return false;
       saveError.value = normalizeDataGridSaveError(databaseType.value, error);
       return false;
     } finally {

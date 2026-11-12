@@ -3101,6 +3101,109 @@ describe("useDataGridEditor saveChanges reload", () => {
     }
   });
 
+  describe("conditional cancel rejection identity (UNRUN source-only candidate)", () => {
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+      void promise.catch(() => undefined);
+      return { promise, resolve, reject };
+    }
+
+    function observe<T>(promise: Promise<T>) {
+      return promise.then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      );
+    }
+
+    async function waitForEntry(entered: Promise<void>, settled: Promise<unknown>) {
+      const winner = await Promise.race([entered.then(() => "entered"), settled.then(() => "settled")]);
+      expect(winner).toBe("entered");
+    }
+
+    for (const continuation of ["no-new-execution", "new-api-pending", "new-unknown-error", "current-execution"] as const) {
+      it(`UNRUN: cancel rejection preserves ${continuation}`, async () => {
+        const apiEntered = deferred<void>();
+        const apiGate = deferred<{ affected_rows: number }>();
+        const cancelEntered = deferred<void>();
+        const cancelGate = deferred<{ requested: boolean; terminal: boolean }>();
+        const nextApiEntered = deferred<void>();
+        const nextApiGate = deferred<{ affected_rows: number }>();
+        mocks.executeConditionalUpdate
+          .mockImplementationOnce(() => { apiEntered.resolve(); return apiGate.promise; })
+          .mockImplementationOnce(() => { nextApiEntered.resolve(); return nextApiGate.promise; });
+        mocks.cancelConditionalUpdate
+          .mockImplementationOnce(() => { cancelEntered.resolve(); return cancelGate.promise; })
+          .mockResolvedValue({ requested: true, terminal: true });
+        mocks.addHistory.mockResolvedValue(undefined);
+        const prepareFullReload = vi.fn();
+        const { editor, emit } = createSaveTestEditor({ prepareFullReload });
+        const statement = "UPDATE orders_test SET status = 'shipped' WHERE id > 0;";
+        const oldObserved = observe(editor.executeConditionalUpdate(statement));
+        let cancelObserved: ReturnType<typeof observe<boolean>> | undefined;
+        let nextObserved: typeof oldObserved | undefined;
+        const reloadCount = () => emit.mock.calls.filter(([event]) => event === "reload").length;
+        try {
+          await waitForEntry(apiEntered.promise, oldObserved);
+          cancelObserved = observe(editor.cancelConditionalUpdate());
+          await waitForEntry(cancelEntered.promise, cancelObserved);
+          expect(mocks.cancelConditionalUpdate).toHaveBeenCalledWith(mocks.executeConditionalUpdate.mock.calls[0][4]);
+          if (continuation !== "current-execution") {
+            apiGate.resolve({ affected_rows: 7 });
+            expect(await oldObserved).toEqual({ status: "fulfilled", value: { affectedRows: 7 } });
+            expect(editor.isSaving.value).toBe(false);
+            expect(editor.isConditionalUpdateActive.value).toBe(false);
+          }
+          if (continuation === "new-api-pending" || continuation === "new-unknown-error") {
+            nextObserved = observe(editor.executeConditionalUpdate(statement));
+            await waitForEntry(nextApiEntered.promise, nextObserved);
+            expect(mocks.executeConditionalUpdate).toHaveBeenCalledTimes(2);
+            if (continuation === "new-unknown-error") {
+              // Mocked API rejection through the real composable creates the newer error and unknown owner.
+              nextApiGate.reject(new Error("New execution transport outcome unknown"));
+              expect(await nextObserved).toEqual({ status: "fulfilled", value: null });
+              expect(editor.saveError.value).toBe("New execution transport outcome unknown");
+            }
+          }
+          if (continuation !== "new-unknown-error") expect(editor.saveError.value).toBe("");
+          const errorBefore = editor.saveError.value;
+          const activeBefore = editor.isConditionalUpdateActive.value;
+          const savingBefore = editor.isSaving.value;
+          const historyBefore = mocks.addHistory.mock.calls.length;
+          const reloadsBefore = reloadCount();
+          const preparesBefore = prepareFullReload.mock.calls.length;
+          cancelGate.reject(new Error("Old cancellation transport failed"));
+          expect(await cancelObserved).toEqual({ status: "fulfilled", value: false });
+          expect(editor.saveError.value).toBe(continuation === "current-execution" ? "Old cancellation transport failed" : errorBefore);
+          expect(editor.isConditionalUpdateActive.value).toBe(activeBefore);
+          expect(editor.isSaving.value).toBe(savingBefore);
+          expect(activeBefore).toBe(continuation !== "no-new-execution");
+          expect(savingBefore).toBe(continuation !== "no-new-execution");
+          expect(mocks.addHistory).toHaveBeenCalledTimes(historyBefore);
+          expect(reloadCount()).toBe(reloadsBefore);
+          expect(prepareFullReload).toHaveBeenCalledTimes(preparesBefore);
+          if (continuation === "current-execution" || continuation === "new-unknown-error") {
+            // A terminal stub proves cancellation remains available, with no polling timer.
+            expect(await observe(editor.cancelConditionalUpdate())).toEqual({ status: "fulfilled", value: true });
+            const callIndex = continuation === "current-execution" ? 0 : 1;
+            expect(mocks.cancelConditionalUpdate).toHaveBeenLastCalledWith(mocks.executeConditionalUpdate.mock.calls[callIndex][4]);
+            expect(editor.isConditionalUpdateActive.value).toBe(false);
+            expect(editor.isSaving.value).toBe(false);
+          }
+        } finally {
+          // Release every operation gate and observe all started operations on assertion failure too.
+          apiGate.resolve({ affected_rows: 7 });
+          nextApiGate.resolve({ affected_rows: 11 });
+          cancelGate.resolve({ requested: true, terminal: true });
+          await Promise.all([oldObserved, cancelObserved, nextObserved]);
+          // Resolving an already rejected API cannot release its unknown owner.
+          if (editor.isConditionalUpdateActive.value) await observe(editor.cancelConditionalUpdate());
+        }
+      });
+    }
+  });
+
   it("refuses a conditional update while row edits are pending", async () => {
     const { editor, emit } = createSaveTestEditor();
     editor.dirtyRows.value = new Map([[0, new Map([[1, "shipped"]])]]);
