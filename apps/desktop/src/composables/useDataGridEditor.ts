@@ -162,6 +162,7 @@ export interface UseDataGridEditorOptions {
 
 interface PendingChangesSnapshot {
   manualSaveRequired?: boolean;
+  batchFailureRequiresManualSave?: boolean;
   newRows: CellValue[][];
   newRowMeta: GridNewRowMeta[];
   quickEntryDraftRow?: CellValue[];
@@ -340,6 +341,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   const redoStack = ref<PendingChangesHistorySnapshot[]>([]);
   const pendingChangesVersion = ref(0);
   const manualSaveRequired = ref(false);
+  // Batch failures are not undoable edit history, and error text may be cleared by later edits.
+  let batchFailureRequiresManualSave = false;
   let restoredEditingCell = false;
   let restoredTransactionActive = false;
   let suppressNextBlurCommit = false;
@@ -364,7 +367,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       quickEntryDraftRow.value = cached.quickEntryDraftRow ? [...cached.quickEntryDraftRow] : [];
       dirtyRows.value = cached.dirtyRows;
       deletedRows.value = cached.deletedRows;
-      manualSaveRequired.value = cached.manualSaveRequired === true;
+      batchFailureRequiresManualSave = cached.batchFailureRequiresManualSave === true;
+      manualSaveRequired.value = batchFailureRequiresManualSave || cached.manualSaveRequired === true;
       editingCell.value = cached.editingCell ?? null;
       editValue.value = cached.editValue ?? "";
       restoredEditingCell = !!cached.editingCell;
@@ -485,7 +489,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     restoreNewRowMeta(snapshot.newRowMeta ?? []);
     quickEntryDraftRow.value = snapshot.quickEntryDraftRow ? [...snapshot.quickEntryDraftRow] : emptyDraftRow();
     dirtyRows.value = restoredDirtyRows;
-    manualSaveRequired.value = snapshot.manualSaveRequired === true;
+    manualSaveRequired.value = batchFailureRequiresManualSave || snapshot.manualSaveRequired === true;
     deletedRows.value = new Set(snapshot.deletedRows);
     transactionActive.value = snapshot.transactionActive === true && useTransaction.value === true;
     queuedAutoSaveChanges.clear();
@@ -1115,7 +1119,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       return changed;
     } finally {
       commitBatch();
-      if (!hasPendingChanges.value) manualSaveRequired.value = false;
+      if (!hasPendingChanges.value) manualSaveRequired.value = batchFailureRequiresManualSave;
     }
   }
 
@@ -1583,15 +1587,20 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     touchPendingChanges();
   }
 
-  async function finishSaveChanges(savedSnapshot?: PendingSaveSnapshot) {
+  async function finishSaveChanges(savedSnapshot?: PendingSaveSnapshot, successfulExplicitBatch = false) {
     isSaving.value = false;
-    if (!hasPendingChanges.value) manualSaveRequired.value = false;
+    if (!hasPendingChanges.value) manualSaveRequired.value = batchFailureRequiresManualSave;
     if (pendingAutoSaveRequested && dataGridQuickEntryEnabled.value) {
       applyQueuedAutoSaveChanges(savedSnapshot);
     } else {
       queuedAutoSaveChanges.clear();
     }
     if (!hasPendingChanges.value) {
+      // Only an actual explicit batch success with all newer edits drained can lift this reason.
+      if (successfulExplicitBatch) {
+        batchFailureRequiresManualSave = false;
+        manualSaveRequired.value = false;
+      }
       pendingAutoSaveRequested = false;
       return;
     }
@@ -1898,7 +1907,11 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
 
   async function saveChanges(saveOptions: SaveChangesOptions = {}) {
     if (!editable.value) return;
-    if (saveOptions.autoSave && manualSaveRequired.value) return;
+    if (saveOptions.autoSave && (manualSaveRequired.value || batchFailureRequiresManualSave)) {
+      // Remember edits made during a manual retry even though they must not auto-save.
+      if (batchFailureRequiresManualSave && isSaving.value) pendingAutoSaveRequested = true;
+      return;
+    }
     if (isSaving.value) {
       if (saveOptions.autoSave) pendingAutoSaveRequested = true;
       return;
@@ -2096,6 +2109,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
     const start = Date.now();
     let apiResult: { affected_rows?: number } | undefined;
+    let successfulBatch = false;
     console.info("[DBX][dataGrid:save-statements]", {
       databaseType: databaseType.value,
       table: tableMeta.value ? [tableMeta.value.schema, tableMeta.value.tableName].filter(Boolean).join(".") : undefined,
@@ -2125,7 +2139,12 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     } else if (hasBackendSaveTarget.value) {
       try {
         apiResult = await api.executeBatch(connectionId.value!, database.value ?? "", stmts, preparedSave?.executionSchema);
+        successfulBatch = true;
       } catch (e: any) {
+        // A failed batch may have applied statements before the error.
+        // Require manual save for the pending edits instead of automatic replay.
+        batchFailureRequiresManualSave = true;
+        manualSaveRequired.value = true;
         saveError.value = await recordFailedDataGridHistory(stmts, rollbackStmts, start, snapshot, e);
         await finishInterruptedSaveChanges(snapshot);
         return;
@@ -2167,11 +2186,12 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     if (shouldReloadAfterSqlSave && !savedRowsRefreshed) {
       reloadCurrentData();
     }
-    await finishSaveChanges(snapshot);
+    await finishSaveChanges(snapshot, successfulBatch && saveOptions.autoSave !== true);
   }
 
   function discardChanges() {
     if (isConditionalUpdateActive.value) return;
+    batchFailureRequiresManualSave = false;
     manualSaveRequired.value = false;
     dirtyRows.value = new Map();
     newRows.value = [];
@@ -2212,12 +2232,13 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const scroll = includeScroll ? (readScrollPosition() ?? pendingScrollRestore) : undefined;
     if (includeScroll) pendingScrollRestore = scroll;
     const quickEntryDraftRowSnapshot = draftRowHasValue() ? [...quickEntryDraftRow.value] : undefined;
-    if (!hasPendingChanges.value && !quickEntryDraftRowSnapshot && !(includeEditing && editingCell.value) && !scroll) {
+    if (!batchFailureRequiresManualSave && !hasPendingChanges.value && !quickEntryDraftRowSnapshot && !(includeEditing && editingCell.value) && !scroll) {
       pendingChangesCache.delete(k);
       return;
     }
     pendingChangesCache.set(k, {
       manualSaveRequired: manualSaveRequired.value,
+      batchFailureRequiresManualSave,
       newRows: newRows.value.map((r) => [...r]),
       newRowMeta: cloneNewRowMeta(newRowMeta.value),
       quickEntryDraftRow: quickEntryDraftRowSnapshot,

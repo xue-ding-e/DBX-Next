@@ -5,6 +5,7 @@ import { clearDataGridPendingSnapshot, DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID, useDa
 import { clearDataGridClipboardCopy, parseDataGridClipboard, rememberDataGridClipboardCopy } from "@/lib/dataGrid/dataGridClipboard";
 import { buildMongoUpdateDocument, MONGO_DOCUMENT_GRID_NULL, mongoDocumentGridInputValue, mongoDocumentGridValue } from "@/lib/mongo/mongoDocumentValues";
 import type { CellValue } from "@/lib/dataGrid/cellValue";
+import { canInsertTableRows, supportsDataGridTransaction } from "@/lib/table/tableEditing";
 
 const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(),
@@ -1041,6 +1042,10 @@ describe("useDataGridEditor saveChanges reload", () => {
       onManualTransactionMutation?: ReturnType<typeof vi.fn>;
       connectionId?: string;
       databaseType?: import("@/types/database").DatabaseType;
+      quickEntry?: boolean;
+      resolveNewRowItems?: boolean;
+      resolveExistingRowItems?: boolean;
+      cacheKey?: string;
       primaryKeys?: string[];
       onExecuteSql?: (sql: string) => Promise<void>;
     } = {},
@@ -1056,7 +1061,8 @@ describe("useDataGridEditor saveChanges reload", () => {
       ],
     });
     if (options.queryResult) result.value = options.queryResult;
-    const editor = useDataGridEditor({
+    let editor: ReturnType<typeof useDataGridEditor>;
+    editor = useDataGridEditor({
       result: computed(() => result.value),
       editable: computed(() => true),
       databaseType: computed(() => options.databaseType ?? "mysql"),
@@ -1085,16 +1091,607 @@ describe("useDataGridEditor saveChanges reload", () => {
       orderByInput: ref(""),
       rowStatusFilter: ref("all"),
       confirmDangerousRowDeletion: computed(() => true),
+      dataGridQuickEntryEnabled: computed(() => options.quickEntry ?? false),
       pageSize: ref(100),
       currentPage,
-      cacheKey: computed(() => undefined),
-      getRowItem: () => undefined,
+      cacheKey: computed(() => options.cacheKey),
+      getRowItem: (rowId) => {
+        if (rowId >= 0 && options.resolveExistingRowItems) {
+          // Same unfiltered source-index and live dirty overlay as the existing
+          // createEditorWithResult fixture, not a mounted DataGrid resolver.
+          const row = result.value.rows[rowId];
+          if (!row) return undefined;
+          const changes = editor.dirtyRows.value.get(rowId);
+          return {
+            id: rowId,
+            sourceIndex: rowId,
+            data: editor.rowDataWithChanges(row, rowId),
+            isNew: false,
+            isDeleted: editor.deletedRows.value.has(rowId),
+            isDirtyCol: row.map((_, col) => changes?.has(col) ?? false),
+            status: editor.deletedRows.value.has(rowId) ? "deleted" : changes?.size ? "edited" : "clean",
+          };
+        }
+        if (!options.resolveNewRowItems || rowId >= 0) return undefined;
+        // Minimal injected resolver: DataGrid uses -(newIndex + 1) and the live
+        // newRows entry. This is not the full resolver or a mounted UI fixture.
+        const newIndex = -rowId - 1;
+        const row = editor.newRows.value[newIndex];
+        if (!row) return undefined;
+        return {
+          id: rowId,
+          newIndex,
+          data: row,
+          isNew: true,
+          isDeleted: false,
+          isDirtyCol: result.value.columns.map(() => false),
+          status: "new",
+        };
+      },
       prepareFullReload: options.prepareFullReload,
       refreshSavedRows: options.refreshSavedRows,
       emit,
     });
     return { editor, emit, currentPage, ensureManualTransactionSession };
   }
+
+  describe("failed batch manual-save lifetime", () => {
+    const insertSql = "INSERT INTO orders_test VALUES (3, 'first')";
+    const updateSql = "UPDATE orders_test SET status='changed' WHERE id=1";
+    const failure = "Batch outcome is unknown.";
+    type Editor = ReturnType<typeof useDataGridEditor>;
+
+    beforeEach(() => {
+      mocks.addHistory.mockResolvedValue(undefined);
+      // Finite fallback responses let an erroneous replay settle and be counted.
+      mocks.prepareDataGridSave.mockResolvedValue({ statements: [insertSql], rollbackStatements: [] });
+      mocks.executeBatch.mockResolvedValue({ affected_rows: 1 });
+      mocks.executeBatch.mockRejectedValueOnce(new Error(failure));
+    });
+
+    async function addInsert(editor: Editor, id = "3", status = "first") {
+      const rowId = editor.addRows(1)!;
+      await nextTick();
+      editor.startEdit(rowId, 0);
+      editor.editValue.value = id;
+      expect(editor.commitEdit()).toEqual({ changed: true, rowKind: "new" });
+      editor.startEdit(rowId, 1);
+      editor.editValue.value = status;
+      expect(editor.commitEdit()).toEqual({ changed: true, rowKind: "new" });
+      return rowId;
+    }
+
+    function stageUpdate(editor: Editor, value = "changed") {
+      editor.startEdit(0, 1);
+      editor.editValue.value = value;
+      expect(editor.commitEdit()).toEqual({ changed: true, rowKind: "existing" });
+    }
+
+    function insertEditor(cacheKey?: string, customSaveHandler?: CustomSaveHandler) {
+      expect(canInsertTableRows("hive")).toBe(true);
+      expect(supportsDataGridTransaction("hive")).toBe(false);
+      return createSaveTestEditor({ databaseType: "hive", quickEntry: true, resolveNewRowItems: true, cacheKey, customSaveHandler }).editor;
+    }
+
+    function updateEditor(confirmSaveRequest?: (request: import("@/composables/useDataGridEditor").DataGridSaveConfirmationRequest) => Promise<boolean>) {
+      mocks.prepareDataGridSave.mockResolvedValue({ statements: [updateSql], rollbackStatements: [] });
+      return createSaveTestEditor({ databaseType: "mysql", quickEntry: true, resolveExistingRowItems: true, confirmSaveRequest }).editor;
+    }
+
+    it("keeps the failure gate through undo to empty, an empty save, and redo", async () => {
+      const editor = insertEditor();
+      await addInsert(editor);
+      await editor.saveChanges();
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect(editor.saveError.value).toBe(failure);
+      // Exactly the add and two cell edits; no unbounded history traversal.
+      for (let i = 0; i < 3; i++) editor.undoPendingChange();
+      expect(editor.newRows.value).toEqual([]);
+      expect(editor.hasPendingChanges.value).toBe(false);
+      expect(editor.canUndoPendingChange.value).toBe(false);
+      expect.soft(editor.manualSaveRequired.value).toBe(true);
+      await editor.saveChanges();
+      for (let i = 0; i < 3; i++) editor.redoPendingChange();
+      expect(editor.newRows.value).toEqual([[3, "first"]]);
+      expect.soft(editor.manualSaveRequired.value).toBe(true);
+      await editor.saveChanges({ autoSave: true });
+      expect(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect(editor.newRows.value).toEqual([[3, "first"]]);
+    });
+
+    it.each([false, true])("restores a settled failure from the tab cache (failure-only=%s)", async (failureOnly) => {
+      const key = `failure-lifetime-settled-${failureOnly}`;
+      clearDataGridPendingSnapshot(key);
+      try {
+        const first = insertEditor(key);
+        await addInsert(first);
+        await first.saveChanges();
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+        expect(first.saveError.value).toBe(failure);
+        if (failureOnly) {
+          for (let i = 0; i < 3; i++) first.undoPendingChange();
+          expect(first.hasPendingChanges.value).toBe(false);
+        }
+        if (failureOnly) first.savePendingSnapshot();
+        else first.onBeforeTabSwitch();
+        const restored = insertEditor(key);
+        expect(restored.canUndoPendingChange.value).toBe(false);
+        expect(restored.canRedoPendingChange.value).toBe(false);
+        expect.soft(restored.manualSaveRequired.value).toBe(true);
+        if (failureOnly) await addInsert(restored, "4", "later");
+        restored.startEdit(-1, 1);
+        restored.editValue.value = "after restore";
+        await restored.commitEditFromBlur();
+        expect(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+        expect(restored.newRows.value).toEqual([[failureOnly ? 4 : 3, "after restore"]]);
+        // Only this instance's new edits supply Undo history. The separate
+        // failure-only and custom-success cases distinguish the failure reason.
+        restored.undoPendingChange();
+        expect(restored.manualSaveRequired.value).toBe(true);
+      } finally {
+        clearDataGridPendingSnapshot(key);
+      }
+    });
+
+    it("caches the failure gate before failed-history recording settles", async () => {
+      const key = "failure-lifetime-deferred-history";
+      clearDataGridPendingSnapshot(key);
+      let historyStarted!: () => void;
+      let releaseHistory!: () => void;
+      const started = new Promise<void>((resolve) => { historyStarted = resolve; });
+      const blocked = new Promise<void>((resolve) => { releaseHistory = resolve; });
+      mocks.addHistory.mockImplementationOnce(async () => {
+        historyStarted();
+        await blocked;
+      });
+      const first = insertEditor(key);
+      await addInsert(first);
+      const firstSave = first.saveChanges();
+      try {
+        await started;
+        expect(first.isSaving.value).toBe(true);
+        expect(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+        expect(mocks.executeBatch).toHaveBeenCalledWith("connection-1", "app", [insertSql], undefined);
+        expect(mocks.addHistory).toHaveBeenCalledWith(expect.objectContaining({ success: false }));
+        first.savePendingSnapshot();
+        const restored = insertEditor(key);
+        expect.soft(restored.manualSaveRequired.value).toBe(true);
+        restored.startEdit(-1, 1);
+        restored.editValue.value = "while history waits";
+        await restored.commitEditFromBlur();
+        expect(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+        expect(restored.newRows.value).toEqual([[3, "while history waits"]]);
+      } finally {
+        releaseHistory();
+        await firstSave;
+        clearDataGridPendingSnapshot(key);
+      }
+    });
+
+    it.each([false, true])("releases the gate only after an explicit batch retry drains pending work (new pending=%s)", async (newPending) => {
+      const editor = insertEditor();
+      await addInsert(editor);
+      await editor.saveChanges();
+      expect(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect(mocks.executeBatch).toHaveBeenCalledWith("connection-1", "app", [insertSql], undefined);
+      expect(editor.manualSaveRequired.value).toBe(true);
+      let retryStarted!: () => void;
+      let releaseRetry!: () => void;
+      const started = new Promise<void>((resolve) => { retryStarted = resolve; });
+      const blocked = new Promise<void>((resolve) => { releaseRetry = resolve; });
+      mocks.executeBatch.mockImplementationOnce(async () => {
+        retryStarted();
+        await blocked;
+        return { affected_rows: 1 };
+      });
+      const retry = editor.saveChanges();
+      try {
+        await started;
+        expect(mocks.executeBatch).toHaveBeenCalledTimes(2);
+        if (newPending) {
+          const rowId = await addInsert(editor, "4", "queued");
+          editor.startEdit(rowId, 1);
+          editor.editValue.value = "queued during retry";
+          await editor.commitEditFromBlur();
+        }
+      } finally {
+        releaseRetry();
+        await retry;
+      }
+      expect(editor.isSaving.value).toBe(false);
+      expect(mocks.executeBatch).toHaveBeenCalledTimes(2);
+      expect(editor.canUndoPendingChange.value).toBe(false);
+      expect(editor.canRedoPendingChange.value).toBe(false);
+      expect(editor.hasPendingChanges.value).toBe(newPending);
+      expect(editor.manualSaveRequired.value).toBe(newPending);
+      if (newPending) {
+        expect(editor.newRows.value).toEqual([[4, "queued during retry"]]);
+        await editor.saveChanges({ autoSave: true });
+        expect(mocks.executeBatch).toHaveBeenCalledTimes(2);
+      } else {
+        expect(editor.newRows.value).toEqual([]);
+        const rowId = await addInsert(editor, "5", "fresh");
+        editor.startEdit(rowId, 1);
+        editor.editValue.value = "fresh auto-save";
+        await editor.commitEditFromBlur();
+        expect(mocks.executeBatch).toHaveBeenCalledTimes(3);
+        expect(editor.hasPendingChanges.value).toBe(false);
+      }
+      expect(mocks.executeInTransaction).not.toHaveBeenCalled();
+      expect(mocks.executeInManualTransaction).not.toHaveBeenCalled();
+    });
+
+    it("retains an existing-row reversal to the old result while an explicit retry is in flight", async () => {
+      const editor = updateEditor();
+      stageUpdate(editor);
+      await editor.saveChanges();
+      expect(editor.saveError.value).toBe(failure);
+      expect(editor.manualSaveRequired.value).toBe(true);
+      expect(mocks.executeBatch).toHaveBeenNthCalledWith(1, "connection-1", "app", [updateSql], undefined);
+      let retryStarted!: () => void;
+      let releaseRetry!: () => void;
+      const started = new Promise<void>((resolve) => { retryStarted = resolve; });
+      const blocked = new Promise<void>((resolve) => { releaseRetry = resolve; });
+      mocks.executeBatch.mockImplementationOnce(async () => {
+        retryStarted();
+        await blocked;
+        return { affected_rows: 1 };
+      });
+      const retry = editor.saveChanges();
+      try {
+        await started;
+        editor.startEdit(0, 1);
+        editor.editValue.value = "pending";
+        await editor.commitEditFromBlur();
+        // Equal to the OLD result now, but different from the retry's saved value.
+        expect(editor.dirtyRows.value.size).toBe(0);
+        expect(mocks.executeBatch).toHaveBeenCalledTimes(2);
+      } finally {
+        releaseRetry();
+        await retry;
+      }
+      expect.soft(editor.dirtyRows.value.get(0)).toEqual(new Map([[1, "pending"]]));
+      expect.soft(editor.hasPendingChanges.value).toBe(true);
+      expect.soft(editor.manualSaveRequired.value).toBe(true);
+      await editor.saveChanges({ autoSave: true });
+      expect(mocks.prepareDataGridSave).toHaveBeenCalledTimes(2);
+      expect(mocks.executeBatch).toHaveBeenCalledTimes(2);
+      expect(mocks.executeInTransaction).not.toHaveBeenCalled();
+      expect(mocks.executeInManualTransaction).not.toHaveBeenCalled();
+    });
+
+    it.each(["preparation failure", "no statements", "declined confirmation"] as const)("does not clear the failure gate after %s", async (interruption) => {
+      const confirmSaveRequest = vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false);
+      const editor = updateEditor(interruption === "declined confirmation" ? confirmSaveRequest : undefined);
+      stageUpdate(editor);
+      await editor.saveChanges();
+      expect(editor.saveError.value).toBe(failure);
+      if (interruption === "preparation failure") mocks.prepareDataGridSave.mockRejectedValueOnce(new Error("Preparation failed."));
+      if (interruption === "no statements") mocks.prepareDataGridSave.mockResolvedValueOnce({ statements: [], rollbackStatements: [] });
+      await editor.saveChanges();
+      // This is past preparation, not an auto-save early-guard-only assertion.
+      expect(mocks.prepareDataGridSave).toHaveBeenCalledTimes(2);
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      if (interruption === "declined confirmation") expect(confirmSaveRequest).toHaveBeenCalledTimes(2);
+      expect(editor.isSaving.value).toBe(false);
+      editor.undoPendingChange();
+      expect(editor.hasPendingChanges.value).toBe(false);
+      expect.soft(editor.manualSaveRequired.value).toBe(true);
+      stageUpdate(editor, "after interruption");
+      await editor.saveChanges({ autoSave: true });
+      expect(mocks.prepareDataGridSave).toHaveBeenCalledTimes(2);
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect(editor.dirtyRows.value.get(0)?.get(1)).toBe("after interruption");
+    });
+
+    it("does not treat successful custom saving as recovery from a cached batch failure", async () => {
+      const key = "failure-lifetime-custom-save";
+      clearDataGridPendingSnapshot(key);
+      try {
+        const first = insertEditor(key);
+        await addInsert(first);
+        await first.saveChanges();
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+        first.savePendingSnapshot();
+        const customSave = vi.fn().mockResolvedValue(undefined);
+        const restored = insertEditor(key, { save: customSave, supportsInsert: true });
+        await restored.saveChanges();
+        expect(customSave).toHaveBeenCalledOnce();
+        expect(restored.hasPendingChanges.value).toBe(false);
+        expect.soft(restored.manualSaveRequired.value).toBe(true);
+        const rowId = await addInsert(restored, "4", "later");
+        restored.startEdit(rowId, 1);
+        restored.editValue.value = "must stay pending";
+        await restored.commitEditFromBlur();
+        expect(customSave).toHaveBeenCalledOnce();
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+        expect(restored.newRows.value).toEqual([[4, "must stay pending"]]);
+      } finally {
+        clearDataGridPendingSnapshot(key);
+      }
+    });
+
+    it("allows fresh auto-save after explicit discard of the failed batch", async () => {
+      const editor = insertEditor();
+      await addInsert(editor);
+      await editor.saveChanges();
+      expect(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect(mocks.executeBatch).toHaveBeenCalledWith("connection-1", "app", [insertSql], undefined);
+      expect(editor.manualSaveRequired.value).toBe(true);
+      editor.discardChanges();
+      expect(editor.manualSaveRequired.value).toBe(false);
+      expect(editor.hasPendingChanges.value).toBe(false);
+      const rowId = await addInsert(editor, "4", "fresh");
+      editor.startEdit(rowId, 1);
+      editor.editValue.value = "fresh after discard";
+      await editor.commitEditFromBlur();
+      expect(mocks.executeBatch).toHaveBeenCalledTimes(2);
+      expect(editor.hasPendingChanges.value).toBe(false);
+    });
+  });
+
+  describe("non-transactional insert batch failures", () => {
+    const initialRows: CellValue[][] = [
+      [3, "first"],
+      [4, "second"],
+    ];
+    const queuedRow: CellValue[] = [5, "queued"];
+    const initialStatements = ["INSERT INTO orders_test VALUES (3, 'first')", "INSERT INTO orders_test VALUES (4, 'second')"];
+    const queuedStatement = "INSERT INTO orders_test VALUES (5, 'queued')";
+    const partialFailure = "Statement 2 failed; previous 1 statement(s) may have been committed.";
+
+    beforeEach(() => {
+      // Hive already supports INSERT without grid transactions. Do not enable
+      // generic JDBC INSERT or mock the capability that selects executeBatch.
+      expect(canInsertTableRows("hive")).toBe(true);
+      expect(supportsDataGridTransaction("hive")).toBe(false);
+      mocks.prepareDataGridSave.mockResolvedValueOnce({ statements: initialStatements, rollbackStatements: [] });
+      mocks.addHistory.mockResolvedValue(undefined);
+    });
+
+    it.each([false, true])("retains inserts after partial failure without replaying the batch (queued auto-save=%s)", async (queueAutoSave) => {
+      let firstBatchStarted!: () => void;
+      let releaseFirstBatch!: () => void;
+      const started = new Promise<void>((resolve) => {
+        firstBatchStarted = resolve;
+      });
+      const blocked = new Promise<void>((resolve) => {
+        releaseFirstBatch = resolve;
+      });
+      const committedStatements: string[] = [];
+      mocks.executeBatch.mockImplementation(async (_connectionId, _database, statements: string[]) => {
+        if (mocks.executeBatch.mock.calls.length === 1) {
+          // Synthetic external-boundary result: statement 1 committed, then
+          // statement 2 failed. This is not evidence about a real driver.
+          committedStatements.push(statements[0]!);
+          firstBatchStarted();
+          await blocked;
+          throw new Error(partialFailure);
+        }
+        committedStatements.push(...statements);
+        return { affected_rows: statements.length };
+      });
+      // If the regression re-enters preparation, model the still-pending rows.
+      // The test must fail on that replay, not on an incomplete mock response.
+      mocks.prepareDataGridSave.mockResolvedValue({
+        statements: queueAutoSave ? [...initialStatements, queuedStatement] : initialStatements,
+        rollbackStatements: [],
+      });
+      const { editor } = createSaveTestEditor({ databaseType: "hive", quickEntry: true });
+      editor.newRows.value = initialRows.map((row) => [...row]);
+
+      expect(editor.manualSaveRequired.value).toBe(false);
+      expect(editor.useTransaction.value).toBe(false);
+      expect(editor.hasPendingChanges.value).toBe(true);
+      const firstSave = editor.saveChanges({ autoSave: true });
+      try {
+        await started;
+        expect(editor.isSaving.value).toBe(true);
+        expect(committedStatements).toEqual([initialStatements[0]]);
+        if (queueAutoSave) {
+          editor.newRows.value.push([...queuedRow]);
+          await editor.saveChanges({ autoSave: true });
+        }
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      } finally {
+        releaseFirstBatch();
+        await firstSave;
+      }
+      await nextTick();
+
+      expect.soft(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect.soft(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+      expect.soft(committedStatements).toEqual([initialStatements[0]]);
+      expect.soft(editor.newRows.value).toEqual(queueAutoSave ? [...initialRows, queuedRow] : initialRows);
+      expect.soft(editor.hasPendingChanges.value).toBe(true);
+      expect.soft(editor.saveError.value).toBe(partialFailure);
+      expect(editor.isSaving.value).toBe(false);
+      expect(mocks.executeInTransaction).not.toHaveBeenCalled();
+      expect(mocks.executeInManualTransaction).not.toHaveBeenCalled();
+      expect(mocks.addHistory).toHaveBeenCalledWith(expect.objectContaining({ success: false, error: partialFailure }));
+
+      // Exercise the public auto-save entry again, including when no request
+      // was queued during the failure. This does not simulate a mounted blur.
+      expect.soft(editor.manualSaveRequired.value).toBe(true);
+      await editor.saveChanges({ autoSave: true });
+      await nextTick();
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+      expect(committedStatements).toEqual([initialStatements[0]]);
+      expect(editor.newRows.value).toEqual(queueAutoSave ? [...initialRows, queuedRow] : initialRows);
+      expect(editor.hasPendingChanges.value).toBe(true);
+      expect(editor.saveError.value).toBe(partialFailure);
+      expect(editor.isSaving.value).toBe(false);
+    });
+
+    it.each(["undo then edit", "undo then redo", "edit without undo"] as const)("does not replay a failed insert after %s", async (transition) => {
+      const rowA: CellValue[] = [3, "first"];
+      const rowB: CellValue[] = [4, "queued"];
+      const changedRowB: CellValue[] = [4, "changed"];
+      const statementA = "INSERT INTO orders_test VALUES (3, 'first')";
+      const changedStatementB = "INSERT INTO orders_test VALUES (4, 'changed')";
+      const failure = "Insert batch outcome is unknown.";
+      let firstBatchStarted!: () => void;
+      let releaseFirstBatch!: () => void;
+      const started = new Promise<void>((resolve) => {
+        firstBatchStarted = resolve;
+      });
+      const blocked = new Promise<void>((resolve) => {
+        releaseFirstBatch = resolve;
+      });
+      mocks.prepareDataGridSave.mockReset();
+      mocks.prepareDataGridSave.mockResolvedValueOnce({ statements: [statementA], rollbackStatements: [] });
+      // A complete, finite fallback makes any forbidden replay observable and
+      // lets the awaited public blur save settle even on the unfixed product.
+      mocks.prepareDataGridSave.mockResolvedValue({ statements: [statementA, changedStatementB], rollbackStatements: [] });
+      mocks.executeBatch.mockResolvedValue({ affected_rows: 2 });
+      mocks.executeBatch.mockImplementationOnce(async () => {
+        firstBatchStarted();
+        await blocked;
+        // Synthetic unknown outcome only; no real commit or duplication is proven.
+        throw new Error(failure);
+      });
+      const { editor } = createSaveTestEditor({ databaseType: "hive", quickEntry: true, resolveNewRowItems: true });
+      const rowAId = editor.addRows(1)!;
+      await nextTick();
+      editor.startEdit(rowAId, 0);
+      editor.editValue.value = "3";
+      expect(editor.commitEdit()).toEqual({ changed: true, rowKind: "new" });
+      editor.startEdit(rowAId, 1);
+      editor.editValue.value = "first";
+      expect(editor.commitEdit()).toEqual({ changed: true, rowKind: "new" });
+      expect(editor.newRows.value).toEqual([rowA]);
+      expect(editor.manualSaveRequired.value).toBe(false);
+      expect(editor.useTransaction.value).toBe(false);
+
+      let rowBId!: number;
+      const firstSave = editor.saveChanges({ autoSave: true });
+      try {
+        await started;
+        expect(editor.isSaving.value).toBe(true);
+        expect(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+        expect(mocks.prepareDataGridSave.mock.calls[0]![0]).toMatchObject({ databaseType: "hive", newRows: [rowA] });
+        expect(mocks.executeBatch).toHaveBeenCalledWith("connection-1", "app", [statementA], undefined);
+        rowBId = editor.addRows(1)!;
+        await nextTick();
+        expect(rowBId).toBe(-2);
+        expect(editor.newRowMeta.value.map((meta) => meta.token)).toEqual([1, 2]);
+        editor.startEdit(rowBId, 0);
+        editor.editValue.value = "4";
+        expect(editor.commitEdit()).toEqual({ changed: true, rowKind: "new" });
+        editor.startEdit(rowBId, 1);
+        editor.editValue.value = "queued";
+        await editor.commitEditFromBlur();
+        expect(editor.newRows.value).toEqual([rowA, rowB]);
+        expect(editor.editingCell.value).toBeNull();
+        expect(editor.manualSaveRequired.value).toBe(false);
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      } finally {
+        releaseFirstBatch();
+        await firstSave;
+      }
+
+      expect(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect(editor.isSaving.value).toBe(false);
+      expect(editor.manualSaveRequired.value).toBe(true);
+      expect(editor.saveError.value).toBe(failure);
+      expect(editor.newRows.value).toEqual([rowA, rowB]);
+      expect(editor.canUndoPendingChange.value).toBe(true);
+
+      if (transition !== "edit without undo") {
+        editor.undoPendingChange();
+        expect(editor.newRows.value).toEqual([rowA, [4, null]]);
+        expect(editor.canRedoPendingChange.value).toBe(true);
+        expect(editor.editingCell.value).toBeNull();
+        // Undo changes B locally. It must not prepare or dispatch SQL itself.
+        expect(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      }
+
+      if (transition === "undo then redo") {
+        editor.redoPendingChange();
+        expect(editor.newRows.value).toEqual([rowA, rowB]);
+        expect(editor.manualSaveRequired.value).toBe(true);
+        expect(editor.canRedoPendingChange.value).toBe(false);
+        await editor.saveChanges({ autoSave: true });
+      } else {
+        editor.startEdit(rowBId, 1);
+        expect(editor.editingCell.value).toEqual({ rowId: rowBId, col: 1 });
+        editor.editValue.value = "changed";
+        // This awaits the whole commit -> auto-save chain, not just a Vue tick.
+        await editor.commitEditFromBlur();
+        expect(editor.canRedoPendingChange.value).toBe(false);
+        if (transition === "edit without undo") {
+          expect(editor.manualSaveRequired.value).toBe(true);
+        }
+      }
+
+      expect.soft(mocks.prepareDataGridSave).toHaveBeenCalledOnce();
+      expect.soft(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect.soft(editor.newRows.value).toEqual([rowA, transition === "undo then redo" ? rowB : changedRowB]);
+      expect.soft(editor.hasPendingChanges.value).toBe(true);
+      expect(editor.isSaving.value).toBe(false);
+      expect(editor.editingCell.value).toBeNull();
+      expect(mocks.executeInTransaction).not.toHaveBeenCalled();
+      expect(mocks.executeInManualTransaction).not.toHaveBeenCalled();
+    });
+
+    it("saves only the queued new row once after a successful non-transactional batch", async () => {
+      let firstBatchStarted!: () => void;
+      let releaseFirstBatch!: () => void;
+      const started = new Promise<void>((resolve) => {
+        firstBatchStarted = resolve;
+      });
+      const blocked = new Promise<void>((resolve) => {
+        releaseFirstBatch = resolve;
+      });
+      mocks.executeBatch.mockResolvedValue({ affected_rows: 1 });
+      mocks.executeBatch.mockImplementationOnce(async () => {
+        firstBatchStarted();
+        await blocked;
+        return { affected_rows: 2 };
+      });
+      mocks.prepareDataGridSave.mockResolvedValue({ statements: [queuedStatement], rollbackStatements: [] });
+      const { editor } = createSaveTestEditor({ databaseType: "hive", quickEntry: true });
+      editor.newRows.value = initialRows.map((row) => [...row]);
+
+      expect(editor.manualSaveRequired.value).toBe(false);
+      expect(editor.useTransaction.value).toBe(false);
+      expect(editor.hasPendingChanges.value).toBe(true);
+      const firstSave = editor.saveChanges({ autoSave: true });
+      try {
+        await started;
+        editor.newRows.value.push([...queuedRow]);
+        await editor.saveChanges({ autoSave: true });
+        await editor.saveChanges({ autoSave: true });
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      } finally {
+        releaseFirstBatch();
+        await firstSave;
+      }
+      await nextTick();
+
+      expect(mocks.executeBatch).toHaveBeenCalledTimes(2);
+      expect(mocks.executeBatch).toHaveBeenNthCalledWith(1, "connection-1", "app", initialStatements, undefined);
+      expect(mocks.executeBatch).toHaveBeenNthCalledWith(2, "connection-1", "app", [queuedStatement], undefined);
+      expect(mocks.prepareDataGridSave).toHaveBeenCalledTimes(2);
+      expect(mocks.prepareDataGridSave.mock.calls[0]![0]).toMatchObject({ databaseType: "hive", newRows: initialRows });
+      expect(mocks.prepareDataGridSave.mock.calls[1]![0]).toMatchObject({ databaseType: "hive", newRows: [queuedRow] });
+      expect(editor.newRows.value).toEqual([]);
+      expect(editor.hasPendingChanges.value).toBe(false);
+      expect(editor.saveError.value).toBe("");
+      expect(editor.isSaving.value).toBe(false);
+      expect(mocks.executeInTransaction).not.toHaveBeenCalled();
+      expect(mocks.executeInManualTransaction).not.toHaveBeenCalled();
+    });
+  });
 
   // https://github.com/t8y2/dbx/issues/8321: without a primary key the row is
   // addressed by matching every column value, and the loaded page cannot show
