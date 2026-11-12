@@ -1058,6 +1058,8 @@ describe("useDataGridEditor saveChanges reload", () => {
       refreshSavedRows?: ReturnType<typeof vi.fn>;
       onManualTransactionMutation?: ReturnType<typeof vi.fn>;
       connectionId?: string;
+      connectionIdRef?: Ref<string | undefined>;
+      tableMetaRef?: Ref<import("@/composables/useDataGridEditor").UseDataGridEditorOptions["tableMeta"]["value"]>;
       databaseRef?: Ref<string | undefined>;
       databaseType?: import("@/types/database").DatabaseType;
       quickEntry?: boolean;
@@ -1085,9 +1087,9 @@ describe("useDataGridEditor saveChanges reload", () => {
       result: computed(() => result.value),
       editable: computed(() => options.editable?.value ?? true),
       databaseType: computed(() => options.databaseType ?? "mysql"),
-      connectionId: computed(() => ("connectionId" in options ? options.connectionId : "connection-1")),
+      connectionId: computed(() => options.connectionIdRef ? options.connectionIdRef.value : ("connectionId" in options ? options.connectionId : "connection-1")),
       database: computed(() => options.databaseRef ? options.databaseRef.value : "app"),
-      tableMeta: computed(() => ({
+      tableMeta: computed(() => options.tableMetaRef ? options.tableMetaRef.value : ({
         tableName: "orders_test",
         columns: [
           { name: "id", data_type: "int" },
@@ -2972,6 +2974,145 @@ describe("useDataGridEditor saveChanges reload", () => {
     expect(JSON.parse(mocks.addHistory.mock.calls[0][0].details_json)).toMatchObject({ conditional_update: true, execution_outcome: "failed" });
     expect(prepareFullReload).toHaveBeenCalledTimes(1);
     expect(emit).toHaveBeenCalledWith("reload", undefined, "", undefined, undefined, 100, 0);
+  });
+
+  describe("conditional history dispatch context (UNRUN source-only candidate)", () => {
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+      // Observe rejection immediately, including a gate released during cleanup.
+      void promise.catch(() => undefined);
+      return { promise, resolve, reject };
+    }
+
+    function observe<T>(promise: Promise<T>) {
+      return promise.then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      );
+    }
+
+    it("UNRUN: releases preflight when history context capture fails and permits an explicit retry", async () => {
+      let failCapture = false;
+      const captureError = new Error("History connection lookup failed");
+      mocks.getConfig.mockImplementation(() => {
+        if (failCapture) throw captureError;
+        return { id: "connection-1", name: "Local MySQL", db_type: "mysql" };
+      });
+      mocks.ensureReadOnlyWriteAccess.mockImplementationOnce(async () => {
+        // The initial connection lookup succeeds; only the post-unlock capture fails.
+        failCapture = true;
+        return true;
+      });
+      mocks.executeConditionalUpdate.mockResolvedValue({ affected_rows: 7 });
+      mocks.addHistory.mockResolvedValue(undefined);
+      const { editor } = createSaveTestEditor();
+      const statement = "UPDATE orders_test SET status = 'shipped';";
+
+      await expect(editor.executeConditionalUpdate(statement)).rejects.toBe(captureError);
+      expect(mocks.executeConditionalUpdate).not.toHaveBeenCalled();
+      expect(mocks.addHistory).not.toHaveBeenCalled();
+      expect(editor.isSaving.value).toBe(false);
+      expect(editor.isConditionalUpdateActive.value).toBe(false);
+
+      failCapture = false;
+      await expect(editor.executeConditionalUpdate(statement)).resolves.toEqual({ affectedRows: 7 });
+      expect(mocks.executeConditionalUpdate).toHaveBeenCalledTimes(1);
+      expect(mocks.executeConditionalUpdate).toHaveBeenCalledWith("connection-1", "app", statement, undefined, expect.any(String));
+      expect(mocks.addHistory).toHaveBeenCalledTimes(1);
+      expect(mocks.addHistory).toHaveBeenCalledWith(expect.objectContaining({ connection_id: "connection-1", connection_name: "Local MySQL", success: true }));
+      expect(editor.isSaving.value).toBe(false);
+      expect(editor.isConditionalUpdateActive.value).toBe(false);
+    });
+
+    for (const outcome of ["success", "terminal-failure"] as const) {
+      for (const transition of ["switch", "disappear", "in-place", "joined-in-place", "stable"] as const) {
+        it(`UNRUN: ${outcome} retains dispatched history context after ${transition}`, async () => {
+          const apiEntered = deferred<void>();
+          const apiGate = deferred<{ affected_rows: number }>();
+          const connectionId = ref<string | undefined>("connection-A");
+          const database = ref<string | undefined>("database-A");
+          const tableMeta = ref<import("@/composables/useDataGridEditor").UseDataGridEditorOptions["tableMeta"]["value"]>({
+            schema: "schema-A", tableName: "table-A", columns: [], primaryKeys: [],
+          });
+          const config = { id: "connection-A", name: "Connection A", db_type: "mysql" };
+          const joinedTargets = [
+            { tableMeta: { database: "database-A", schema: "schema-A", tableName: "table-A", columns: [], primaryKeys: [] }, sourceColumns: [] },
+            { tableMeta: { database: "database-A", schema: "schema-A", tableName: "joined-A", columns: [], primaryKeys: [] }, sourceColumns: [] },
+          ];
+          mocks.getConfig.mockImplementation((id: string) => id === "connection-A" ? config : { id, name: "Connection B", db_type: "mysql" });
+          mocks.executeConditionalUpdate.mockImplementationOnce(() => { apiEntered.resolve(); return apiGate.promise; });
+          mocks.addHistory.mockResolvedValue(undefined);
+          const { editor } = createSaveTestEditor({
+            connectionIdRef: connectionId,
+            databaseRef: database,
+            tableMetaRef: tableMeta,
+            joinedWriteTargets: transition === "joined-in-place" ? joinedTargets : undefined,
+          });
+          const statement = "UPDATE `database-A`.`table-A` SET `status` = 'shipped';";
+          const sqlError = Object.assign(new Error("Duplicate entry '1' for key 'PRIMARY'"), {
+            backendError: {
+              version: 1,
+              code: "DBX-JDBC-4001",
+              messageKey: "backendErrors.jdbc.sqlFailed",
+              messageParams: { stage: "execute" },
+              source: "jdbc_agent",
+              operationOutcome: "unknown",
+              diagnostics: { category: "sql", stage: "execute" },
+            },
+          });
+          const observed = observe(editor.executeConditionalUpdate(statement));
+          try {
+            const winner = await Promise.race([apiEntered.promise.then(() => "entered"), observed.then(() => "settled")]);
+            expect(winner).toBe("entered");
+            expect(mocks.executeConditionalUpdate).toHaveBeenCalledTimes(1);
+            expect(mocks.executeConditionalUpdate).toHaveBeenCalledWith("connection-A", "database-A", statement, "schema-A", expect.any(String));
+            expect(mocks.addHistory).not.toHaveBeenCalled();
+            if (transition === "switch") {
+              connectionId.value = "connection-B";
+              database.value = "database-B";
+              tableMeta.value = { schema: "schema-B", tableName: "table-B", columns: [], primaryKeys: [] };
+            } else if (transition === "disappear") {
+              connectionId.value = undefined;
+              database.value = undefined;
+              tableMeta.value = undefined;
+            } else if (transition === "in-place" || transition === "joined-in-place") {
+              config.name = "Renamed connection";
+              tableMeta.value!.schema = "renamed-schema";
+              tableMeta.value!.tableName = "renamed-table";
+              joinedTargets[0].tableMeta.database = "renamed-database";
+              joinedTargets[1].tableMeta.tableName = "renamed-joined";
+            }
+            if (outcome === "success") apiGate.resolve({ affected_rows: 7 });
+            else apiGate.reject(sqlError);
+            expect(await observed).toEqual({ status: "fulfilled", value: outcome === "success" ? { affectedRows: 7 } : null });
+            expect(mocks.addHistory).toHaveBeenCalledTimes(1);
+            expect(mocks.addHistory).toHaveBeenCalledWith(expect.objectContaining({
+              connection_id: "connection-A",
+              connection_name: "Connection A",
+              database: "database-A",
+              target: transition === "joined-in-place" ? "database-A.schema-A.table-A, database-A.schema-A.joined-A" : "schema-A.table-A",
+              sql: statement,
+              operation: "UPDATE",
+              success: outcome === "success",
+              affected_rows: outcome === "success" ? 7 : undefined,
+              error: outcome === "success" ? undefined : "Duplicate entry '1' for key 'PRIMARY'",
+            }));
+            expect(JSON.parse(mocks.addHistory.mock.calls[0][0].details_json)).toMatchObject({
+              schema: "schema-A",
+              table: "table-A",
+              conditional_update: true,
+              statement_count: 1,
+              execution_outcome: outcome === "success" ? "completed" : "failed",
+            });
+          } finally {
+            apiGate.resolve({ affected_rows: 7 });
+            await observed;
+          }
+        });
+      }
+    }
   });
 
   describe("conditional history completion identity (UNRUN source-only candidate)", () => {

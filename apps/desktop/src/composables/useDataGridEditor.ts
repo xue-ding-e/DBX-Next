@@ -42,6 +42,15 @@ export const DATA_GRID_MAX_BATCH_INSERT_ROWS = 1000;
 type RowKind = "none" | "existing" | "new" | "draft";
 type ConditionalUpdateOutcome = "not-started" | "running" | "completed" | "failed" | "unknown";
 
+interface ConditionalUpdateHistoryContext {
+  readonly connectionId: string;
+  readonly connectionName: string;
+  readonly database: string;
+  readonly schema: string | undefined;
+  readonly table: string;
+  readonly target: string;
+}
+
 interface ConditionalUpdateExecution {
   executionId: string;
   dispatched: boolean;
@@ -1762,25 +1771,23 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     return message;
   }
 
-  async function recordConditionalUpdateHistory(statement: string, elapsed: number, historyResult: { affectedRows?: number; success?: boolean; error?: string } = {}) {
-    if (!connectionId.value || !tableMeta.value) return;
-    const connectionName = connectionStore.getConfig(connectionId.value)?.name || "";
+  async function recordConditionalUpdateHistory(context: ConditionalUpdateHistoryContext, statement: string, elapsed: number, historyResult: { affectedRows?: number; success?: boolean; error?: string } = {}) {
     const success = historyResult.success ?? true;
     await historyStore.add({
-      connection_id: connectionId.value,
-      connection_name: connectionName,
-      database: database.value ?? "",
+      connection_id: context.connectionId,
+      connection_name: context.connectionName,
+      database: context.database,
       sql: statement,
       execution_time_ms: elapsed,
       success,
       error: success ? undefined : historyResult.error,
       activity_kind: "data_change",
       operation: "UPDATE",
-      target: tableHistoryTarget(),
+      target: context.target,
       affected_rows: success ? historyResult.affectedRows : undefined,
       details_json: JSON.stringify({
-        schema: tableMeta.value.schema,
-        table: tableMeta.value.tableName,
+        schema: context.schema,
+        table: context.table,
         conditional_update: true,
         statement_count: 1,
         execution_outcome: success ? "completed" : "failed",
@@ -1836,6 +1843,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
 
     let execution: ConditionalUpdateExecution;
+    let historyContext: ConditionalUpdateHistoryContext;
     const preflightTarget = { connectionId: connectionId.value, database: database.value, tableMeta: tableMeta.value, rows: result.value.rows, columns: result.value.columns };
     function isConditionalUpdateTargetCurrent() {
       return editable.value && connectionId.value === preflightTarget.connectionId && database.value === preflightTarget.database
@@ -1866,6 +1874,15 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         saveError.value = i18n.global.t("grid.conditionalBulkEditPendingChanges");
         return null;
       }
+      // Capture scalar attribution before installing execution state; dispatch has no further await.
+      historyContext = {
+        connectionId: connectionId.value,
+        connectionName: connectionStore.getConfig(connectionId.value)?.name || "",
+        database: database.value ?? "",
+        schema: tableMeta.value.schema,
+        table: tableMeta.value.tableName,
+        target: tableHistoryTarget(),
+      };
       execution = {
         executionId: uuid(),
         dispatched: false,
@@ -1885,11 +1902,11 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       if (execution.cancelRequested) return null;
       execution.dispatched = true;
       execution.outcome = "running";
-      const result = await api.executeConditionalUpdate(connectionId.value, database.value ?? "", statement, tableMeta.value.schema, execution.executionId);
+      const result = await api.executeConditionalUpdate(historyContext.connectionId, historyContext.database, statement, historyContext.schema, execution.executionId);
       if (conditionalUpdateExecution.value !== execution) return null;
       execution.outcome = "completed";
       try {
-        await recordConditionalUpdateHistory(statement, Date.now() - startedAt, { affectedRows: result.affected_rows });
+        await recordConditionalUpdateHistory(historyContext, statement, Date.now() - startedAt, { affectedRows: result.affected_rows });
       } catch (historyError) {
         console.warn("[DBX] failed to record conditional data grid update history", historyError);
       }
@@ -1903,7 +1920,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       if (isConditionalUpdateTerminalFailure(error)) {
         execution.outcome = "failed";
         try {
-          await recordConditionalUpdateHistory(statement, Date.now() - startedAt, { success: false, error: message });
+          await recordConditionalUpdateHistory(historyContext, statement, Date.now() - startedAt, { success: false, error: message });
         } catch (historyError) {
           console.warn("[DBX] failed to record conditional data grid update history", historyError);
         }
