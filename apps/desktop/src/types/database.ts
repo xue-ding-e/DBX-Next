@@ -585,8 +585,8 @@ export interface PluginMenusContribution {
 /**
  * Declares that the plugin sidecar speaks the optional MCP tool bridge
  * (`mcp/tools` + `mcp/call`) and opts its tools into the host's automatic
- * surfaces: the built-in AI agent and the external `dbx` MCP server. Both
- * default to true; the Plugin Center switch still overrides the AI surface.
+ * surfaces: the built-in AI agent and the external `dbx` MCP server. AI defaults
+ * to true and external exposure to false; the Plugin Center switch still overrides AI.
  */
 export interface PluginMcpContribution {
   type: "mcp";
@@ -594,6 +594,33 @@ export interface PluginMcpContribution {
   description?: string;
   ai_tools?: boolean;
   external_tools?: boolean;
+  rpc_tools?: Record<string, PluginRpcToolDeclaration>;
+}
+
+/** Shared CLI automation declarations map to existing plugin backend handlers. */
+export interface PluginRpcToolDeclaration {
+  method: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  access: "read" | "write" | "full";
+  connection?: "none" | "id" | "lifecycle" | "both";
+  snapshot?: PluginRpcSnapshot;
+}
+
+export interface PluginRpcSnapshot {
+  event_method: string;
+  stop_method: string;
+  closed_event_method?: string | null;
+  event_connection_field?: string;
+  event_feed_field?: string;
+  feed_id_field?: string;
+  stop_feed_field?: string;
+  duration_param?: string;
+  max_messages_param?: string;
+  default_duration_ms?: number;
+  max_duration_ms?: number;
+  default_max_messages?: number;
+  max_messages?: number;
 }
 
 /**
@@ -660,6 +687,7 @@ export interface PluginManifest {
   manifest_version?: number;
   id: string;
   name: string;
+  automation?: Record<string, PluginRpcToolDeclaration>;
   icon?: string;
   version?: string;
   publisher?: string;

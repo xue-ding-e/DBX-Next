@@ -10,6 +10,7 @@
     "manifest_version": { "const": 1 },
     "id": { "$ref": "#/$defs/identifier" },
     "name": { "type": "string", "minLength": 1 },
+    "automation": { "$ref": "#/$defs/rpcToolMap", "description": "CLI operations mapped to existing plugin backend RPC methods." },
     "icon": { "$ref": "#/$defs/assetPath" },
     "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$" },
     "publisher": { "type": "string", "minLength": 1 },
@@ -438,7 +439,47 @@
         "id": { "$ref": "#/$defs/identifier" },
         "description": { "type": "string" },
         "ai_tools": { "type": "boolean", "default": true, "description": "Set false to keep the tools off the built-in AI agent." },
-        "external_tools": { "type": "boolean", "default": false, "description": "Set true to expose the tools on the external dbx MCP server." }
+        "external_tools": { "type": "boolean", "default": false, "description": "Set true to expose the tools on the external dbx MCP server." },
+        "rpc_tools": { "$ref": "#/$defs/rpcToolMap" }
+      }
+    },
+    "rpcToolMap": {
+      "type": "object",
+      "maxProperties": 4096,
+      "propertyNames": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.-]+$" },
+      "additionalProperties": { "$ref": "#/$defs/rpcTool" }
+    },
+    "rpcTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "description", "input_schema", "access"],
+      "properties": {
+        "method": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 16384 },
+        "input_schema": { "type": "object" },
+        "access": { "enum": ["read", "write", "full"] },
+        "connection": { "enum": ["none", "id", "lifecycle", "both"], "default": "id" },
+        "snapshot": { "$ref": "#/$defs/rpcSnapshot" }
+      }
+    },
+    "rpcSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_method", "stop_method"],
+      "properties": {
+        "event_method": { "type": "string", "minLength": 1 },
+        "stop_method": { "type": "string", "minLength": 1 },
+        "closed_event_method": { "type": ["string", "null"] },
+        "event_connection_field": { "type": "string", "default": "connectionId" },
+        "event_feed_field": { "type": "string", "default": "feedId" },
+        "feed_id_field": { "type": "string", "default": "feedId" },
+        "stop_feed_field": { "type": "string", "default": "feedId" },
+        "duration_param": { "type": "string", "default": "durationMs" },
+        "max_messages_param": { "type": "string", "default": "maxMessages" },
+        "default_duration_ms": { "type": "integer", "minimum": 1 },
+        "max_duration_ms": { "type": "integer", "minimum": 1, "maximum": 30000 },
+        "default_max_messages": { "type": "integer", "minimum": 1 },
+        "max_messages": { "type": "integer", "minimum": 1, "maximum": 200 }
       }
     },
     "menuItem": {

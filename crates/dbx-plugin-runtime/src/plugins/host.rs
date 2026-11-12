@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::models::connection::{ConnectionConfig, ConnectionTestResult, DatabaseType};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, OwnedMutexGuard, RwLock};
 
 use super::{
     InstalledPlugin, PluginBinaryMessage, PluginConnectionActionContribution, PluginConnectionCapability,
@@ -85,6 +85,7 @@ struct PluginHostInner {
     registry: PluginRegistry,
     sessions: RwLock<HashMap<String, Arc<PluginSidecarSession>>>,
     activation_lock: Mutex<()>,
+    connection_creation_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     events: broadcast::Sender<PluginEvent>,
     binary_messages: broadcast::Sender<PluginBinaryMessage>,
 }
@@ -98,6 +99,7 @@ impl PluginHost {
                 registry,
                 sessions: RwLock::new(HashMap::new()),
                 activation_lock: Mutex::new(()),
+                connection_creation_locks: Mutex::new(HashMap::new()),
                 events,
                 binary_messages,
             }),
@@ -112,8 +114,37 @@ impl PluginHost {
         self.inner.binary_messages.subscribe()
     }
 
+    /// Serialize creation of one saved plugin connection across host clones.
+    /// Callers must acquire this before checking for an existing pool and keep
+    /// it until the new pool is published. Locking only the connect RPC leaves
+    /// a window where another creator can replace the same remote connection.
+    /// Different connection IDs have independent locks; inactive entries are
+    /// held weakly and reclaimed on the next acquisition.
+    pub async fn lock_connection_creation(&self, connection_id: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.inner.connection_creation_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(connection_id).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(connection_id.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+
     pub(super) fn registry(&self) -> &PluginRegistry {
         &self.inner.registry
+    }
+
+    /// Metadata-only CLI inventory. Dynamic/native operations are probed only
+    /// when the caller inspects or invokes that particular plugin.
+    pub fn declared_automation_tools(&self, plugin: &InstalledPlugin) -> Result<Option<serde_json::Value>, String> {
+        let descriptor = self.inner.registry.root_dir().join("automation").join(format!("{}.json", plugin.manifest.id));
+        super::mcp_adapters::declared_catalog(&plugin.manifest, Some(&descriptor))
     }
 
     pub async fn activate(&self, plugin_id: &str) -> Result<Arc<PluginSidecarSession>, String> {
@@ -165,7 +196,36 @@ impl PluginHost {
         let _activity = self.inner.registry.lifecycle.begin_operation(plugin_id)?;
         let session = self.activate(plugin_id).await?;
         ensure_permission(session.plugin(), required_permission)?;
-        session.invoke_with_timeout(method, params, None, timeout).await
+        // Keep native MCP implementations authoritative. Host-maintained adapters
+        // cover known workbench protocols without modifying signed packages.
+        let value = match session.invoke_with_timeout::<serde_json::Value>(method, params.clone(), None, timeout).await
+        {
+            Ok(value) => value,
+            Err(error) if automation_method_alias(method).is_some() && method_not_found(&error) => {
+                let (alternate, bridge) = automation_method_alias(method).expect("automation method");
+                match session.invoke_with_timeout::<serde_json::Value>(alternate, params.clone(), None, timeout).await {
+                    Ok(value) => return serde_json::from_value(value).map_err(|error| error.to_string()),
+                    Err(alternate_error) if method_not_found(&alternate_error) => {}
+                    Err(alternate_error) => return Err(alternate_error),
+                }
+                let descriptor = self.inner.registry.root_dir().join("automation").join(format!("{plugin_id}.json"));
+                // Keep bounded adapter cleanup alive when a client cancels its
+                // request. The owned session and activity lease prevent an
+                // update/uninstall from racing a snapshot's final stop RPC.
+                let activity = self.inner.registry.lifecycle.begin_operation(plugin_id)?;
+                let session = Arc::clone(&session);
+                let adapter = tokio::spawn(async move {
+                    let _activity = activity;
+                    super::mcp_adapters::invoke(&session, bridge, &params, timeout, Some(&descriptor)).await
+                });
+                match adapter.await.map_err(|error| format!("Plugin automation task failed: {error}"))?? {
+                    Some(value) => value,
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        serde_json::from_value(value).map_err(|error| format!("Failed to decode plugin '{plugin_id}' result: {error}"))
     }
 
     pub async fn notify(
@@ -439,6 +499,24 @@ impl PluginHost {
                 }
             }
         });
+    }
+}
+
+fn method_not_found(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if error.starts_with("json-rpc error ") {
+        return error.starts_with("json-rpc error -32601:");
+    }
+    error == "method not found" || error.starts_with("method not found:") || error.starts_with("unknown method:")
+}
+
+fn automation_method_alias(method: &str) -> Option<(&'static str, &'static str)> {
+    match method {
+        "automation/tools" => Some(("mcp/tools", "mcp/tools")),
+        "automation/call" => Some(("mcp/call", "mcp/call")),
+        "mcp/tools" => Some(("automation/tools", "mcp/tools")),
+        "mcp/call" => Some(("automation/call", "mcp/call")),
+        _ => None,
     }
 }
 
@@ -993,6 +1071,18 @@ mod tests {
             plugin_connect_deadline(&config_with(5, None), &provider_without_default),
             std::time::Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn automation_protocol_aliases_are_explicit_and_do_not_retry_business_errors() {
+        assert_eq!(super::automation_method_alias("automation/tools"), Some(("mcp/tools", "mcp/tools")));
+        assert_eq!(super::automation_method_alias("mcp/call"), Some(("automation/call", "mcp/call")));
+        assert!(super::automation_method_alias("connection/connect").is_none());
+        assert!(super::method_not_found("JSON-RPC error -32601: Method not found"));
+        assert!(super::method_not_found("unknown method: automation/tools"));
+        assert!(!super::method_not_found("JSON-RPC error -32000: method not found while running operation"));
+        assert!(!super::method_not_found("resource method not found"));
+        assert!(!super::method_not_found("connection timed out"));
     }
 
     #[test]

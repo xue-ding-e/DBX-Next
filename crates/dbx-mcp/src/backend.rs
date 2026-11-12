@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use dbx_core::{
     agent_events::{ToolCall, ToolResult},
     agent_tools::{self, format_query_result_as_text, AgentSqlPermissions, QueryCellWindow},
-    connection::{connection_configs_pool_equivalent, AppState, ConnectionLifecycleSnapshot, SalesforceCurrentUser},
+    connection::{
+        connection_configs_pool_equivalent, AppState, ConnectionLifecycleSnapshot, PoolKind, SalesforceCurrentUser,
+    },
     db::{mongo_driver::MongoIndexSpec, redis_driver::RedisCommandResult, ColumnInfo, TableInfo},
     history::HistoryEntry,
     mcp_policy::{connection_group_paths, McpConnectionGroupPath},
@@ -222,6 +224,10 @@ pub struct DocsSnapshotOptions {
 
 #[async_trait]
 pub trait DbxBackend: Send + Sync {
+    /// Release processes owned by a short-lived CLI invocation. Remote hosts
+    /// keep their shared runtime; only the local CLI backend shuts it down.
+    async fn shutdown_cli(&self) {}
+
     async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicy, String>;
 
     async fn load_connections(&self) -> Result<Vec<ConnectionConfig>, String>;
@@ -443,11 +449,76 @@ pub trait DbxBackend: Send + Sync {
     /// Tool-capable plugins for the external `dbx` MCP surface, with their
     /// discovered `mcp/tools` listings. Author opt-in: installed +
     /// compatible + backend entrypoint + a manifest `external_tools: true`
-    /// declaration. An error means "no plugin tools on this backend" (e.g.
-    /// the web backend); the server degrades to the static tools.
+    /// declaration. An error means plugin discovery is unavailable; the
+    /// server retains its static tools.
     async fn list_plugin_mcp_tools(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
         let _ = self;
         Err("Plugin tools are not supported by this backend.".to_string())
+    }
+    /// CLI automation is independent of external MCP exposure and settings.
+    /// Existing providers share their operation schema and backend handlers.
+    async fn list_plugin_cli_tools(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
+        self.list_plugin_mcp_tools().await
+    }
+    async fn list_plugin_cli_tools_for(
+        &self,
+        plugin_id: Option<&str>,
+    ) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
+        let mut providers = self.list_plugin_cli_tools().await?;
+        if let Some(plugin_id) = plugin_id {
+            providers.retain(|provider| provider.plugin_id == plugin_id);
+        }
+        Ok(providers)
+    }
+    async fn list_plugin_cli_inventory(&self) -> Result<Vec<crate::plugin_tools::PluginInventoryEntry>, String> {
+        let providers = self.list_plugin_cli_tools().await?;
+        let connections = self.load_connections().await?;
+        Ok(providers
+            .into_iter()
+            .map(|provider| crate::plugin_tools::PluginInventoryEntry {
+                connection_count: connections
+                    .iter()
+                    .filter(|config| config.plugin_id.as_deref() == Some(provider.plugin_id.as_str()))
+                    .count(),
+                id: provider.plugin_id,
+                name: provider.plugin_name,
+                version: String::new(),
+                status: "ready".to_string(),
+                tool_count: provider.tools.len(),
+                diagnostic: None,
+            })
+            .collect())
+    }
+    async fn call_plugin_cli_tool(
+        &self,
+        plugin_id: &str,
+        tool: &str,
+        connection: Option<&str>,
+        arguments: &Value,
+        allow_writes: bool,
+        allow_dangerous: bool,
+    ) -> Result<Value, String> {
+        crate::plugin_tools::call_cli_operation(
+            self,
+            plugin_id,
+            tool,
+            connection,
+            arguments,
+            allow_writes,
+            allow_dangerous,
+        )
+        .await
+    }
+    /// Low-level transport after CLI metadata and connection checks. The
+    /// default keeps older providers usable; local hosts prefer automation/call.
+    async fn invoke_plugin_cli_operation(
+        &self,
+        plugin_id: &str,
+        tool: &str,
+        connection: Option<&str>,
+        arguments: &Value,
+    ) -> Result<Value, String> {
+        self.call_plugin_mcp_tool(plugin_id, tool, connection, arguments).await
     }
     /// Calls one plugin MCP tool. `connection_id` (already policy-checked by
     /// the server) selects the saved connection whose host-generated
@@ -679,6 +750,39 @@ impl WebBackend {
         connected.insert(connection.id.clone(), connection.clone());
         Ok(())
     }
+
+    async fn remote_plugin_tools(&self, path: &str) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
+        let listings: Vec<Value> = self
+            .request(reqwest::Method::GET, path, None)
+            .await?
+            .json()
+            .await
+            .map_err(|error| format!("Invalid plugin tool catalog response: {error}"))?;
+        listings
+            .into_iter()
+            .map(|listing| {
+                let plugin_id = listing
+                    .get("pluginId")
+                    .and_then(Value::as_str)
+                    .ok_or("Plugin tool catalog is missing pluginId")?
+                    .to_string();
+                let plugin_name = listing
+                    .get("pluginName")
+                    .and_then(Value::as_str)
+                    .ok_or("Plugin tool catalog is missing pluginName")?
+                    .to_string();
+                let tools = dbx_core::ai::plugin_tools::parse_tool_list_with_limit(
+                    &listing,
+                    if path.split('?').next().is_some_and(|path| path.ends_with("/cli/tools")) {
+                        usize::MAX
+                    } else {
+                        dbx_core::ai::plugin_tools::MAX_TOOLS_PER_PLUGIN
+                    },
+                );
+                Ok(crate::plugin_tools::PluginToolProvider { plugin_id, plugin_name, tools })
+            })
+            .collect()
+    }
 }
 
 /// Whether a sidecar error means "this plugin simply does not expose an MCP surface".
@@ -894,8 +998,8 @@ impl LocalBackend {
     }
 
     /// Call one plugin MCP tool through the host-managed sidecar session.
-    /// When a saved connection is supplied, only its host-generated lifecycle
-    /// payload is sent to the plugin; credentials remain host-managed. The
+    /// When a saved connection is supplied, its managed pool is opened first
+    /// so the lifecycle retains the runtime SSH/proxy endpoint. The
     /// saved config must still belong to the target plugin, so a connection
     /// re-bound to another plugin can never leak its lifecycle here.
     pub async fn call_plugin_tool(
@@ -905,6 +1009,49 @@ impl LocalBackend {
         connection_id: Option<&str>,
         arguments: &Value,
     ) -> Result<Value, String> {
+        self.call_plugin_operation_via(plugin_id, tool, connection_id, arguments, "mcp/call").await
+    }
+
+    async fn call_plugin_operation_via(
+        &self,
+        plugin_id: &str,
+        tool: &str,
+        connection_id: Option<&str>,
+        arguments: &Value,
+        method: &str,
+    ) -> Result<Value, String> {
+        // Connection establishment and publication must finish even when the
+        // client drops its request while the sidecar is processing connect.
+        // The owned state retains the resulting pool/lease; a cancelled caller
+        // does not proceed to the business RPC after a cold connect completes.
+        let backend = Self::from_app_state(self.state.clone(), self.data_dir.clone());
+        let plugin_id = plugin_id.to_string();
+        let tool = tool.to_string();
+        let connection_id = connection_id.map(str::to_string);
+        let arguments = arguments.clone();
+        let method = method.to_string();
+        let (sender, receiver) = tokio::sync::oneshot::channel::<Result<Value, String>>();
+        tokio::spawn(async move {
+            let result = backend
+                .call_plugin_operation_inline(&plugin_id, &tool, connection_id.as_deref(), &arguments, &method, &sender)
+                .await;
+            let _ = sender.send(result);
+        });
+        receiver.await.map_err(|_| "Plugin operation task ended before returning a result".to_string())?
+    }
+
+    async fn call_plugin_operation_inline(
+        &self,
+        plugin_id: &str,
+        tool: &str,
+        connection_id: Option<&str>,
+        arguments: &Value,
+        method: &str,
+        caller: &tokio::sync::oneshot::Sender<Result<Value, String>>,
+    ) -> Result<Value, String> {
+        if caller.is_closed() {
+            return Err("Plugin operation cancelled before connection setup".to_string());
+        }
         let mut params = json!({ "tool": tool, "arguments": arguments });
         if let Some(connection_id) = connection_id {
             let config = self
@@ -918,13 +1065,31 @@ impl LocalBackend {
             if config.plugin_id.as_deref() != Some(plugin_id) {
                 return Err(format!("Connection \"{connection_id}\" is not bound to plugin \"{plugin_id}\""));
             }
-            let lifecycle = self.state.plugin_host.connection_params_standalone(&config)?;
+            let pool_key = self.state.get_or_create_pool(connection_id, None).await?;
+            if caller.is_closed() {
+                return Err("Plugin operation cancelled after connection setup".to_string());
+            }
+            let mut lifecycle = self
+                .state
+                .with_connection_pools(|pools| match pools.get(&pool_key) {
+                    Some(PoolKind::PluginConnection(handle))
+                        if handle.plugin_id == plugin_id
+                            && handle.connection_id == connection_id
+                            && handle.is_running() =>
+                    {
+                        Some(handle.lifecycle_params().clone())
+                    }
+                    _ => None,
+                })
+                .await
+                .ok_or_else(|| format!("Plugin connection \"{connection_id}\" is not open"))?;
+            lifecycle["operationId"] = json!(uuid::Uuid::new_v4().to_string());
             params["lifecycle"] = lifecycle;
         }
-        self.state
-            .plugin_host
-            .invoke(plugin_id, "mcp/call", params, None, Some(std::time::Duration::from_secs(300)))
-            .await
+        if caller.is_closed() {
+            return Err("Plugin operation cancelled before invocation".to_string());
+        }
+        self.state.plugin_host.invoke(plugin_id, method, params, None, Some(std::time::Duration::from_secs(300))).await
     }
 
     /// Opt-in, parallel `mcp/tools` discovery for the external surface:
@@ -932,13 +1097,29 @@ impl LocalBackend {
     /// `external_tools: true`. A plugin that fails to list skips itself
     /// (with a warning) instead of failing the whole `tools/list`.
     pub async fn detect_plugin_tool_providers(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
+        self.detect_plugin_tool_providers_for_surface(false).await
+    }
+
+    async fn detect_plugin_tool_providers_for_surface(
+        &self,
+        cli: bool,
+    ) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
+        self.discover_plugin_operations(cli, None).await.map(|(providers, _)| providers)
+    }
+
+    async fn discover_plugin_operations(
+        &self,
+        cli: bool,
+        plugin_id: Option<&str>,
+    ) -> Result<(Vec<crate::plugin_tools::PluginToolProvider>, HashMap<String, String>), String> {
         let plugins = self.state.plugins.list_installed()?;
         let candidates: Vec<(String, String)> = plugins
             .into_iter()
             .filter(|plugin| {
                 plugin.compatibility.compatible
                     && plugin.manifest.backend_entrypoint().is_some()
-                    && !plugin.manifest.external_tools_excluded()
+                    && (cli || !plugin.manifest.external_tools_excluded())
+                    && plugin_id.is_none_or(|requested| plugin.manifest.id == requested)
             })
             .map(|plugin| (plugin.manifest.id.clone(), plugin.manifest.name.clone()))
             .collect();
@@ -949,16 +1130,26 @@ impl LocalBackend {
             async move {
                 let listing = state
                     .plugin_host
-                    .invoke::<Value>(&plugin_id, "mcp/tools", json!({}), None, Some(PLUGIN_TOOLS_PROBE_TIMEOUT))
+                    .invoke::<Value>(
+                        &plugin_id,
+                        if cli { "automation/tools" } else { "mcp/tools" },
+                        json!({}),
+                        None,
+                        Some(PLUGIN_TOOLS_PROBE_TIMEOUT),
+                    )
                     .await;
                 (plugin_id, plugin_name, listing)
             }
         });
         let mut providers = Vec::new();
+        let mut diagnostics = HashMap::new();
         for (plugin_id, plugin_name, listing) in futures::future::join_all(probes).await {
             match listing {
                 Ok(value) => {
-                    let tools = dbx_core::ai::plugin_tools::parse_tool_list(&value);
+                    let tools = dbx_core::ai::plugin_tools::parse_tool_list_with_limit(
+                        &value,
+                        if cli { usize::MAX } else { dbx_core::ai::plugin_tools::MAX_TOOLS_PER_PLUGIN },
+                    );
                     if tools.is_empty() {
                         log::debug!("[mcp] plugin {plugin_id} exposes no MCP tools");
                     } else {
@@ -967,13 +1158,15 @@ impl LocalBackend {
                 }
                 Err(err) if plugin_lacks_mcp_surface(&err) => {
                     log::debug!("[mcp] plugin {plugin_id} exposes no MCP tool surface: {err}");
+                    diagnostics.insert(plugin_id, err);
                 }
                 Err(err) => {
                     log::warn!("[mcp] plugin {plugin_id} tool discovery failed: {err}");
+                    diagnostics.insert(plugin_id, err);
                 }
             }
         }
-        Ok(providers)
+        Ok((providers, diagnostics))
     }
 
     /// Sync the latest connection list from storage into the `AppState.configs` in-memory cache:
@@ -1061,12 +1254,62 @@ fn local_agent_dir(settings: &DesktopSettings, data_dir: &Path) -> PathBuf {
 
 #[async_trait]
 impl DbxBackend for LocalBackend {
+    async fn shutdown_cli(&self) {
+        self.state.plugin_host.stop_all().await;
+    }
+
     async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicy, String> {
         self.state.storage.load_mcp_global_policy().await.map(effective_mcp_policy)
     }
 
     async fn list_plugin_mcp_tools(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
         self.detect_plugin_tool_providers().await
+    }
+
+    async fn list_plugin_cli_tools(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
+        self.detect_plugin_tool_providers_for_surface(true).await
+    }
+
+    async fn list_plugin_cli_tools_for(
+        &self,
+        plugin_id: Option<&str>,
+    ) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
+        self.discover_plugin_operations(true, plugin_id).await.map(|(providers, _)| providers)
+    }
+
+    async fn invoke_plugin_cli_operation(
+        &self,
+        plugin_id: &str,
+        tool: &str,
+        connection: Option<&str>,
+        arguments: &Value,
+    ) -> Result<Value, String> {
+        self.call_plugin_operation_via(plugin_id, tool, connection, arguments, "automation/call").await
+    }
+
+    async fn list_plugin_cli_inventory(&self) -> Result<Vec<crate::plugin_tools::PluginInventoryEntry>, String> {
+        let plugins = self.state.plugins.list_installed()?;
+        let connections = self.load_connections().await?;
+        let mut entries = plugins.into_iter().map(|plugin| {
+            let (status, tool_count, diagnostic) = if !plugin.compatibility.compatible {
+                ("incompatible", 0, Some(plugin.compatibility.errors.join("; ")))
+            } else if plugin.manifest.backend_entrypoint().is_none() {
+                ("ui-only", 0, Some("This plugin exports a GUI only. Its author must expose backend operations for CLI use.".to_string()))
+            } else {
+                match self.state.plugin_host.declared_automation_tools(&plugin) {
+                    Ok(Some(listing)) => ("ready", listing["tools"].as_array().map_or(0, Vec::len), None),
+                    Ok(None) => ("uninspected", 0, Some("Native operations have not been probed. Run `dbx plugins tools <plugin-id>` to inspect this backend; older GUI plugins may need an automation descriptor.".to_string())),
+                    Err(error) => ("unavailable", 0, Some(error.chars().take(1_000).collect())),
+                }
+            };
+            crate::plugin_tools::PluginInventoryEntry {
+                connection_count: connections.iter().filter(|config| config.plugin_id.as_deref() == Some(plugin.manifest.id.as_str())).count(),
+                id: plugin.manifest.id, name: plugin.manifest.name, version: plugin.manifest.version,
+                status: status.to_string(), tool_count, diagnostic,
+            }
+        }).collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(entries)
     }
 
     async fn call_plugin_mcp_tool(
@@ -1516,6 +1759,82 @@ impl DbxBackend for LocalBackend {
 
 #[async_trait]
 impl DbxBackend for WebBackend {
+    async fn list_plugin_cli_inventory(&self) -> Result<Vec<crate::plugin_tools::PluginInventoryEntry>, String> {
+        self.request(reqwest::Method::GET, "/api/plugins/cli", None)
+            .await?
+            .json()
+            .await
+            .map_err(|error| format!("Invalid plugin inventory response: {error}"))
+    }
+
+    async fn list_plugin_mcp_tools(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
+        self.remote_plugin_tools("/api/plugins/mcp/tools").await
+    }
+
+    async fn list_plugin_cli_tools(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
+        self.remote_plugin_tools("/api/plugins/cli/tools").await
+    }
+
+    async fn list_plugin_cli_tools_for(
+        &self,
+        plugin_id: Option<&str>,
+    ) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
+        let mut path = "/api/plugins/cli/tools".to_string();
+        if let Some(plugin_id) = plugin_id {
+            let query =
+                url::form_urlencoded::Serializer::new(String::new()).append_pair("plugin_id", plugin_id).finish();
+            path.push('?');
+            path.push_str(&query);
+        }
+        self.remote_plugin_tools(&path).await
+    }
+
+    async fn call_plugin_cli_tool(
+        &self,
+        plugin_id: &str,
+        tool: &str,
+        connection: Option<&str>,
+        arguments: &Value,
+        allow_writes: bool,
+        allow_dangerous: bool,
+    ) -> Result<Value, String> {
+        self.request(
+            reqwest::Method::POST,
+            "/api/plugins/cli/call",
+            Some(json!({
+                "pluginId": plugin_id, "tool": tool, "connectionId": connection,
+                "arguments": arguments, "allowWrites": allow_writes, "allowDangerous": allow_dangerous,
+            })),
+        )
+        .await?
+        .json()
+        .await
+        .map_err(|error| format!("Invalid plugin operation response: {error}"))
+    }
+
+    async fn call_plugin_mcp_tool(
+        &self,
+        plugin_id: &str,
+        tool: &str,
+        connection_id: Option<&str>,
+        arguments: &Value,
+    ) -> Result<Value, String> {
+        // Resolve credentials and transport endpoints on the Web host. The
+        // remote caller supplies only the policy-bound saved connection id.
+        self.request(
+            reqwest::Method::POST,
+            "/api/plugins/mcp/call",
+            Some(json!({
+                "pluginId": plugin_id, "tool": tool,
+                "connectionId": connection_id, "arguments": arguments,
+            })),
+        )
+        .await?
+        .json()
+        .await
+        .map_err(|error| format!("Invalid plugin tool response: {error}"))
+    }
+
     async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicy, String> {
         self.request(reqwest::Method::GET, "/api/app-settings/mcp-policy", None)
             .await?
@@ -3499,6 +3818,70 @@ mod tests {
         assert_eq!(result.messages[0].message_id.as_deref(), Some("2:17"));
         assert_eq!(result.messages[0].headers.get("type").map(String::as_str), Some("binary"));
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_plugin_cli_discovers_complete_catalog_and_leaves_credentials_on_host() {
+        use axum::{
+            extract::State,
+            routing::{get, post},
+            Json, Router,
+        };
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route(
+                "/api/auth/check",
+                get(|| async { Json(json!({"authenticated":true,"required":false,"setup_required":false})) }),
+            )
+            .route(
+                "/api/plugins/cli/tools",
+                get(|| async {
+                    Json(json!([{
+                        "pluginId":"vendor.remote", "pluginName":"Remote operations",
+                        "tools":(0..100).map(|index| json!({
+                            "name":format!("inspect_{index}"), "annotations":{"readOnlyHint":true},
+                            "inputSchema":{"type":"object","properties":{}}
+                        })).collect::<Vec<_>>()
+                    }]))
+                }),
+            )
+            .route(
+                "/api/plugins/cli/call",
+                post(|State(calls): State<Arc<std::sync::Mutex<Vec<Value>>>>, Json(body): Json<Value>| async move {
+                    calls.lock().unwrap().push(body);
+                    Json(json!({"content":[{"type":"text","text":"remote result"}],"isError":false}))
+                }),
+            )
+            .route(
+                "/api/app-settings/mcp-policy",
+                get(|| async {
+                    panic!("CLI discovery and dispatch must not load remote MCP policy");
+                    #[allow(unreachable_code)]
+                    Json(json!({}))
+                }),
+            )
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend =
+            WebBackend::new_with_config(format!("http://{address}"), String::new(), None, None, None, false, None)
+                .unwrap();
+        let tools = backend.list_plugin_cli_tools_for(Some("vendor.remote")).await.unwrap();
+        assert_eq!(tools[0].tools.len(), 100, "CLI discovery must not silently use the AI tool limit");
+        let result = backend
+            .call_plugin_cli_tool("vendor.remote", "inspect_99", Some("saved-id"), &json!({"limit":3}), false, false)
+            .await
+            .unwrap();
+        assert_eq!(result["isError"], false);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[json!({
+                "pluginId":"vendor.remote", "tool":"inspect_99", "connectionId":"saved-id",
+                "arguments":{"limit":3}, "allowWrites":false, "allowDangerous":false
+            })]
+        );
+        server.abort();
     }
 
     #[tokio::test]

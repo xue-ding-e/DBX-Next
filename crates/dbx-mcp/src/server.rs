@@ -10,7 +10,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
 
@@ -737,6 +737,7 @@ pub struct DbxMcpServer {
     backend: Arc<dyn DbxBackend>,
     scope: McpScope,
     plugin_tools_mode: PluginToolsMode,
+    cli_permissions: Option<(bool, bool)>,
     sessions: Arc<McpSessionStore>,
     pending_salesforce_writes: Arc<PendingSalesforceWrites>,
     tool_router: ToolRouter<Self>,
@@ -885,10 +886,20 @@ impl DbxMcpServer {
             backend,
             scope,
             plugin_tools_mode,
+            cli_permissions: None,
             sessions: McpSessionStore::new(),
             pending_salesforce_writes: PendingSalesforceWrites::new(SALESFORCE_WRITE_CONFIRM_TTL),
             tool_router,
         }
+    }
+
+    /// Cap this server's execution permissions without changing saved MCP
+    /// settings or process-wide environment. Repeated calls can only narrow
+    /// the cap; a writable saved policy still needs an explicit CLI opt-in.
+    pub fn with_cli_permissions(mut self, allow_writes: bool, allow_dangerous: bool) -> Self {
+        let current = self.cli_permissions.unwrap_or((true, true));
+        self.cli_permissions = Some((current.0 && allow_writes, current.1 && allow_writes && allow_dangerous));
+        self
     }
 
     fn spawn_session_cleanup(&self, session: McpSession) -> tokio::sync::oneshot::Receiver<SessionCleanupResult> {
@@ -3262,7 +3273,32 @@ impl DbxMcpServer {
     // CallToolResult is the rmcp wire response type; keeping it unboxed avoids conversions at every tool boundary.
     #[allow(clippy::result_large_err)]
     async fn load_policy(&self) -> Result<McpGlobalPolicy, CallToolResult> {
-        self.backend.load_mcp_global_policy().await.map_err(|error| backend_tool_error("MCP_POLICY_UNAVAILABLE", error))
+        let mut policy = self
+            .backend
+            .load_mcp_global_policy()
+            .await
+            .map_err(|error| backend_tool_error("MCP_POLICY_UNAVAILABLE", error))?;
+        if let Some((allow_writes, allow_dangerous)) = self.cli_permissions {
+            policy.read_only |= !allow_writes;
+            policy.allow_dangerous_sql &= allow_dangerous;
+            // Current scoped rules can override the global defaults. Apply
+            // the CLI ceiling at every level without changing version markers
+            // or inheritance, which would change the saved policy's meaning.
+            for rule in &mut policy.group_policies {
+                rule.read_only |= !allow_writes;
+                rule.allow_dangerous_sql &= allow_dangerous;
+            }
+            for rule in &mut policy.connection_policies {
+                rule.read_only |= !allow_writes;
+                rule.allow_dangerous_sql &= allow_dangerous;
+                rule.allow_salesforce_dml &= allow_writes;
+                for database in &mut rule.database_policies {
+                    database.read_only |= !allow_writes;
+                    database.allow_dangerous_sql &= allow_dangerous;
+                }
+            }
+        }
+        Ok(policy)
     }
 
     // CallToolResult is the rmcp wire response type; keeping it unboxed avoids conversions at every tool boundary.
@@ -3319,13 +3355,11 @@ impl DbxMcpServer {
         }
     }
 
-    /// Scoped-session and read-only enforcement shared by both plugin-tool
+    /// Scoped-session enforcement shared by both plugin-tool
     /// call paths, closing the gap between what the flat `tools/list`
     /// advertises and what the lazy/meta surface executes:
-    /// - under a read-only execution policy, only tools the plugin declares
-    ///   with `readOnlyHint` may run. The hint is the plugin author's claim,
-    ///   so the host defaults to deny for undeclared tools instead of
-    ///   letting an opaque write bypass the mode;
+    /// - execution permissions are checked after binding the connection, so
+    ///   connection/group defaults and hard connection protections apply;
     /// - with a scope active, only plugins owning at least one in-scope
     ///   connection stay callable — a connection-less tool of an
     ///   out-of-scope plugin must not become a side door.
@@ -3334,16 +3368,6 @@ impl DbxMcpServer {
         &self,
         entry: &crate::plugin_tools::PluginToolEntry,
     ) -> Result<(), CallToolResult> {
-        let policy = self.load_policy().await?;
-        if policy.read_only && !entry.tool.read_only {
-            return Err(tool_error(
-                "MCP_READ_ONLY",
-                format!(
-                    "Plugin tool \"{}\" is not declared read-only, but the DBX MCP execution policy is read-only.",
-                    entry.exposed_name
-                ),
-            ));
-        }
         if self.scope.enabled() {
             let allowed = self.allowed_plugin_connections().await?;
             if !allowed.contains_key(&entry.plugin_id) {
@@ -3353,6 +3377,70 @@ impl DbxMcpServer {
                         "Plugin \"{}\" has no connection inside the current DBX MCP session scope.",
                         entry.plugin_id
                     ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the same connection protections to every community plugin,
+    /// regardless of whether it implements MCP or uses a declarative RPC bridge.
+    #[allow(clippy::result_large_err)]
+    async fn ensure_plugin_connection_policy(
+        &self,
+        entry: &crate::plugin_tools::PluginToolEntry,
+        connection_id: Option<&str>,
+    ) -> Result<(), CallToolResult> {
+        let mut policy = self.load_policy().await?;
+        if let Some(connection_id) = connection_id {
+            let resolved = self
+                .resolve_connection(&ConnectionSelector {
+                    connection_id: Some(connection_id.to_string()),
+                    connection_name: None,
+                })
+                .await?;
+            if resolved.connection.plugin_id.as_deref() != Some(entry.plugin_id.as_str()) {
+                return Err(tool_error("CONNECTION_OUT_OF_SCOPE", "The connection belongs to another plugin."));
+            }
+            if !entry.tool.read_only {
+                if resolved.connection.read_only {
+                    return Err(tool_error(
+                        "CONNECTION_READ_ONLY",
+                        "The plugin connection has read-only protection enabled.",
+                    ));
+                }
+                let database = resolved.connection.database.as_deref().unwrap_or_default();
+                if is_production_database(&resolved.connection, database)
+                    || resolved.connection.production_databases.iter().any(|database| !database.trim().is_empty())
+                {
+                    return Err(tool_error(
+                        "PRODUCTION_WRITE_BLOCKED",
+                        "MCP cannot run plugin writes against a production connection.",
+                    ));
+                }
+                policy = effective_policy_for_database_with_groups(
+                    &resolved.policy,
+                    &resolved.group_ids,
+                    &resolved.connection,
+                    database,
+                );
+            }
+        }
+        if !entry.tool.read_only {
+            if policy.read_only {
+                return Err(tool_error(
+                    "MCP_READ_ONLY",
+                    "This plugin tool is not declared read-only and the effective MCP policy is read-only.",
+                ));
+            }
+            // MCP's default for an undeclared destructiveHint is true. An
+            // opaque RPC must never acquire a lower risk merely by omitting it.
+            if entry.tool.annotations.get("destructiveHint").and_then(Value::as_bool).unwrap_or(true)
+                && !policy.allow_dangerous_sql
+            {
+                return Err(tool_error(
+                    "PLUGIN_OPERATION_BLOCKED",
+                    "High-risk plugin operations are disabled in DBX MCP settings.",
                 ));
             }
         }
@@ -3629,6 +3717,11 @@ impl DbxMcpServer {
             Ok(bound) => bound.cloned(),
             Err(message) => return Ok(tool_error("CONNECTION_NOT_FOUND", message)),
         };
+        if let Err(error) =
+            self.ensure_plugin_connection_policy(&entry, bound.as_ref().map(|(id, _)| id.as_str())).await
+        {
+            return Ok(error);
+        }
         if let Some((connection_id, connection_name)) = &bound {
             let _ = CALL_HISTORY.try_with(|history| {
                 let mut history = history.lock().unwrap();
@@ -3720,7 +3813,7 @@ impl DbxMcpServer {
     /// `(plugin_id, tool name)` over a fresh discovery pass, strips
     /// selector arguments, binds the connection, and forwards to the
     /// backend. Returns the raw plugin answer for the caller to render.
-    async fn call_plugin_by_id(
+    pub async fn call_plugin_by_id(
         &self,
         plugin_id: &str,
         tool: &str,
@@ -3761,6 +3854,7 @@ impl DbxMcpServer {
             Ok(bound) => bound.cloned(),
             Err(message) => return Err(tool_error("CONNECTION_NOT_FOUND", message)),
         };
+        self.ensure_plugin_connection_policy(&entry, bound.as_ref().map(|(id, _)| id.as_str())).await?;
         if let Some((connection_id, connection_name)) = &bound {
             let _ = CALL_HISTORY.try_with(|history| {
                 let mut history = history.lock().unwrap();
@@ -5871,6 +5965,7 @@ mod tests {
     #[tokio::test]
     async fn plugin_meta_tools_discover_and_call_by_plugin_id() {
         let backend = Arc::new(FakeBackend {
+            policy: McpGlobalPolicy { allow_dangerous_sql: true, ..Default::default() },
             connections: vec![
                 plugin_connection("k1", "prod", "io.dbx.kafka"),
                 plugin_connection("k2", "test", "io.dbx.kafka"),
@@ -6132,6 +6227,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_operations_enforce_bound_connection_policy_and_hard_protections() {
+        for (read_only, production, policy_read_only, expected) in [
+            (true, false, false, "CONNECTION_READ_ONLY"),
+            (false, true, false, "PRODUCTION_WRITE_BLOCKED"),
+            (false, false, true, "MCP_READ_ONLY"),
+        ] {
+            let mut config = plugin_connection("k1", "test", "io.dbx.kafka");
+            config.read_only = read_only;
+            config.is_production = production;
+            let backend = Arc::new(FakeBackend {
+                policy: McpGlobalPolicy {
+                    read_only: false,
+                    allow_dangerous_sql: true,
+                    connection_policies: vec![serde_json::from_value(json!({
+                        "connectionId":"k1", "allowed":true, "readOnly":policy_read_only,
+                        "allowDangerousSql":true, "executionModeConfigured":true,
+                        "executionModePolicyVersion":dbx_core::mcp_policy::MCP_EXECUTION_POLICY_VERSION
+                    }))
+                    .unwrap()],
+                    ..Default::default()
+                },
+                connections: vec![config],
+                plugin_providers: vec![plugin_provider("io.dbx.kafka", "Kafka", kafka_plugin_listing())],
+                ..Default::default()
+            });
+            let server = DbxMcpServer::with_runtime_options(backend.clone(), McpScope::default(), false);
+            let denied = server
+                .call_plugin_tool_dispatch("dbx_kafka__kafka_topics_delete", json!({"topics":["t"]}))
+                .await
+                .unwrap();
+            assert!(result_text(&denied).contains(expected), "{}", result_text(&denied));
+            assert!(backend.plugin_tool_calls.lock().unwrap().is_empty());
+        }
+
+        let backend = Arc::new(FakeBackend {
+            policy: McpGlobalPolicy {
+                read_only: true,
+                connection_policies: vec![serde_json::from_value(json!({
+                    "connectionId":"k1", "allowed":true, "readOnly":false,
+                    "allowDangerousSql":true, "executionModeConfigured":true,
+                    "executionModePolicyVersion":dbx_core::mcp_policy::MCP_EXECUTION_POLICY_VERSION
+                }))
+                .unwrap()],
+                ..Default::default()
+            },
+            connections: vec![plugin_connection("k1", "test", "io.dbx.kafka")],
+            plugin_providers: vec![plugin_provider("io.dbx.kafka", "Kafka", kafka_plugin_listing())],
+            ..Default::default()
+        });
+        let server = DbxMcpServer::with_runtime_options(backend.clone(), McpScope::default(), false);
+        let allowed =
+            server.call_plugin_tool_dispatch("dbx_kafka__kafka_topics_delete", json!({"topics":["t"]})).await.unwrap();
+        assert_eq!(allowed.is_error, Some(false), "{}", result_text(&allowed));
+        assert_eq!(backend.plugin_tool_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn plugin_tools_enforce_session_scope() {
         // A scoped session must not reach plugins whose connections are all
         // out of scope — including their connection-less tools, which the
@@ -6213,6 +6365,7 @@ mod tests {
     #[tokio::test]
     async fn plugin_tool_calls_bind_connections_and_respect_policy() {
         let backend = Arc::new(FakeBackend {
+            policy: McpGlobalPolicy { allow_dangerous_sql: true, ..Default::default() },
             connections: vec![
                 plugin_connection("k1", "prod", "io.dbx.kafka"),
                 plugin_connection("k2", "test", "io.dbx.kafka"),

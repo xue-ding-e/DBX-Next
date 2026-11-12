@@ -1,0 +1,925 @@
+{
+  "schema_version": 1,
+  "plugin_id": "com.astergaze.nats",
+  "plugin_version": "=0.1.0",
+  "rpc_tools": {
+    "nats_overview": {
+      "method": "nats/overview",
+      "description": "Read server, connection and JetStream account information.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_services_list": {
+      "method": "nats/services",
+      "description": "Discover micro services using $SRV.INFO/$SRV.STATS and read endpoint statistics.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_streams_list": {
+      "method": "nats/streams",
+      "description": "List all JetStream streams, including KV_ and OBJ_ backing streams flagged as system streams. This RPC has no pagination.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_stream_get": {
+      "method": "nats/stream",
+      "description": "Read a stream's state and editable configuration.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "stream": {
+            "type": "string",
+            "description": "JetStream stream name.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "stream"
+        ],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_stream_save": {
+      "method": "nats/streamSave",
+      "description": "Create a stream, or replace its editable configuration when update=true. Lower limits or changed retention may discard stored data; supply the full desired configuration.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "streamSpec": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Stream name.",
+                "minLength": 1
+              },
+              "description": {
+                "type": "string",
+                "description": "Stream description."
+              },
+              "subjects": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "description": "NATS subject; wildcards are allowed.",
+                  "minLength": 1
+                }
+              },
+              "storage": {
+                "type": "string",
+                "description": "Storage backend.",
+                "enum": [
+                  "file",
+                  "memory"
+                ],
+                "default": "file"
+              },
+              "retention": {
+                "type": "string",
+                "description": "Retention policy.",
+                "enum": [
+                  "limits",
+                  "interest",
+                  "workqueue"
+                ],
+                "default": "limits"
+              },
+              "discard": {
+                "type": "string",
+                "description": "Behavior when a limit is reached.",
+                "enum": [
+                  "old",
+                  "new"
+                ],
+                "default": "old"
+              },
+              "replicas": {
+                "type": "integer",
+                "description": "Number of replicas.",
+                "minimum": 1,
+                "maximum": 5,
+                "default": 1
+              },
+              "maxMsgs": {
+                "type": "integer",
+                "description": "Message count limit; -1 or 0 means unlimited.",
+                "minimum": -1,
+                "maximum": 9223372036854775807,
+                "default": -1
+              },
+              "maxBytes": {
+                "type": "integer",
+                "description": "Storage byte limit; -1 or 0 means unlimited.",
+                "minimum": -1,
+                "maximum": 9223372036854775807,
+                "default": -1
+              },
+              "maxAgeSecs": {
+                "type": "integer",
+                "description": "Maximum message age in seconds; 0 means unlimited.",
+                "minimum": 0,
+                "maximum": 9223372036,
+                "default": 0
+              },
+              "maxMsgSize": {
+                "type": "integer",
+                "description": "Maximum message bytes; -1 or 0 means unlimited.",
+                "minimum": -1,
+                "maximum": 2147483647,
+                "default": -1
+              },
+              "duplicatesSecs": {
+                "type": "integer",
+                "description": "Duplicate detection window in seconds; 0 uses the server default.",
+                "minimum": 0,
+                "maximum": 9223372036,
+                "default": 0
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "update": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "streamSpec"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_stream_purge": {
+      "method": "nats/streamPurge",
+      "description": "Permanently purge stream messages, optionally restricted by a subject filter (wildcards allowed). Omitting subject purges the entire stream.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "stream": {
+            "type": "string",
+            "description": "JetStream stream name.",
+            "minLength": 1
+          },
+          "subject": {
+            "type": "string",
+            "description": "Optional subject filter; empty means all subjects."
+          }
+        },
+        "required": [
+          "stream"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_stream_delete": {
+      "method": "nats/streamDelete",
+      "description": "Permanently delete a stream and its messages and consumers.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "stream": {
+            "type": "string",
+            "description": "JetStream stream name.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "stream"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_stream_messages": {
+      "method": "nats/streamMessages",
+      "description": "Read messages newest first without acknowledging or consuming them. before is exclusive; 0 starts at the newest message. Pass nextBefore for the next page (0 means done). Deleted sequences can make a page shorter. Bodies over 64 KiB are truncated with encoding/size/truncated metadata.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "stream": {
+            "type": "string",
+            "description": "JetStream stream name.",
+            "minLength": 1
+          },
+          "before": {
+            "type": "integer",
+            "description": "Exclusive sequence cursor; 0 starts at the end.",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Sequence window size (1..200).",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 50
+          }
+        },
+        "required": [
+          "stream"
+        ],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_message_delete": {
+      "method": "nats/messageDelete",
+      "description": "Permanently delete one stored stream message by its sequence.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "stream": {
+            "type": "string",
+            "description": "JetStream stream name.",
+            "minLength": 1
+          },
+          "seq": {
+            "type": "integer",
+            "description": "Message sequence (positive uint64).",
+            "minimum": 1,
+            "maximum": 18446744073709551615
+          }
+        },
+        "required": [
+          "stream",
+          "seq"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_consumers_list": {
+      "method": "nats/consumers",
+      "description": "List a stream's consumers and pending/ack/redelivery statistics. This RPC has no pagination.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "stream": {
+            "type": "string",
+            "description": "JetStream stream name.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "stream"
+        ],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_consumer_delete": {
+      "method": "nats/consumerDelete",
+      "description": "Delete a consumer, including its delivery and acknowledgement state.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "stream": {
+            "type": "string",
+            "description": "JetStream stream name.",
+            "minLength": 1
+          },
+          "consumer": {
+            "type": "string",
+            "description": "Consumer name.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "stream",
+          "consumer"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_kv_buckets_list": {
+      "method": "nats/kvBuckets",
+      "description": "List KV buckets and their storage/history/TTL statistics. This RPC has no pagination.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_kv_bucket_create": {
+      "method": "nats/kvBucketCreate",
+      "description": "Create a KV bucket using bucketSpec (history, ttlSecs, maxBytes, storage and replicas).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "bucketSpec": {
+            "type": "object",
+            "properties": {
+              "bucket": {
+                "type": "string",
+                "description": "KV bucket name.",
+                "minLength": 1
+              },
+              "description": {
+                "type": "string",
+                "description": "Bucket description."
+              },
+              "history": {
+                "type": "integer",
+                "description": "Retained revisions per key (NATS maximum 64).",
+                "minimum": 1,
+                "maximum": 64,
+                "default": 1
+              },
+              "ttlSecs": {
+                "type": "integer",
+                "description": "Key lifetime in seconds; 0 means no expiry.",
+                "minimum": 0,
+                "maximum": 9223372036,
+                "default": 0
+              },
+              "maxBytes": {
+                "type": "integer",
+                "description": "Bucket byte limit; -1 or 0 means unlimited.",
+                "minimum": -1,
+                "maximum": 9223372036854775807,
+                "default": -1
+              },
+              "storage": {
+                "type": "string",
+                "description": "Storage backend.",
+                "enum": [
+                  "file",
+                  "memory"
+                ],
+                "default": "file"
+              },
+              "replicas": {
+                "type": "integer",
+                "description": "Number of replicas.",
+                "minimum": 1,
+                "maximum": 5,
+                "default": 1
+              }
+            },
+            "required": [
+              "bucket"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "bucketSpec"
+        ],
+        "additionalProperties": false
+      },
+      "access": "write",
+      "connection": "id"
+    },
+    "nats_kv_bucket_delete": {
+      "method": "nats/kvBucketDelete",
+      "description": "Permanently delete a KV bucket and all retained key revisions.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "description": "KV bucket name.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "bucket"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_kv_keys_list": {
+      "method": "nats/kvKeys",
+      "description": "List at most 1,000 current KV keys. truncated=true means more keys exist; the legacy RPC offers no continuation cursor.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "description": "KV bucket name.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "bucket"
+        ],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_kv_get": {
+      "method": "nats/kvGet",
+      "description": "Read the latest revision of a KV key. Value bodies over 64 KiB are truncated; inspect encoding/size/truncated.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "description": "KV bucket name.",
+            "minLength": 1
+          },
+          "key": {
+            "type": "string",
+            "description": "KV key.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "bucket",
+          "key"
+        ],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_kv_history": {
+      "method": "nats/kvHistory",
+      "description": "Read all retained revisions of a KV key newest first, including delete/purge operations. Value bodies are capped at 64 KiB each; no pagination.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "description": "KV bucket name.",
+            "minLength": 1
+          },
+          "key": {
+            "type": "string",
+            "description": "KV key.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "bucket",
+          "key"
+        ],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_kv_put": {
+      "method": "nats/kvPut",
+      "description": "Write a UTF-8 KV value, creating a new revision and replacing the current value.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "description": "KV bucket name.",
+            "minLength": 1
+          },
+          "key": {
+            "type": "string",
+            "description": "KV key.",
+            "minLength": 1
+          },
+          "data": {
+            "type": "string",
+            "description": "UTF-8 message body; an empty string is allowed."
+          }
+        },
+        "required": [
+          "bucket",
+          "key",
+          "data"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_kv_delete": {
+      "method": "nats/kvDelete",
+      "description": "Delete a KV key. purge=true also permanently removes its retained history.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "description": "KV bucket name.",
+            "minLength": 1
+          },
+          "key": {
+            "type": "string",
+            "description": "KV key.",
+            "minLength": 1
+          },
+          "purge": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "bucket",
+          "key"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_kv_watch": {
+      "method": "nats/kvWatch",
+      "description": "Collect a bounded snapshot of future KV changes (not existing values) and stop the watch before returning. Match with a wildcard pattern; default > watches all keys. At most 100 events/second; events report dropped counts and truncate bodies over 64 KiB.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "description": "KV bucket name.",
+            "minLength": 1
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Key wildcard pattern.",
+            "minLength": 1,
+            "default": ">"
+          },
+          "durationMs": {
+            "type": "integer",
+            "description": "Maximum snapshot duration in milliseconds, excluding setup and cleanup.",
+            "minimum": 1,
+            "maximum": 30000,
+            "default": 1000
+          },
+          "maxMessages": {
+            "type": "integer",
+            "description": "Stop after this many matching events.",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 50
+          }
+        },
+        "required": [
+          "bucket"
+        ],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id",
+      "snapshot": {
+        "event_method": "nats/kvChange",
+        "stop_method": "nats/feedStop",
+        "closed_event_method": "nats/feedClosed",
+        "event_connection_field": "connectionId",
+        "event_feed_field": "feedId",
+        "feed_id_field": "feedId",
+        "stop_feed_field": "feedId",
+        "duration_param": "durationMs",
+        "max_messages_param": "maxMessages",
+        "default_duration_ms": 1000,
+        "max_duration_ms": 30000,
+        "default_max_messages": 50,
+        "max_messages": 200
+      }
+    },
+    "nats_object_stores_list": {
+      "method": "nats/objectStores",
+      "description": "List object stores and their storage statistics. This RPC has no pagination.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_object_store_create": {
+      "method": "nats/objectStoreCreate",
+      "description": "Create an object store with an optional description.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "store": {
+            "type": "string",
+            "description": "Object store name.",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string",
+            "description": "Store description."
+          }
+        },
+        "required": [
+          "store"
+        ],
+        "additionalProperties": false
+      },
+      "access": "write",
+      "connection": "id"
+    },
+    "nats_object_store_delete": {
+      "method": "nats/objectStoreDelete",
+      "description": "Permanently delete an object store and all its objects.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "store": {
+            "type": "string",
+            "description": "Object store name.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "store"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_objects_list": {
+      "method": "nats/objects",
+      "description": "List metadata for all objects in a store. This RPC has no pagination.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "store": {
+            "type": "string",
+            "description": "Object store name.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "store"
+        ],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_object_get": {
+      "method": "nats/objectGet",
+      "description": "Read an object's metadata and bytes (returned in the base64 data field). Objects over 4 MiB are rejected.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "store": {
+            "type": "string",
+            "description": "Object store name.",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "description": "Object name.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "store",
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    },
+    "nats_object_put": {
+      "method": "nats/objectPut",
+      "description": "Upload or overwrite an object using standard base64 dataBase64. Maximum decoded size is 4 MiB; an empty object is allowed.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "store": {
+            "type": "string",
+            "description": "Object store name.",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "description": "Object name.",
+            "minLength": 1
+          },
+          "dataBase64": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "maxLength": 5592408,
+            "x-dbx-maxDecodedBytes": 4194304,
+            "description": "Object bytes encoded as standard base64."
+          }
+        },
+        "required": [
+          "store",
+          "name",
+          "dataBase64"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_object_delete": {
+      "method": "nats/objectDelete",
+      "description": "Delete a named object from its store.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "store": {
+            "type": "string",
+            "description": "Object store name.",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "description": "Object name.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "store",
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_publish": {
+      "method": "nats/publish",
+      "description": "Publish a UTF-8 message and flush the connection. Subscribers may perform arbitrary writes; this is not a read-only operation.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "NATS subject (no wildcards for publish/request).",
+            "minLength": 1
+          },
+          "data": {
+            "type": "string",
+            "description": "UTF-8 message body; an empty string is allowed."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "NATS headers as string values."
+          }
+        },
+        "required": [
+          "subject",
+          "data"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_request": {
+      "method": "nats/request",
+      "description": "Publish a request and wait for one reply. Responders may change state; this is not read-only. Reply bodies over 64 KiB are truncated with encoding/size/truncated metadata.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "NATS subject (no wildcards for publish/request).",
+            "minLength": 1
+          },
+          "data": {
+            "type": "string",
+            "description": "UTF-8 message body; an empty string is allowed."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "NATS headers as string values."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "description": "Reply timeout in milliseconds (maximum 60 seconds).",
+            "minimum": 1,
+            "maximum": 60000,
+            "default": 5000
+          }
+        },
+        "required": [
+          "subject",
+          "data"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    },
+    "nats_subscribe": {
+      "method": "nats/subscribe",
+      "description": "Collect a bounded snapshot of core NATS messages and unsubscribe before returning; wildcards allowed. Optional queue joins a queue group and may divert work from other members, so this entire tool is not read-only. At most 100 events/second with dropped counts; bodies are capped at 64 KiB.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "Subject filter; NATS wildcards are allowed.",
+            "minLength": 1
+          },
+          "queue": {
+            "type": "string",
+            "description": "Optional queue group; omit for an ordinary subscription."
+          },
+          "durationMs": {
+            "type": "integer",
+            "description": "Maximum snapshot duration in milliseconds, excluding setup and cleanup.",
+            "minimum": 1,
+            "maximum": 30000,
+            "default": 1000
+          },
+          "maxMessages": {
+            "type": "integer",
+            "description": "Stop after this many matching events.",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 50
+          }
+        },
+        "required": [
+          "subject"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id",
+      "snapshot": {
+        "event_method": "nats/message",
+        "stop_method": "nats/feedStop",
+        "closed_event_method": "nats/feedClosed",
+        "event_connection_field": "connectionId",
+        "event_feed_field": "feedId",
+        "feed_id_field": "feedId",
+        "stop_feed_field": "feedId",
+        "duration_param": "durationMs",
+        "max_messages_param": "maxMessages",
+        "default_duration_ms": 1000,
+        "max_duration_ms": 30000,
+        "default_max_messages": 50,
+        "max_messages": 200
+      }
+    },
+    "nats_feed_stop": {
+      "method": "nats/feedStop",
+      "description": "Stop a known subscription or KV watch belonging to the bound connection. Unknown feed IDs are a no-op. Snapshot tools already stop their own feeds.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "feedId": {
+            "type": "string",
+            "description": "Feed ID belonging to the host-bound connection.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "feedId"
+        ],
+        "additionalProperties": false
+      },
+      "access": "full",
+      "connection": "id"
+    }
+  }
+}

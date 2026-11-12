@@ -2527,6 +2527,21 @@ impl AppState {
             let configs = self.configs.read().await;
             configs.get(connection_id).ok_or("Connection config not found")?.clone()
         };
+        // A plugin owns its remote connection by saved ID, not by the host
+        // pool handle. Keep creation serialized through publication: otherwise
+        // retiring a duplicate pool can disconnect the newly created session.
+        let _plugin_creation = if config.db_type == DatabaseType::Plugin {
+            Some(self.plugin_host.lock_connection_creation(connection_id).await)
+        } else {
+            None
+        };
+        // A queued creator may have waited while the saved config was changed
+        // or removed. Resolve its current identity and credentials under the lock.
+        let config = if _plugin_creation.is_some() {
+            self.configs.read().await.get(connection_id).ok_or("Connection config not found")?.clone()
+        } else {
+            config
+        };
         validate_connection_url_params(&config)?;
         let db_type = Some(config.db_type);
         let validate_existing_pool = should_validate_existing_pool_before_reuse(config.db_type);

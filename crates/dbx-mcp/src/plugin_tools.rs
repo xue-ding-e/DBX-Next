@@ -19,6 +19,19 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+/// CLI catalog includes GUI-only and unavailable plugins, so a missing
+/// automation declaration is diagnosable instead of silently hiding a plugin.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PluginInventoryEntry {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub status: String,
+    pub tool_count: usize,
+    pub connection_count: usize,
+    pub diagnostic: Option<String>,
+}
+
 #[doc(hidden)]
 pub use dbx_core::ai::plugin_tools::CONNECTION_ARGUMENT as PLUGIN_CONNECTION_ARGUMENT;
 use dbx_core::ai::plugin_tools::{
@@ -190,6 +203,98 @@ pub fn select_connection<'a>(
 /// consuming them), preferring the canonical `dbx_connection` key.
 pub fn connection_selector_from(arguments: &Value) -> Option<&str> {
     CONNECTION_SELECTOR_ARGUMENTS.iter().find_map(|key| arguments.get(*key).and_then(Value::as_str))
+}
+
+/// Direct CLI operation dispatch. It deliberately does not load MCP settings or
+/// start an MCP service: CLI confirmation flags are its execution ceiling, while
+/// the connection's own read-only/production protections remain mandatory.
+pub async fn call_cli_operation<B: crate::backend::DbxBackend + ?Sized>(
+    backend: &B,
+    plugin_id: &str,
+    tool: &str,
+    selector: Option<&str>,
+    arguments: &Value,
+    allow_writes: bool,
+    allow_dangerous: bool,
+) -> Result<Value, String> {
+    if allow_dangerous && !allow_writes {
+        return Err("INVALID_OPTION: --allow-dangerous requires --allow-writes".to_string());
+    }
+    let providers = backend.list_plugin_cli_tools_for(Some(plugin_id)).await?;
+    let operation = providers.iter().find(|provider| provider.plugin_id == plugin_id)
+        .and_then(|provider| provider.tools.iter().find(|operation| operation.name == tool))
+        .ok_or_else(|| format!("PLUGIN_TOOL_NOT_FOUND: {plugin_id} does not expose {tool}. Inspect `dbx plugins tools {plugin_id}`; GUI-only plugins need native tool registration or a version-bound automation descriptor."))?;
+    let mut arguments =
+        arguments.as_object().cloned().ok_or("INVALID_ARGUMENT: Plugin operation arguments must be a JSON object")?;
+    let argument_selector = connection_selector_from(&Value::Object(arguments.clone())).map(str::to_string);
+    if let (Some(explicit), Some(argument)) = (selector, argument_selector.as_deref()) {
+        if explicit.trim() != argument.trim() {
+            return Err("INVALID_ARGUMENT: Conflicting plugin connection selectors".to_string());
+        }
+    }
+    let selector = selector.or(argument_selector.as_deref());
+    let no_connection = operation.input_schema.get("x-dbx-connection").and_then(Value::as_str) == Some("none");
+    let configs = if no_connection {
+        if selector.is_some() {
+            return Err("INVALID_ARGUMENT: This operation does not accept a connection".to_string());
+        }
+        Vec::new()
+    } else {
+        backend
+            .load_connections()
+            .await?
+            .into_iter()
+            .filter(|config| config.plugin_id.as_deref() == Some(plugin_id))
+            .collect::<Vec<_>>()
+    };
+    let mut connections = configs.iter().map(|config| (config.id.clone(), config.name.clone())).collect::<Vec<_>>();
+    connections.sort();
+    let bound = select_connection(&connections, selector)?;
+    if !no_connection && bound.is_none() && operation.input_schema.pointer("/properties/connectionId").is_some() {
+        return Err(format!(
+            "PLUGIN_CONNECTION_REQUIRED: Save a connection for {plugin_id} and select it with --connection"
+        ));
+    }
+    let config = bound.and_then(|(id, _)| configs.iter().find(|config| &config.id == id));
+    if !operation.read_only {
+        if !allow_writes {
+            return Err("PLUGIN_WRITE_BLOCKED: This operation requires --allow-writes".to_string());
+        }
+        if let Some(config) = config {
+            if config.read_only {
+                return Err("CONNECTION_READ_ONLY: This plugin connection is protected against writes".to_string());
+            }
+            if dbx_core::production_safety::is_production_database(
+                config,
+                config.database.as_deref().unwrap_or_default(),
+            ) || config.production_databases.iter().any(|database| !database.trim().is_empty())
+            {
+                return Err("PRODUCTION_WRITE_BLOCKED: Plugin writes are blocked on production connections".to_string());
+            }
+        }
+        if operation.annotations.get("destructiveHint").and_then(Value::as_bool).unwrap_or(true) && !allow_dangerous {
+            return Err(
+                "PLUGIN_OPERATION_BLOCKED: This operation requires --allow-writes --allow-dangerous".to_string()
+            );
+        }
+    }
+    for key in CONNECTION_SELECTOR_ARGUMENTS.iter().copied().chain(["lifecycle", "runtime", "provider", "operationId"])
+    {
+        arguments.remove(key);
+    }
+    if operation.input_schema.pointer("/properties/connectionId").is_some() {
+        if let Some(config) = config {
+            arguments.insert("connectionId".to_string(), json!(config.id));
+        }
+    }
+    backend
+        .invoke_plugin_cli_operation(
+            plugin_id,
+            tool,
+            config.map(|config| config.id.as_str()),
+            &Value::Object(arguments),
+        )
+        .await
 }
 
 /// Converts a plugin `mcp/call` answer (MCP `CallToolResult`-shaped JSON)

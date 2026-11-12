@@ -420,6 +420,128 @@ pub async fn invoke_plugin(
         .map_err(AppError::bad_request)
 }
 
+/// Discover the same backend operations exposed by local CLI and MCP hosts.
+/// Tool schemas contain no saved connection values or lifecycle credentials.
+pub async fn list_plugin_mcp_tools(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let backend = dbx_mcp::LocalBackend::from_app_state(state.app.clone(), state.data_dir.clone());
+    let providers = backend.detect_plugin_tool_providers().await.map_err(AppError::from)?;
+    Ok(Json(plugin_provider_response(providers)))
+}
+
+fn plugin_provider_response(providers: Vec<dbx_mcp::plugin_tools::PluginToolProvider>) -> Vec<serde_json::Value> {
+    providers
+        .into_iter()
+        .map(|provider| {
+            serde_json::json!({
+                "pluginId": provider.plugin_id,
+                "pluginName": provider.plugin_name,
+                "tools": provider.tools.into_iter().map(|tool| serde_json::json!({
+                    "name": tool.name, "description": tool.description,
+                    "inputSchema": tool.input_schema, "annotations": tool.annotations,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PluginCliDiscoveryQuery {
+    plugin_id: Option<String>,
+}
+
+pub async fn list_plugin_cli_tools(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<PluginCliDiscoveryQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let backend = dbx_mcp::LocalBackend::from_app_state(state.app.clone(), state.data_dir.clone());
+    let providers = dbx_mcp::DbxBackend::list_plugin_cli_tools_for(&backend, query.plugin_id.as_deref())
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(plugin_provider_response(providers)))
+}
+
+pub async fn list_plugin_cli_inventory(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<Vec<dbx_mcp::plugin_tools::PluginInventoryEntry>>, AppError> {
+    let backend = dbx_mcp::LocalBackend::from_app_state(state.app.clone(), state.data_dir.clone());
+    dbx_mcp::DbxBackend::list_plugin_cli_inventory(&backend).await.map(Json).map_err(AppError::from)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginCliCallRequest {
+    plugin_id: String,
+    tool: String,
+    connection_id: Option<String>,
+    #[serde(default = "empty_plugin_arguments")]
+    arguments: serde_json::Value,
+    #[serde(default)]
+    allow_writes: bool,
+    #[serde(default)]
+    allow_dangerous: bool,
+}
+
+/// CLI requests use explicit command flags, not MCP settings. Re-evaluate
+/// operation metadata and hard connection protections on the server as well.
+pub async fn call_plugin_cli_tool(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<PluginCliCallRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let backend = dbx_mcp::LocalBackend::from_app_state(state.app.clone(), state.data_dir.clone());
+    dbx_mcp::DbxBackend::call_plugin_cli_tool(
+        &backend,
+        &request.plugin_id,
+        &request.tool,
+        request.connection_id.as_deref(),
+        &request.arguments,
+        request.allow_writes,
+        request.allow_dangerous,
+    )
+    .await
+    .map(Json)
+    .map_err(AppError::from)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginMcpCallRequest {
+    plugin_id: String,
+    tool: String,
+    connection_id: Option<String>,
+    #[serde(default = "empty_plugin_arguments")]
+    arguments: serde_json::Value,
+}
+
+fn empty_plugin_arguments() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// Recheck current policy on the Web host before opening the saved connection.
+/// Remote clients cannot submit a lifecycle or override its connection binding.
+pub async fn call_plugin_mcp_tool(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<PluginMcpCallRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let mut arguments = request
+        .arguments
+        .as_object()
+        .cloned()
+        .ok_or_else(|| AppError::bad_request("Plugin tool arguments must be an object"))?;
+    if let Some(id) = request.connection_id {
+        arguments.insert("dbx_connection".to_string(), serde_json::json!(id));
+    }
+    let backend = Arc::new(dbx_mcp::LocalBackend::from_app_state(state.app.clone(), state.data_dir.clone()));
+    let server = dbx_mcp::DbxMcpServer::with_runtime_options(backend, dbx_mcp::McpScope::default(), true);
+    let value =
+        match server.call_plugin_by_id(&request.plugin_id, &request.tool, serde_json::Value::Object(arguments)).await {
+            Ok(value) => value,
+            Err(error) => serde_json::to_value(error).map_err(|error| AppError::bad_request(error.to_string()))?,
+        };
+    Ok(Json(value))
+}
+
 pub async fn invoke_plugin_connection_action(
     State(state): State<Arc<WebState>>,
     Json(body): Json<PluginConnectionActionRequest>,

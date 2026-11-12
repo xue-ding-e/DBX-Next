@@ -72,6 +72,45 @@ dbx context local --tables users,orders
 dbx open local users
 ```
 
+## Use community plugins
+
+The CLI uses installed plugin backends and saved DBX connections directly. An
+MCP client or enabled MCP service is not required.
+
+```sh
+dbx plugins list --json
+dbx plugins tools vendor.metrics --json
+dbx plugins call vendor.metrics metrics_snapshot --connection staging --file arguments.json --json
+```
+
+`plugins list` includes every installed plugin with availability diagnostics.
+`plugins tools` (alias `plugins operations`) returns operation names, parameter
+schemas and access annotations. `plugins call` accepts a JSON object, a JSON
+file, or `--file -` for stdin. Select a connection by id or an unambiguous name
+with `--connection`; the host resolves credentials, SSH tunnels and proxies.
+
+Calls default to read-only. Writes need `--allow-writes`, and destructive
+operations also need `--allow-dangerous`. A connection's read-only and
+production protections always apply. Failures, including plugin `isError: true`
+results, return a nonzero exit status; `--json` retains structured results.
+
+Authors may declare mappings to existing RPC handlers in the manifest's
+top-level `automation` map, or implement native `automation/tools` and
+`automation/call`. Existing `mcp/tools` and `mcp/call` backends remain compatible.
+Older GUI plugins can use a version-bound descriptor at
+`<plugins-directory>/automation/<plugin-id>.json`; UI-only features need an
+author-provided backend operation. See the repository's `plugins/README.md`
+and `plugins/automation.schema.json` for the complete author contract.
+
+For a portable installation, set `DBX_DATA_DIR` to its actual data directory.
+With `DBX_WEB_URL`, the authenticated Web host resolves the saved connection
+and rechecks operation permissions and connection protections.
+
+Local commands release their own plugin processes on exit. For job ids,
+cursors or sessions that must survive several commands, use a persistent DBX
+Web host through `DBX_WEB_URL`, or a plugin that stores its state on its service.
+Subscription declarations can return event snapshots with bounded time and count.
+
 ## Import a DBX connection bundle
 
 Import a plaintext or encrypted DBX export into local encrypted connection storage without connecting to any database:

@@ -1,5 +1,7 @@
 mod agent_skill;
 mod connections;
+mod plugins;
+mod tools;
 
 use std::{env, path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -103,6 +105,8 @@ struct Flags {
     max_rows: Option<usize>,
     timeout_ms: Option<u64>,
     file: Option<PathBuf>,
+    tool_filter: Option<String>,
+    plugin_connection: Option<String>,
     passphrase_file: Option<PathBuf>,
     plan: Option<PathBuf>,
     initialize: bool,
@@ -123,11 +127,12 @@ struct Flags {
 struct CliError {
     code: &'static str,
     message: String,
+    tool_result: Option<Value>,
 }
 
 impl CliError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self { code, message: message.into(), tool_result: None }
     }
 }
 
@@ -178,11 +183,11 @@ async fn main() -> ExitCode {
         }
         Err((error, json_output)) => {
             if json_output {
-                eprintln!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({ "error": { "code": error.code, "message": error.message } }))
-                        .unwrap()
-                );
+                let mut value = json!({ "error": { "code": error.code, "message": error.message } });
+                if let Some(result) = error.tool_result {
+                    value["error"]["result"] = result;
+                }
+                eprintln!("{}", serde_json::to_string_pretty(&value).unwrap());
             } else {
                 eprintln!("Error [{}]: {}", error.code, error.message);
             }
@@ -219,6 +224,19 @@ async fn run(argv: Vec<String>) -> Result<String, (CliError, bool)> {
             .map_err(|error| (error, json_output));
     }
 
+    // Validate tool arguments before opening a saved profile or starting a
+    // plugin. Invalid JSON and unsupported options must fail without dispatch.
+    let plugin_command = if flags.args[0] == "plugins" {
+        Some(plugins::parse_command(&flags).await.map_err(|error| (error, json_output))?)
+    } else {
+        None
+    };
+    let tool_command = if flags.args[0] == "tools" {
+        Some(tools::parse_command(&flags).await.map_err(|error| (error, json_output))?)
+    } else {
+        None
+    };
+
     // This local-only path must run before LocalBackend::open, which hydrates
     // every saved connection. The bridge has its own narrow native transaction.
     if flags.args.first().is_some_and(|arg| arg == "connections")
@@ -248,7 +266,16 @@ async fn run(argv: Vec<String>) -> Result<String, (CliError, bool)> {
         )
     };
 
-    let result = run_with_backend(backend.as_ref(), flags).await;
+    let result = if let Some(command) = plugin_command {
+        plugins::run(backend.as_ref(), &flags, command).await
+    } else if let Some(command) = tool_command {
+        tools::run(backend.clone(), &flags, command).await
+    } else {
+        run_with_backend(backend.as_ref(), flags).await
+    };
+    // A standalone CLI owns its local sidecars. Web backends leave their
+    // shared host untouched through the default no-op shutdown hook.
+    backend.shutdown_cli().await;
     result.map_err(|error| (error, json_output))
 }
 
@@ -704,6 +731,8 @@ fn parse_flags(argv: &[String]) -> Result<Flags, CliError> {
         max_rows: None,
         timeout_ms: None,
         file: None,
+        tool_filter: None,
+        plugin_connection: None,
         passphrase_file: None,
         plan: None,
         initialize: false,
@@ -763,12 +792,14 @@ fn parse_flags(argv: &[String]) -> Result<Flags, CliError> {
             }
             "--plan" => flags.plan = Some(PathBuf::from(option_value(argv, &mut index, "--plan")?)),
             "--file" => flags.file = Some(PathBuf::from(option_value(argv, &mut index, "--file")?)),
+            "--filter" => flags.tool_filter = Some(option_value(argv, &mut index, "--filter")?),
+            "--connection" => flags.plugin_connection = Some(option_value(argv, &mut index, "--connection")?),
             "--out" => flags.out = Some(PathBuf::from(option_value(argv, &mut index, "--out")?)),
             "--notes" => flags.notes = Some(PathBuf::from(option_value(argv, &mut index, "--notes")?)),
             "--lang" => flags.lang = Some(option_value(argv, &mut index, "--lang")?),
             "--skills-dir" => flags.skills_dir = Some(PathBuf::from(option_value(argv, &mut index, "--skills-dir")?)),
             "--allow-writes" => flags.allow_writes = true,
-            "--allow-dangerous-sql" => flags.allow_dangerous = true,
+            "--allow-dangerous" | "--allow-dangerous-sql" => flags.allow_dangerous = true,
             "--single-transaction" => flags.single_transaction = true,
             "--force" => flags.force = true,
             "--yes" => flags.yes = true,
@@ -824,6 +855,17 @@ fn duration_ms(value: &str, option: &'static str) -> Result<u64, CliError> {
 }
 
 fn validate_agent_only_flags(flags: &Flags) -> Result<(), CliError> {
+    if flags.plugin_connection.is_some()
+        && !(flags.args.first().is_some_and(|arg| arg == "plugins")
+            && flags.args.get(1).is_some_and(|arg| arg == "call"))
+    {
+        return Err(CliError::new("INVALID_OPTION", "--connection is only supported by dbx plugins call."));
+    }
+    if flags.tool_filter.is_some()
+        && !(flags.args.first().is_some_and(|arg| arg == "tools") && flags.args.get(1).is_some_and(|arg| arg == "list"))
+    {
+        return Err(CliError::new("INVALID_OPTION", "--filter is only supported by dbx tools list."));
+    }
     if flags.plan.is_some()
         && !(flags.args.first().is_some_and(|arg| arg == "connections")
             && flags.args.get(1).is_some_and(|arg| matches!(arg.as_str(), "import-meatshell" | "update-route")))
@@ -1140,14 +1182,36 @@ fn format_multi_statement(
 
 fn format_capabilities(format: OutputFormat) -> Result<String, CliError> {
     match format {
-        OutputFormat::Json => json_string(
-            &json!({ "directQueryTypes": DIRECT_QUERY_TYPES, "bridgeRequiredTypes": BRIDGE_REQUIRED_TYPES }),
-        ),
+        OutputFormat::Json => json_string(&json!({
+            "directQueryTypes": DIRECT_QUERY_TYPES,
+            "bridgeRequiredTypes": BRIDGE_REQUIRED_TYPES,
+            "plugins": {
+                "list": "dbx plugins list [--json]",
+                "tools": "dbx plugins tools <plugin-id> [--json]",
+                "call": "dbx plugins call <plugin-id> <tool> [JSON | --file <path|->] [--connection <id-or-name>] [--json]",
+                "requiresMcp": false,
+                "readOnlyByDefault": true,
+                "permissionFlags": ["--allow-writes", "--allow-dangerous"],
+                "outputFormats": ["table", "json"]
+            },
+            "tools": {
+                "list": "dbx tools list [--filter name] [--json]",
+                "call": "dbx tools call <tool> [JSON | --file <path|->] [--json]",
+                "sources": ["builtin-mcp", "plugin-mcp"],
+                "pluginToolsMode": "both",
+                "readOnlyByDefault": true,
+                "permissionFlags": ["--allow-writes", "--allow-dangerous"],
+                "savedMcpPolicyEnforced": true,
+                "outputFormats": ["table", "json"]
+            }
+        })),
         OutputFormat::Csv => {
             let rows: Vec<Value> = DIRECT_QUERY_TYPES
                 .iter()
                 .map(|kind| json!({ "mode": "direct", "type": kind }))
                 .chain(BRIDGE_REQUIRED_TYPES.iter().map(|kind| json!({ "mode": "bridge", "type": kind })))
+                .chain([json!({ "mode": "plugins", "type": "Installed plugin inventory and native CLI tools (dbx plugins list)" })])
+                .chain([json!({ "mode": "tools", "type": "Built-in MCP and installed plugin tools (dbx tools list)" })])
                 .collect();
             Ok(csv_table(&["mode", "type"], &rows))
         }
@@ -1156,7 +1220,10 @@ fn format_capabilities(format: OutputFormat) -> Result<String, CliError> {
                 json!({ "mode": "Direct", "types": DIRECT_QUERY_TYPES.join(", ") }),
                 json!({ "mode": "Requires DBX Desktop", "types": BRIDGE_REQUIRED_TYPES.join(", ") }),
             ];
-            Ok(format!("{}\n", markdown_table(&["Mode", "Types"], &rows, &["mode", "types"])))
+            Ok(format!(
+                "{}\n\nPlugins: dbx plugins list shows all installed plugins with status and diagnostics.\nDiscover: dbx plugins tools <plugin-id> [--json]\nCall: dbx plugins call <plugin-id> <tool> [JSON | --file <path|->] [--connection <id-or-name>] [--json]\nPlugin commands use native CLI permissions, default to read-only, and enforce saved connection and production protections.\n\nAdditional MCP tools: dbx tools list [--filter name] [--json]\nCall: dbx tools call <tool> [JSON | --file <path|->] [--json]\nMCP tools default to read-only; --allow-writes and --allow-dangerous remain subject to saved MCP permissions.\n",
+                markdown_table(&["Mode", "Types"], &rows, &["mode", "types"])
+            ))
         }
     }
 }
@@ -1295,7 +1362,48 @@ fn csv_cell(value: &str) -> String {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  dbx doctor [--json]\n  dbx capabilities [--json]\n  dbx agent setup [--skills-dir path] [--force] [--json]\n  dbx agent status [--skills-dir path] [--json]\n  dbx connections list [--json]\n  dbx connections get <id-or-name> [--json]\n  dbx connections import --file <path|-> [--passphrase-file <path|->] [--initialize] [--yes] [--json]\n  dbx connections import-meatshell --file - --plan <owner-only-plan.json> [--yes] [--json]\n  dbx connections add --file <path|-> [--json]\n  dbx connections update <id-or-name> --file <path|-> [--json]\n  dbx connections update-route --plan <owner-only.json> --file - [--yes] [--json]\n  dbx connections remove <id-or-name> --yes [--json]\n  dbx schema list <connection> [--schema name] [--json]\n  dbx schema describe <connection> <table> [--schema name] [--json]\n  dbx query <connection> <sql> [--file path] [--limit n] [--timeout 10s] [--allow-writes] [--allow-dangerous-sql] [--single-transaction] [--json]\n  dbx context <connection> [--schema name] [--tables a,b] [--max-tables n] [--json]\n  dbx dbml <connection> [--out path] [--notes path] [--schema name] [--database name] [--tables a,b]\n  dbx docs <connection> [--out path] [--notes path] [--lang code] [--schema name] [--database name] [--tables a,b]\n  dbx open <connection> <table> [--schema name] [--database name] [--json]"
+    r#"Usage:
+  dbx doctor [--json]
+  dbx capabilities [--json]
+  dbx plugins list [--json]
+  dbx plugins tools <plugin-id> [--json]
+  dbx plugins call <plugin-id> <tool> [JSON | --file <path|->] [--connection <id-or-name>] [--allow-writes] [--allow-dangerous] [--json]
+  dbx tools list [--filter name] [--json]
+  dbx tools call <tool> [JSON | --file <path|->] [--allow-writes] [--allow-dangerous] [--json]
+  dbx agent setup [--skills-dir path] [--force] [--json]
+  dbx agent status [--skills-dir path] [--json]
+  dbx connections list [--json]
+  dbx connections get <id-or-name> [--json]
+  dbx connections import --file <path|-> [--passphrase-file <path|->] [--initialize] [--yes] [--json]
+  dbx connections import-meatshell --file - --plan <owner-only-plan.json> [--yes] [--json]
+  dbx connections add --file <path|-> [--json]
+  dbx connections update <id-or-name> --file <path|-> [--json]
+  dbx connections update-route --plan <owner-only.json> --file - [--yes] [--json]
+  dbx connections remove <id-or-name> --yes [--json]
+  dbx schema list <connection> [--schema name] [--json]
+  dbx schema describe <connection> <table> [--schema name] [--json]
+  dbx query <connection> <sql> [--file path] [--limit n] [--timeout 10s] [--allow-writes] [--allow-dangerous-sql] [--single-transaction] [--json]
+  dbx context <connection> [--schema name] [--tables a,b] [--max-tables n] [--json]
+  dbx dbml <connection> [--out path] [--notes path] [--schema name] [--database name] [--tables a,b]
+  dbx docs <connection> [--out path] [--notes path] [--lang code] [--schema name] [--database name] [--tables a,b]
+  dbx open <connection> <table> [--schema name] [--database name] [--json]
+
+Plugin CLI examples:
+  dbx plugins list --json
+  dbx plugins tools org.example.plugin --json
+  dbx plugins call org.example.plugin inspect --connection local --file arguments.json --json
+  dbx plugins call org.example.plugin inspect '{"detail":true}' --connection local --json
+
+Plugin commands use native CLI automation and require no MCP enablement. The inventory includes unavailable and UI-only plugins with diagnostics.
+Use tool names returned by dbx plugins tools; operations is an alias for tools. --connection accepts a saved connection ID or exact name.
+Plugin arguments default to {} and must be a JSON object. Writes require --allow-writes; destructive operations also require --allow-dangerous.
+Saved connection read-only and production protections always apply to plugin calls.
+
+Additional tools commands discover built-in MCP and installed plugin MCP tools; meta and flat plugin tools are both exposed.
+The optional list filter matches tool names case-insensitively (also accepted as a positional argument).
+Tool arguments default to {} and must be a JSON object. --json retains schemas, content, and structured results.
+MCP tools default to read-only, even when write environment flags are set. --allow-writes and --allow-dangerous can only narrow saved MCP permissions.
+--allow-dangerous requires --allow-writes; --allow-dangerous-sql is an alias. Tool errors exit nonzero."#
 }
 
 #[cfg(test)]

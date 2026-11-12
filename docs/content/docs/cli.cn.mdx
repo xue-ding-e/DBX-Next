@@ -72,6 +72,26 @@ dbx context local --tables users,orders
 dbx open local users
 ```
 
+## 使用社区插件
+
+CLI 直接复用已安装插件的后端和 DBX 保存的连接，不要求开启 MCP 服务或配置 MCP 客户端。
+
+```sh
+dbx plugins list --json
+dbx plugins tools vendor.metrics --json
+dbx plugins call vendor.metrics metrics_snapshot --connection staging --file arguments.json --json
+```
+
+`plugins list` 显示全部已安装插件及可用性诊断；`plugins tools`（也可写为 `plugins operations`）返回操作名称、参数 schema 和读写标注。`plugins call` 接收一个 JSON 对象，也支持 `--file -` 从标准输入读取。一个插件有多个已保存连接时，用 `--connection` 指定连接 ID 或不重名的名称；凭据、SSH 和代理地址由宿主解析。
+
+插件调用默认只读。写操作需加 `--allow-writes`，破坏性操作还需 `--allow-dangerous`；连接自身的只读和生产保护始终生效。调用失败以及插件返回 `isError: true` 均以非零状态退出，`--json` 保留结构化结果供脚本使用。
+
+新插件可以在 manifest 的顶层 `automation` 中声明对现有 RPC 的映射，也可以实现原生 `automation/tools`、`automation/call`。已有 `mcp/tools`、`mcp/call` 后端自动兼容。没有工具描述的旧 GUI 插件可通过 `<插件目录>/automation/<插件ID>.json` 添加与插件版本绑定的声明；纯 UI 功能需要作者提供后端操作。详细字段及示例见仓库的 `plugins/README.md` 和 `plugins/automation.schema.json`。
+
+便携版请将 `DBX_DATA_DIR` 指向实际使用的数据目录。设置 `DBX_WEB_URL` 时，命令通过认证后的 Web 宿主执行，由远端再次校验操作和连接保护。
+
+本地每次命令拥有独立的插件进程，退出时会清理。需要在多次命令间保留任务 ID、游标或插件会话时，使用 `DBX_WEB_URL` 连接长期运行的 DBX Web 宿主；也可由插件将状态保存在服务端。订阅类声明可以返回有时间和条数上限的事件快照。
+
 ## 导入 DBX 连接包
 
 将明文或加密 DBX 导出文件导入本地加密连接存储；此操作不会连接业务数据库：

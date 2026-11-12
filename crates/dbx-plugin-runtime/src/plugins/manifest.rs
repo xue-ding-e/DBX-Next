@@ -14,13 +14,15 @@ pub const SUPPORTED_PLUGIN_MANIFEST_VERSION: u32 = 1;
 /// plugin-initiated clipboard Host API (`host.clipboardRead` behind the
 /// `host.clipboard:read` permission; clipboard writes reuse the existing
 /// ungated `host.copy`). 1.4 adds consent-gated read-only data queries
-/// (`host.queryData` behind `host.data:read`). All are additive: older plugins
+/// (`host.queryData` behind `host.data:read`). 1.5 adds CLI automation
+/// declarations and the native `automation/tools` / `automation/call` bridge.
+/// All are additive: older plugins
 /// keep working, and a plugin that wants a capability must check the
 /// advertised version (or the matching `capabilities` / `host.features` entry)
 /// before calling it.
-pub const SUPPORTED_PLUGIN_HOST_API_VERSION: &str = "1.4.0";
+pub const SUPPORTED_PLUGIN_HOST_API_VERSION: &str = "1.5.0";
 /// Capabilities the host advertises to a plugin backend at `plugin/initialize`.
-pub const SUPPORTED_PLUGIN_HOST_FEATURES: &[&str] = &["host.requestUserInput"];
+pub const SUPPORTED_PLUGIN_HOST_FEATURES: &[&str] = &["host.requestUserInput", "host.automation"];
 pub const SUPPORTED_PLUGIN_PROTOCOL_VERSION: u32 = 1;
 pub const PLUGIN_CONNECTION_TEST_METHOD: &str = "connection/test";
 pub const PLUGIN_CONNECTION_CONNECT_METHOD: &str = "connection/connect";
@@ -82,6 +84,10 @@ pub struct PluginManifest {
     pub manifest_version: u32,
     pub id: String,
     pub name: String,
+    /// CLI automation declarations reuse backend RPC handlers without requiring
+    /// an external MCP contribution or a separate CLI executable per plugin.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub automation: BTreeMap<String, super::PluginRpcToolDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     #[serde(default)]
@@ -297,6 +303,11 @@ pub struct PluginMcpContribution {
     /// `false`; set to `true` to opt in to that surface.
     #[serde(default, skip_serializing_if = "is_false")]
     pub external_tools: bool,
+    /// Declarative automation for an existing backend RPC API. The host adapts
+    /// these operations to the same MCP discovery/call protocol used by native
+    /// plugin tools, so GUI, CLI and MCP can share backend implementations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rpc_tools: BTreeMap<String, super::PluginRpcToolDeclaration>,
 }
 
 fn default_true() -> bool {
@@ -1054,7 +1065,7 @@ impl PluginManifest {
     /// into the external `dbx` MCP server. `external_tools` defaults to
     /// `false`, so only an explicit `true` exposes them there.
     pub fn external_tools_excluded(&self) -> bool {
-        self.mcp_contribution().is_some_and(|mcp| !mcp.external_tools)
+        self.mcp_contribution().is_none_or(|mcp| !mcp.external_tools)
     }
 
     pub fn compatibility(&self, plugin_dir: &Path, dbx_version: &str) -> PluginCompatibility {
@@ -1136,6 +1147,17 @@ impl PluginManifest {
         }
         validate_localizations(&self.localizations, &mut errors);
         validate_declared_icon(plugin_dir, "Plugin icon", self.icon.as_deref(), &mut errors);
+        if !self.automation.is_empty() {
+            if self.backend_entrypoint().is_none() {
+                errors.push("Plugin automation requires a backend entrypoint".to_string());
+            }
+            if let Err(error) = super::mcp_adapters::validate_tools(&self.automation) {
+                errors.push(format!("Plugin automation declarations are invalid: {error}"));
+            }
+            if self.mcp_contribution().is_some_and(|mcp| !mcp.rpc_tools.is_empty()) {
+                errors.push("Declare operations in automation or mcp.rpc_tools, not both".to_string());
+            }
+        }
         validate_contributions(
             &self.contributions,
             self.backend_entrypoint().is_some(),
@@ -1546,6 +1568,9 @@ fn validate_contributions(
             }
             PluginContribution::Mcp(mcp) => {
                 mcp_contributions += 1;
+                if let Err(error) = super::mcp_adapters::validate_tools(&mcp.rpc_tools) {
+                    errors.push(format!("MCP RPC tool declarations are invalid: {error}"));
+                }
                 validate_optional_text(
                     mcp.description.as_deref(),
                     &format!("Mcp contribution '{id}' description"),
@@ -2107,6 +2132,7 @@ mod tests {
             description: None,
             ai_tools: true,
             external_tools: true,
+            rpc_tools: Default::default(),
         });
         let mut errors = Vec::new();
         validate_contributions(std::slice::from_ref(&mcp), false, false, &plugin_dir, &mut errors);
@@ -2120,6 +2146,48 @@ mod tests {
         let mut errors = Vec::new();
         validate_contributions(&two, true, false, &plugin_dir, &mut errors);
         assert!(errors.iter().any(|error| error.contains("at most one")), "{errors:?}");
+    }
+
+    #[test]
+    fn automation_descriptor_schema_matches_the_manifest_contract() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("manifest.schema.json")).unwrap()).unwrap();
+        let descriptor: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("automation.schema.json")).unwrap()).unwrap();
+        for name in ["identifier", "rpcToolMap", "rpcTool", "rpcSnapshot"] {
+            assert_eq!(manifest["$defs"][name], descriptor["$defs"][name], "{name} drifted between authoring schemas");
+        }
+    }
+
+    #[test]
+    fn cli_automation_declarations_require_backend_and_reject_unsafe_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("backend"), b"fixture").unwrap();
+        let mut manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "manifest_version":1, "id":"vendor.metrics", "name":"Metrics", "version":"1.0.0",
+            "publisher":"vendor", "engines":{"dbx":">=0.1.0","host_api":"^1.0"},
+            "entrypoints":{"backend":{"executable":"backend"}},
+            "automation": {"metrics_snapshot": {
+                "method":"metrics/snapshot", "description":"Read metrics", "access":"read", "connection":"id",
+                "input_schema":{"type":"object","properties":{},"additionalProperties":false}
+            }}
+        }))
+        .unwrap();
+        let compatibility = manifest.compatibility(dir.path(), "1.0.0");
+        assert!(compatibility.compatible, "{:?}", compatibility.errors);
+        assert!(manifest.external_tools_excluded(), "CLI automation must not implicitly opt into external MCP");
+        manifest.automation.get_mut("metrics_snapshot").unwrap().method = "connection/connect".into();
+        let compatibility = manifest.compatibility(dir.path(), "1.0.0");
+        assert!(!compatibility.compatible);
+        manifest.automation.get_mut("metrics_snapshot").unwrap().method = "metrics/snapshot".into();
+        manifest.entrypoints.backend = None;
+        let compatibility = manifest.compatibility(dir.path(), "1.0.0");
+        assert!(
+            compatibility.errors.iter().any(|error| error.contains("automation requires a backend")),
+            "{:?}",
+            compatibility.errors
+        );
     }
 
     #[test]
@@ -2591,10 +2659,11 @@ mod tests {
             "the host must satisfy the data-query floor it asks plugins to declare"
         );
 
-        for requirement in ["^1.0", "^1.1", "^1.2", "^1.3", "^1.4", ">=1.1.0, <2.0.0"] {
+        assert!(super::SUPPORTED_PLUGIN_HOST_FEATURES.contains(&"host.automation"));
+        for requirement in ["^1.0", "^1.1", "^1.2", "^1.3", "^1.4", "^1.5", ">=1.1.0, <2.0.0"] {
             assert!(host_api_requirement_errors(requirement).is_empty(), "{requirement} must be satisfiable");
         }
-        for requirement in [">=1.5.0", "^2.0"] {
+        for requirement in [">=1.6.0", "^2.0"] {
             assert!(!host_api_requirement_errors(requirement).is_empty(), "{requirement} must be rejected");
         }
     }

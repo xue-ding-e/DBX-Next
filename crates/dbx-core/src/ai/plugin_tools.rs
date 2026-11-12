@@ -631,6 +631,12 @@ pub struct RawPluginTool {
 
 /// Parses an `mcp/tools` answer (`{ tools: [...] }` or a bare array).
 pub fn parse_tool_list(value: &Value) -> Vec<RawPluginTool> {
+    parse_tool_list_with_limit(value, MAX_TOOLS_PER_PLUGIN)
+}
+
+/// CLI discovery needs the complete operation catalog; AI/MCP callers retain
+/// their context budgets through the default parser above.
+pub fn parse_tool_list_with_limit(value: &Value, limit: usize) -> Vec<RawPluginTool> {
     let tools = value.get("tools").and_then(Value::as_array).or_else(|| value.as_array());
     let Some(tools) = tools else {
         return Vec::new();
@@ -657,7 +663,7 @@ pub fn parse_tool_list(value: &Value) -> Vec<RawPluginTool> {
                 annotations: tool.get("annotations").cloned().unwrap_or_else(|| json!({})),
             })
         })
-        .take(MAX_TOOLS_PER_PLUGIN)
+        .take(limit)
         .collect()
 }
 

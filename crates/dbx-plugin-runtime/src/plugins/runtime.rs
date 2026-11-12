@@ -997,7 +997,10 @@ fn decode_response_value(plugin_id: &str, value: serde_json::Value) -> Result<se
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| error.to_string());
-        return Err(message);
+        return Err(match error.get("code").and_then(serde_json::Value::as_i64) {
+            Some(code) => format!("JSON-RPC error {code}: {message}"),
+            None => message,
+        });
     }
     if value.get("result").is_none() && value.get("error").is_none() {
         return Err(format!("Plugin '{plugin_id}' response has neither result nor error"));

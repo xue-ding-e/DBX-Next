@@ -765,6 +765,145 @@ Plugins normally answer requests, but Host API 1.1 adds one method a plugin back
 - Capability gating: `plugin/initialize` advertises `host.hostApiVersion` (`1.1.0` or later) and `host.features` (containing `host.requestUserInput` when available). Only call the method when it is advertised; an older host reports `1.0.0` and drops the frame.
 - The Rust SDK (`dbx-plugin-sdk`) wraps this: `dbx_plugin_sdk::host_client()`, `HostClient::supports("host/requestUserInput")`, and `HostClient::request_user_input(&UserInputPrompt::secret("Verification code"))`.
 
+## CLI automation for community plugins
+
+The native DBX CLI can discover and call backend operations from any compatible
+community plugin. It uses the installed plugin and DBX's saved connections,
+secret storage, SSH tunnels and proxy routes. It does not require an MCP client,
+an enabled MCP service, or a separate command-line executable for each plugin.
+
+```sh
+dbx plugins list --json
+dbx plugins tools vendor.metrics --json
+dbx plugins call vendor.metrics metrics_snapshot --connection staging --file arguments.json --json
+```
+
+`list` reads metadata without starting backend processes and includes
+incompatible and GUI-only plugins with diagnostics. A native backend whose
+operations have not been inspected is marked `uninspected`; its zero count
+means not yet probed. `tools` and `call` start only the selected plugin. `tools`
+returns operation names, descriptions, input schemas and access annotations.
+`call` accepts an inline JSON object, `--file <path>`, or `--file -` for stdin.
+Successful calls return the plugin result; validation failures, backend failures,
+and plugin results with `isError: true` produce a nonzero exit code. JSON output
+preserves structured content for scripts. Set `DBX_DATA_DIR` to the portable
+profile's data directory when using a portable installation.
+
+### Declare operations once, reuse backend handlers
+
+The preferred CLI contract is the manifest's top-level `automation` map. It is
+independent of the optional external `mcp` contribution. For example, a plugin
+whose workbench already invokes `metrics/snapshot` can declare:
+
+```json
+{
+  "automation": {
+    "metrics_snapshot": {
+      "method": "metrics/snapshot",
+      "description": "Read the current metrics snapshot.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } },
+        "additionalProperties": false
+      },
+      "access": "read",
+      "connection": "id"
+    }
+  }
+}
+```
+
+Manifest-declared automation requires Host API 1.5 or later; authors using it
+should set `engines.host_api` to `>=1.5.0 <2.0.0`. The initialize handshake
+advertises `host.automation`. Existing plugins using native tool protocols or
+an external descriptor keep their original package engine requirements.
+
+The workbench keeps using the same RPC handler. DBX supplies discovery, schema
+validation, connection binding and dispatch for the CLI. Operation declarations
+in an `mcp` contribution's `rpc_tools` map are also accepted as an alternate;
+declare a single manifest source to avoid ambiguous ownership. Backends may
+instead implement dynamic `automation/tools` and `automation/call` methods with
+the same tool-list and call-result shapes described below. The CLI prefers this
+native protocol, accepts existing `mcp/tools` and `mcp/call` implementations as a
+compatibility path, and uses declarations when neither native method exists.
+It calls handlers directly without running an MCP server. Only a method-not-found
+protocol error permits fallback; business failures are returned without retry.
+
+An operation declares `access` as `read`, `write`, or `full`. CLI calls default
+to read-only; writes require `--allow-writes`, and full/destructive operations
+require both `--allow-writes --allow-dangerous`. A connection's read-only flag
+and production protection still apply. Missing native read-only/destructive
+annotations are handled conservatively. CLI flags never modify saved policy.
+
+`connection` is `id` by default: DBX opens the selected connection and injects
+its `connectionId`. `lifecycle` supplies the host-generated `lifecycle` object,
+`both` supplies both, and `none` supports tools that do not use a saved
+connection. The host owns these fields; arguments cannot override a connection,
+credentials or runtime endpoint. With one connection the CLI binds it
+automatically; multiple connections require an unambiguous id or name.
+
+The schema validator supports the documented object, array, primitive, required,
+enum, default and numeric/length bounds used by operation declarations. Invalid
+or unsupported schema constructs are rejected instead of silently ignored.
+Reserved host/lifecycle RPC methods cannot be exposed as automation operations.
+CLI discovery returns the complete catalog rather than the AI context's
+per-plugin tool limit.
+
+### Adapt an existing signed plugin
+
+An existing GUI plugin that already has backend RPC handlers can be adapted
+without changing its signed package. Place an explicit descriptor at
+`<plugins-directory>/automation/<plugin-id>.json`:
+
+```json
+{
+  "schema_version": 1,
+  "plugin_id": "vendor.metrics",
+  "plugin_version": "=1.2.3",
+  "rpc_tools": {
+    "metrics_snapshot": {
+      "method": "metrics/snapshot",
+      "description": "Read the current metrics snapshot.",
+      "input_schema": { "type": "object", "properties": {}, "additionalProperties": false },
+      "access": "read",
+      "connection": "id"
+    }
+  }
+}
+```
+
+Descriptors are executable automation configuration: review their method,
+schema and access declarations. DBX requires the plugin id and installed version
+to match. A malformed or stale local descriptor produces a diagnostic; it does
+not fall back to another mapping. Resolution is native protocol, manifest
+declarations, local descriptor, then a bundled version-specific descriptor.
+The bundled NATS 0.1.0 descriptor is one example; the dispatcher contains no
+NATS-specific RPC routing. Other plugin families use the same contract.
+
+For event-producing methods, the optional `snapshot` declaration identifies
+the event and stop methods, connection/feed correlation fields, duration and
+message-count parameters, defaults and hard limits. DBX subscribes before
+starting the operation, returns a bounded event snapshot and stops the owned
+feed when collection ends. Callers never receive an unattended live feed.
+An old protocol that loses its start response before returning a feed id cannot
+be stopped by id; closing its managed connection remains the final cleanup.
+Binary streams and native UI interactions require an author-provided headless
+operation; a static GUI alone cannot supply an argument schema or executable
+backend behavior. DBX reports this limitation in the plugin catalog.
+
+`DBX_WEB_URL` uses the authenticated Web host's CLI operation endpoints and
+performs connection resolution there. External MCP remains an additional
+consumer of the same registry, with its own exposure and policy checks. CLI
+automation alone does not enable external MCP exposure; that surface requires
+the plugin's explicit `mcp` contribution with `external_tools: true`.
+
+Local CLI invocations own their sidecar processes and release them on exit.
+Operations that depend on a process-local job id, cursor or session across
+several commands should use a persistent DBX Web host through `DBX_WEB_URL`,
+whose plugin runtime survives individual CLI requests. Authors can also keep
+job state on their service or provide one bounded operation. A one-shot local
+call must not promise that its in-memory task handles survive process exit.
+
 ## Tools for the built-in AI assistant
 
 A backend can expose tools to the built-in DBX AI agent through the MCP-shaped sidecar methods `mcp/tools` and `mcp/call` — the same methods DBX's MCP bridge uses:

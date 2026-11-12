@@ -13,7 +13,10 @@ mod installer;
 mod lifecycle;
 mod manifest;
 mod marketplace;
+mod mcp_adapters;
 mod runtime;
+
+pub use mcp_adapters::{PluginRpcAccess, PluginRpcConnection, PluginRpcSnapshot, PluginRpcToolDeclaration};
 
 pub use assets::PluginUiAsset;
 pub use filesystem::{
