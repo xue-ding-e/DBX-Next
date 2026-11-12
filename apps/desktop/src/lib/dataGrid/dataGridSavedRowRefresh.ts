@@ -96,7 +96,8 @@ export function buildDataGridSavedRowRefreshPlan(options: BuildDataGridSavedRowR
   };
 }
 
-function refreshedColumnMapping(columns: readonly string[], sourceColumns: readonly (string | undefined)[] | undefined, refreshedColumns: readonly string[]): number[] | null {
+// Maps each target column to a distinct refreshed column, shared by values and metadata.
+export function dataGridSavedRowRefreshColumnMapping(columns: readonly string[], sourceColumns: readonly (string | undefined)[] | undefined, refreshedColumns: readonly string[]): number[] | null {
   if (columns.length === refreshedColumns.length && columns.every((column, index) => normalizeColumnName(sourceColumns?.[index] ?? column) === normalizeColumnName(refreshedColumns[index]))) {
     return columns.map((_, index) => index);
   }
@@ -113,7 +114,7 @@ function refreshedColumnMapping(columns: readonly string[], sourceColumns: reado
 
 export function dataGridSavedRowRefreshPatches(plan: DataGridSavedRowRefreshPlan, columns: readonly string[], sourceColumns: readonly (string | undefined)[] | undefined, refreshedColumns: readonly string[], refreshedRows: readonly (readonly CellValue[])[]): DataGridSavedRowRefreshPatch[] | null {
   const refreshedIdentityIndexes = resolveColumnIndexes(refreshedColumns, undefined, plan.identityColumns);
-  const columnMapping = refreshedColumnMapping(columns, sourceColumns, refreshedColumns);
+  const columnMapping = dataGridSavedRowRefreshColumnMapping(columns, sourceColumns, refreshedColumns);
   if (!refreshedIdentityIndexes || !columnMapping) return null;
 
   const refreshedRowsByIdentity = new Map<string, { refreshedRowIndex: number; row: readonly CellValue[] }>();

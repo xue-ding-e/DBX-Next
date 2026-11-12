@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildDataGridSavedRowRefreshPlan, dataGridSavedRowRefreshPatches } from "@/lib/dataGrid/dataGridSavedRowRefresh";
+import { buildDataGridSavedRowRefreshPlan, dataGridSavedRowRefreshColumnMapping, dataGridSavedRowRefreshPatches } from "@/lib/dataGrid/dataGridSavedRowRefresh";
 
 function dirtyRows(...entries: Array<[number, Array<[number, string | number | boolean | null]>]>): Map<number, Map<number, string | number | boolean | null>> {
   return new Map(entries.map(([rowIndex, changes]) => [rowIndex, new Map(changes)]));
@@ -115,5 +115,21 @@ describe("dataGridSavedRowRefresh", () => {
         ],
       ),
     ).toBeNull();
+  });
+});
+
+// ALL_UNRUN: shared mapping contract; actual metadata behavior is covered by the mounted callback source.
+describe("dataGridSavedRowRefreshColumnMapping", () => {
+  it("maps a subset in target order", () => {
+    expect(dataGridSavedRowRefreshColumnMapping(["id", "name"], undefined, ["extra", "name", "id"])).toEqual([2, 1]);
+  });
+  it("uses aliases and consumes duplicate matches once", () => {
+    expect(dataGridSavedRowRefreshColumnMapping(["identifier", "first", "second"], ["id", "name", "name"], [" NAME ", "id", "name"])).toEqual([1, 0, 2]);
+  });
+  it("rejects missing distinct duplicate matches", () => {
+    expect(dataGridSavedRowRefreshColumnMapping(["id", "name", "name"], undefined, ["id", "name", "other"])).toBeNull();
+  });
+  it("keeps the identity mapping for already aligned duplicate columns", () => {
+    expect(dataGridSavedRowRefreshColumnMapping(["id", "name", "name"], undefined, ["id", "name", "name"])).toEqual([0, 1, 2]);
   });
 });

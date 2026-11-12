@@ -246,7 +246,7 @@ import { resolveCrosshairTarget, type CrosshairTarget } from "@/lib/dataGrid/cro
 import { DATA_GRID_DARK_STRIPED_ROW_BG, DATA_GRID_LIGHT_STRIPED_ROW_BG, dataGridActiveRowBackground } from "@/lib/dataGrid/dataGridPaintTheme";
 import { createRowLowerTextCache } from "@/lib/dataGrid/dataGridRowLowerText";
 import { dataGridPreviewLabelKey, dataGridSaveActionMode, dataGridSaveToolbarState } from "@/lib/dataGrid/dataGridSaveUi";
-import { buildDataGridSavedRowRefreshPlan, dataGridSavedRowRefreshPatches } from "@/lib/dataGrid/dataGridSavedRowRefresh";
+import { buildDataGridSavedRowRefreshPlan, dataGridSavedRowRefreshColumnMapping, dataGridSavedRowRefreshPatches } from "@/lib/dataGrid/dataGridSavedRowRefresh";
 import type { QueryEditabilityReason } from "@/lib/sql/sqlAnalysis";
 import { sqlWithoutCommentsForCopy } from "@/lib/sql/sqlWithoutCommentsForCopy";
 import { EDITOR_FONT_FAMILY_CSS_VAR } from "@/lib/editor/editorThemes";
@@ -3948,19 +3948,29 @@ async function refreshSavedRows(request: { dirtyRows: ReadonlyMap<number, Readon
     pageSize: planResult.plan.sourceIndexes.length + 1,
   });
   const patches = dataGridSavedRowRefreshPatches(planResult.plan, request.columns, props.sourceColumns, refreshed.columns, refreshed.rows);
-  if (!patches) return false;
+  const columnMapping = dataGridSavedRowRefreshColumnMapping(request.columns, props.sourceColumns, refreshed.columns);
+  if (!patches || !columnMapping) return false;
+  const targetColumnIndexes = new Map(columnMapping.map((refreshedIndex, targetIndex) => [refreshedIndex, targetIndex]));
 
   const refreshedSourceIndexes = new Set(patches.map((patch) => patch.sourceIndex));
   for (const patch of patches) props.result.rows[patch.sourceIndex] = patch.row;
   if (props.result.large_value_cells || refreshed.large_value_cells) {
     props.result.large_value_cells = [
       ...(props.result.large_value_cells ?? []).filter((cell) => !refreshedSourceIndexes.has(cell.row_index)),
-      ...patches.flatMap((patch) => (refreshed.large_value_cells ?? []).filter((cell) => cell.row_index === patch.refreshedRowIndex).map((cell) => ({ ...cell, row_index: patch.sourceIndex }))),
+      ...patches.flatMap((patch) => (refreshed.large_value_cells ?? []).flatMap((cell) => {
+        const columnIndex = targetColumnIndexes.get(cell.column_index);
+        if (cell.row_index !== patch.refreshedRowIndex || columnIndex === undefined) return [];
+        return [{ ...cell, row_index: patch.sourceIndex, column_index: columnIndex }];
+      })),
     ];
   }
   if (props.result.spatial_values || refreshed.spatial_values) {
     props.result.spatial_values ??= props.result.rows.map(() => []);
-    for (const patch of patches) props.result.spatial_values[patch.sourceIndex] = [...(refreshed.spatial_values?.[patch.refreshedRowIndex] ?? [])];
+    for (const patch of patches) {
+      const spatialRow = refreshed.spatial_values?.[patch.refreshedRowIndex];
+      // Preserve the empty-row sentinel when the response has no spatial metadata.
+      props.result.spatial_values[patch.sourceIndex] = spatialRow?.length ? columnMapping.map((columnIndex) => spatialRow[columnIndex] ?? null) : [];
+    }
   }
   clearCellFormatCache();
   scheduleCanvasDraw();
