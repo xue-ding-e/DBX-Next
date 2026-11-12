@@ -1893,6 +1893,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       } catch (historyError) {
         console.warn("[DBX] failed to record conditional data grid update history", historyError);
       }
+      if (conditionalUpdateExecution.value !== execution) return null;
       reloadCurrentData();
       return { affectedRows: result?.affected_rows };
     } catch (error) {
@@ -1906,6 +1907,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         } catch (historyError) {
           console.warn("[DBX] failed to record conditional data grid update history", historyError);
         }
+        if (conditionalUpdateExecution.value !== execution) return null;
         reloadCurrentData();
       } else {
         // A dispatch may reach the database even when the client times out or

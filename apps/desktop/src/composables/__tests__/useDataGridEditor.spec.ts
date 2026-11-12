@@ -2974,6 +2974,133 @@ describe("useDataGridEditor saveChanges reload", () => {
     expect(emit).toHaveBeenCalledWith("reload", undefined, "", undefined, undefined, 100, 0);
   });
 
+  describe("conditional history completion identity (UNRUN source-only candidate)", () => {
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+      // Observe rejection immediately, including a gate released during cleanup.
+      void promise.catch(() => undefined);
+      return { promise, resolve, reject };
+    }
+
+    function observe<T>(promise: Promise<T>) {
+      return promise.then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      );
+    }
+
+    async function waitForEntry(entered: Promise<void>, settled: Promise<unknown>) {
+      const winner = await Promise.race([entered.then(() => "entered"), settled.then(() => "settled")]);
+      expect(winner).toBe("entered");
+    }
+
+    for (const outcome of ["success", "terminal-failure"] as const) {
+      for (const continuation of ["terminal-cancel", "terminal-cancel-new-execution", "normal"] as const) {
+        it(`UNRUN: ${outcome} history completion after ${continuation}`, async () => {
+          const apiEntered = deferred<void>();
+          const apiGate = deferred<{ affected_rows: number }>();
+          const historyEntered = deferred<void>();
+          const historyGate = deferred<void>();
+          const nextApiEntered = deferred<void>();
+          const nextApiGate = deferred<{ affected_rows: number }>();
+          // This is the existing classifier fixture, not a real database failure.
+          const sqlError = Object.assign(new Error("Duplicate entry '1' for key 'PRIMARY'"), {
+            backendError: {
+              version: 1,
+              code: "DBX-JDBC-4001",
+              messageKey: "backendErrors.jdbc.sqlFailed",
+              messageParams: { stage: "execute" },
+              source: "jdbc_agent",
+              operationOutcome: "unknown",
+              diagnostics: { category: "sql", stage: "execute" },
+            },
+          });
+          mocks.executeConditionalUpdate
+            .mockImplementationOnce(() => { apiEntered.resolve(); return apiGate.promise; })
+            .mockImplementationOnce(() => { nextApiEntered.resolve(); return nextApiGate.promise; });
+          mocks.addHistory
+            .mockImplementationOnce(() => { historyEntered.resolve(); return historyGate.promise; })
+            .mockResolvedValue(undefined);
+          mocks.cancelConditionalUpdate.mockResolvedValue({ requested: true, terminal: true });
+          const prepareFullReload = vi.fn();
+          const { editor, emit } = createSaveTestEditor({ prepareFullReload });
+          const statement = "UPDATE `app`.`orders_test` SET `id` = 1 WHERE (`status` = 'pending');";
+          const oldObserved = observe(editor.executeConditionalUpdate(statement));
+          let nextObserved: typeof oldObserved | undefined;
+          let cancelObserved: ReturnType<typeof observe<boolean>> | undefined;
+          const reloadCount = () => emit.mock.calls.filter(([event]) => event === "reload").length;
+          try {
+            await waitForEntry(apiEntered.promise, oldObserved);
+            if (outcome === "success") apiGate.resolve({ affected_rows: 7 });
+            else apiGate.reject(sqlError);
+            await waitForEntry(historyEntered.promise, oldObserved);
+            expect(mocks.addHistory).toHaveBeenCalledTimes(1);
+            expect(mocks.addHistory).toHaveBeenCalledWith(expect.objectContaining({
+              sql: statement,
+              success: outcome === "success",
+              affected_rows: outcome === "success" ? 7 : undefined,
+              error: outcome === "success" ? undefined : "Duplicate entry '1' for key 'PRIMARY'",
+            }));
+            expect(editor.isConditionalUpdateActive.value).toBe(true);
+            expect(editor.isSaving.value).toBe(true);
+            expect(prepareFullReload).not.toHaveBeenCalled();
+            expect(reloadCount()).toBe(0);
+
+            if (continuation !== "normal") {
+              cancelObserved = observe(editor.cancelConditionalUpdate());
+              expect(await cancelObserved).toEqual({ status: "fulfilled", value: true });
+              expect(mocks.cancelConditionalUpdate).toHaveBeenCalledWith(mocks.executeConditionalUpdate.mock.calls[0][4]);
+              expect(editor.isConditionalUpdateActive.value).toBe(false);
+              expect(editor.isSaving.value).toBe(false);
+              expect(prepareFullReload).toHaveBeenCalledTimes(1);
+              expect(reloadCount()).toBe(1);
+            }
+            if (continuation === "terminal-cancel-new-execution") {
+              nextObserved = observe(editor.executeConditionalUpdate(statement));
+              await waitForEntry(nextApiEntered.promise, nextObserved);
+              expect(mocks.executeConditionalUpdate).toHaveBeenCalledTimes(2);
+              expect(editor.isConditionalUpdateActive.value).toBe(true);
+              expect(editor.isSaving.value).toBe(true);
+            }
+
+            historyGate.resolve();
+            expect(await oldObserved).toEqual({
+              status: "fulfilled",
+              value: continuation === "normal" && outcome === "success" ? { affectedRows: 7 } : null,
+            });
+            // Cancellation owns its reload; the stale history continuation adds none.
+            expect(prepareFullReload).toHaveBeenCalledTimes(1);
+            expect(reloadCount()).toBe(1);
+            expect(editor.isConditionalUpdateActive.value).toBe(continuation === "terminal-cancel-new-execution");
+            expect(editor.isSaving.value).toBe(continuation === "terminal-cancel-new-execution");
+            if (nextObserved) {
+              // The newer API was still pending when the old finally ran.
+              nextApiGate.resolve({ affected_rows: 11 });
+              expect(await nextObserved).toEqual({ status: "fulfilled", value: { affectedRows: 11 } });
+              expect(mocks.addHistory).toHaveBeenCalledTimes(2);
+              expect(prepareFullReload).toHaveBeenCalledTimes(2);
+              expect(reloadCount()).toBe(2);
+              expect(editor.isConditionalUpdateActive.value).toBe(false);
+              expect(editor.isSaving.value).toBe(false);
+            } else {
+              expect(mocks.executeConditionalUpdate).toHaveBeenCalledTimes(1);
+              expect(mocks.addHistory).toHaveBeenCalledTimes(1);
+            }
+            expect(mocks.cancelConditionalUpdate).toHaveBeenCalledTimes(continuation === "normal" ? 0 : 1);
+          } finally {
+            // Release all operation gates even when an earlier assertion fails.
+            apiGate.resolve({ affected_rows: 7 });
+            historyGate.resolve();
+            nextApiGate.resolve({ affected_rows: 11 });
+            await Promise.all([oldObserved, nextObserved, cancelObserved]);
+          }
+        });
+      }
+    }
+  });
+
   it("refuses a conditional update while row edits are pending", async () => {
     const { editor, emit } = createSaveTestEditor();
     editor.dirtyRows.value = new Map([[0, new Map([[1, "shipped"]])]]);
