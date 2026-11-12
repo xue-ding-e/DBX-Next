@@ -9,6 +9,9 @@ import { canInsertTableRows, supportsDataGridTransaction } from "@/lib/table/tab
 
 const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(),
+  ensureReadOnlyWriteAccess: vi.fn(),
+  isWriteUnlockActive: vi.fn(),
+  requestProductionConfirmation: vi.fn(),
   prepareDataGridSave: vi.fn(),
   executeBatch: vi.fn(),
   executeConditionalUpdate: vi.fn(),
@@ -38,8 +41,20 @@ vi.mock("@/stores/historyStore", () => ({
   useHistoryStore: () => ({ add: mocks.addHistory }),
 }));
 vi.mock("@/stores/productionSafetyStore", () => ({
-  useProductionSafetyStore: () => ({}),
+  useProductionSafetyStore: () => ({ requestConfirmation: mocks.requestProductionConfirmation }),
 }));
+
+
+vi.mock("@/lib/database/readOnlyWriteAccess", () => ({
+  ensureReadOnlyWriteAccess: mocks.ensureReadOnlyWriteAccess,
+  isWriteUnlockActive: mocks.isWriteUnlockActive,
+}));
+
+beforeEach(() => {
+  mocks.ensureReadOnlyWriteAccess.mockReset().mockResolvedValue(true);
+  mocks.isWriteUnlockActive.mockReset().mockReturnValue(true);
+  mocks.requestProductionConfirmation.mockReset().mockResolvedValue(true);
+});
 
 function createEditorWithResult(
   sourceColumns?: Array<string | undefined>,
@@ -1043,6 +1058,7 @@ describe("useDataGridEditor saveChanges reload", () => {
       connectionId?: string;
       databaseType?: import("@/types/database").DatabaseType;
       quickEntry?: boolean;
+      editable?: Ref<boolean>;
       resolveNewRowItems?: boolean;
       resolveExistingRowItems?: boolean;
       cacheKey?: string;
@@ -1064,7 +1080,7 @@ describe("useDataGridEditor saveChanges reload", () => {
     let editor: ReturnType<typeof useDataGridEditor>;
     editor = useDataGridEditor({
       result: computed(() => result.value),
-      editable: computed(() => true),
+      editable: computed(() => options.editable?.value ?? true),
       databaseType: computed(() => options.databaseType ?? "mysql"),
       connectionId: computed(() => ("connectionId" in options ? options.connectionId : "connection-1")),
       database: computed(() => "app"),
@@ -1134,6 +1150,435 @@ describe("useDataGridEditor saveChanges reload", () => {
     });
     return { editor, emit, currentPage, ensureManualTransactionSession };
   }
+
+  describe("same-instance preflight reservation requirements", () => {
+    // These are source-only regressions against the actual composable. Only
+    // external unlock/confirmation/API boundaries are deferred or mocked.
+    // No private reservation state or replacement save implementation is used.
+    const updateSql = "UPDATE orders_test SET status='changed' WHERE id=1";
+    const conditionalSql = "UPDATE orders_test SET status='conditional' WHERE id=2";
+
+    function deferredBoolean() {
+      let resolve!: (value: boolean) => void;
+      let reject!: (reason: Error) => void;
+      const promise = new Promise<boolean>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      });
+      return { promise, resolve, reject };
+    }
+
+    beforeEach(() => {
+      mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Read-only fixture", db_type: "mysql", read_only: true });
+      mocks.prepareDataGridSave.mockResolvedValue({ statements: [updateSql], rollbackStatements: [] });
+      mocks.executeBatch.mockResolvedValue({ affected_rows: 1 });
+      mocks.executeConditionalUpdate.mockResolvedValue({ affected_rows: 1 });
+      mocks.addHistory.mockResolvedValue(undefined);
+    });
+
+    it.each([false, true])("does not recapture P while read-only unlock is pending (second autoSave=%s)", async (autoSave) => {
+      const unlock = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(unlock.promise);
+      const { editor } = createSaveTestEditor();
+      editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+      const first = editor.saveChanges();
+      let competing: Promise<void> | undefined;
+      try {
+        competing = editor.saveChanges({ autoSave });
+        await nextTick();
+        expect.soft(mocks.ensureReadOnlyWriteAccess).toHaveBeenCalledOnce();
+        expect.soft(mocks.prepareDataGridSave).not.toHaveBeenCalled();
+        expect.soft(mocks.executeBatch).not.toHaveBeenCalled();
+      } finally {
+        unlock.resolve(true);
+        await Promise.all([first, competing]);
+      }
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect(editor.isSaving.value).toBe(false);
+    });
+
+    it("does not recapture custom inserts while production confirmation is pending", async () => {
+      mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Production fixture", db_type: "mysql", is_production: true });
+      const confirmation = deferredBoolean();
+      mocks.requestProductionConfirmation.mockReturnValueOnce(confirmation.promise);
+      const save = vi.fn().mockResolvedValue(undefined);
+      const { editor } = createSaveTestEditor({ customSaveHandler: { save, supportsInsert: true } });
+      editor.newRows.value = [[3, "P"]];
+      const first = editor.saveChanges();
+      let competing: Promise<void> | undefined;
+      try {
+        competing = editor.saveChanges();
+        await nextTick();
+        expect.soft(mocks.requestProductionConfirmation).toHaveBeenCalledOnce();
+        expect.soft(save).not.toHaveBeenCalled();
+      } finally {
+        confirmation.resolve(true);
+        await Promise.all([first, competing]);
+      }
+      expect(save).toHaveBeenCalledOnce();
+      expect(save.mock.calls[0]?.[0].newRows).toEqual([[3, "P"]]);
+      expect(editor.isSaving.value).toBe(false);
+    });
+
+    it("shares the reservation with conditional-update preflight before a competing save", async () => {
+      const unlock = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(unlock.promise);
+      const { editor } = createSaveTestEditor();
+      const conditional = editor.executeConditionalUpdate(conditionalSql);
+      let competing: Promise<void> | undefined;
+      try {
+        editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+        competing = editor.saveChanges();
+        await nextTick();
+        expect.soft(mocks.ensureReadOnlyWriteAccess).toHaveBeenCalledOnce();
+        expect.soft(mocks.executeBatch).not.toHaveBeenCalled();
+      } finally {
+        // Declining the first request leaves only the later explicit save eligible.
+        unlock.resolve(false);
+        await Promise.all([conditional, competing]);
+      }
+      expect(editor.hasPendingChanges.value).toBe(true);
+      await editor.saveChanges();
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      expect(mocks.executeConditionalUpdate).not.toHaveBeenCalled();
+    });
+
+    it("excludes conditional update while a save owns unlock preflight", async () => {
+      const gate = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
+      const { editor } = createSaveTestEditor();
+      editor.newRows.value = [[3, "P"]];
+      const first = editor.saveChanges();
+      try {
+        // Even if the live edits are discarded, the first approval still owns entry.
+        editor.discardChanges();
+        await expect(editor.executeConditionalUpdate(conditionalSql)).resolves.toBeNull();
+        expect(mocks.ensureReadOnlyWriteAccess).toHaveBeenCalledOnce();
+      } finally {
+        gate.resolve(true);
+        await first;
+      }
+      expect(mocks.executeBatch).not.toHaveBeenCalled();
+      expect(mocks.executeConditionalUpdate).not.toHaveBeenCalled();
+      await editor.executeConditionalUpdate(conditionalSql);
+      expect(mocks.executeConditionalUpdate).toHaveBeenCalledOnce();
+    });
+
+    it("retires an accepted conditional approval when a new edit is pending", async () => {
+      const gate = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
+      const { editor, emit } = createSaveTestEditor({ resolveExistingRowItems: true });
+      const first = editor.executeConditionalUpdate(conditionalSql);
+      try {
+        editor.applyCellValue(0, 1, "new intent");
+      } finally {
+        gate.resolve(true);
+        await first;
+      }
+      expect(mocks.executeConditionalUpdate).not.toHaveBeenCalled();
+      expect(emit.mock.calls.some(([event]) => event === "reload")).toBe(false);
+      expect(editor.dirtyRows.value.get(0)?.get(1)).toBe("new intent");
+      expect(editor.isSaving.value).toBe(false);
+      await editor.saveChanges();
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+    });
+
+    it.each(["paste", "undo"] as const)("retires an insert approval after %s replaces row references", async (mutation) => {
+      const gate = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
+      const save = vi.fn().mockResolvedValue(undefined);
+      const { editor } = createSaveTestEditor({ customSaveHandler: { save, supportsInsert: true }, resolveNewRowItems: true });
+      editor.newRows.value = [[3, "P"], [null, null]];
+      if (mutation === "undo") editor.applyCellValue(-1, 1, "before approval");
+      const previousRow = editor.newRows.value[0];
+      const first = editor.saveChanges();
+      try {
+        if (mutation === "paste") {
+          expect(editor.appendPastedRowsToNewRow(-2, [["4", "Q"]], [0, 1]).ok).toBe(true);
+        } else {
+          editor.undoPendingChange();
+        }
+        expect(editor.newRows.value[0]).not.toBe(previousRow);
+      } finally {
+        gate.resolve(true);
+        await first;
+      }
+      expect(save).not.toHaveBeenCalled();
+      expect(editor.newRows.value[0]).toEqual([3, "P"]);
+      if (mutation === "paste") expect(editor.newRows.value[1]?.[1]).toBe("Q");
+      expect(editor.hasPendingChanges.value).toBe(true);
+      expect(editor.isSaving.value).toBe(false);
+      await editor.saveChanges();
+      expect(save).toHaveBeenCalledOnce();
+      expect(save.mock.calls[0]?.[0].newRows[0]).toEqual([3, "P"]);
+      expect(editor.hasPendingChanges.value).toBe(false);
+    });
+
+    it.each(["save-rows", "save-columns", "conditional-rows", "conditional-columns"] as const)("retires initial approval when result identity changes (%s)", async (boundary) => {
+      const gate = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
+      const queryResult: { columns: string[]; rows: CellValue[][] } = {
+        columns: ["id", "status"],
+        rows: [[1, "pending"], [2, "pending"]],
+      };
+      const { editor } = createSaveTestEditor({ queryResult, resolveExistingRowItems: true });
+      if (boundary.startsWith("save")) editor.applyCellValue(0, 1, "changed");
+      const first = boundary.startsWith("save") ? editor.saveChanges() : editor.executeConditionalUpdate(conditionalSql);
+      try {
+        // Replace the backing object's identity without relying on a watcher
+        // flush to invalidate edits before the approval promise resumes.
+        if (boundary.endsWith("rows")) queryResult.rows = queryResult.rows.map((row) => [...row]);
+        else queryResult.columns = [...queryResult.columns];
+      } finally {
+        gate.resolve(true);
+        await first;
+      }
+      expect(mocks.executeBatch).not.toHaveBeenCalled();
+      expect(mocks.executeConditionalUpdate).not.toHaveBeenCalled();
+      expect(editor.isSaving.value).toBe(false);
+      if (boundary.startsWith("save")) await editor.saveChanges();
+      else await editor.executeConditionalUpdate(conditionalSql);
+      expect(boundary.startsWith("save") ? mocks.executeBatch : mocks.executeConditionalUpdate).toHaveBeenCalledOnce();
+    });
+
+    it("retires conditional approval when editing becomes unavailable", async () => {
+      const editable = ref(true);
+      const gate = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
+      const { editor } = createSaveTestEditor({ editable });
+      const first = editor.executeConditionalUpdate(conditionalSql);
+      editable.value = false;
+      gate.resolve(true);
+      await first;
+      expect(mocks.executeConditionalUpdate).not.toHaveBeenCalled();
+      expect(editor.isSaving.value).toBe(false);
+      editable.value = true;
+      await editor.executeConditionalUpdate(conditionalSql);
+      expect(mocks.executeConditionalUpdate).toHaveBeenCalledOnce();
+    });
+
+    it("does not start a second conditional update during the first unlock", async () => {
+      const unlock = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(unlock.promise);
+      const { editor } = createSaveTestEditor();
+      const first = editor.executeConditionalUpdate(conditionalSql);
+      let competing: ReturnType<typeof editor.executeConditionalUpdate> | undefined;
+      try {
+        competing = editor.executeConditionalUpdate(conditionalSql);
+        await nextTick();
+        expect.soft(mocks.ensureReadOnlyWriteAccess).toHaveBeenCalledOnce();
+        expect.soft(mocks.executeConditionalUpdate).not.toHaveBeenCalled();
+      } finally {
+        unlock.resolve(true);
+        await Promise.all([first, competing]);
+      }
+      expect(mocks.executeConditionalUpdate).toHaveBeenCalledOnce();
+      expect(editor.isSaving.value).toBe(false);
+    });
+
+    it.each(["unlock", "custom-production"] as const)("releases a declined %s preflight without dispatching", async (boundary) => {
+      const gate = deferredBoolean();
+      const save = vi.fn().mockResolvedValue(undefined);
+      const { editor } = createSaveTestEditor({ customSaveHandler: boundary === "custom-production" ? { save } : undefined });
+      if (boundary === "unlock") mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
+      else {
+        mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Production fixture", db_type: "mysql", is_production: true });
+        mocks.requestProductionConfirmation.mockReturnValueOnce(gate.promise);
+      }
+      editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+      const first = editor.saveChanges();
+      gate.resolve(false);
+      await first;
+      expect(mocks.executeBatch).not.toHaveBeenCalled();
+      expect(save).not.toHaveBeenCalled();
+      expect(editor.hasPendingChanges.value).toBe(true);
+      expect(editor.isSaving.value).toBe(false);
+      await editor.saveChanges();
+      expect(boundary === "unlock" ? mocks.executeBatch : save).toHaveBeenCalledOnce();
+    });
+
+    it.each(["unlock", "custom-production"] as const)("releases a rejected %s preflight while preserving its thrown error", async (boundary) => {
+      const failure = new Error("synthetic preflight rejection");
+      const gate = deferredBoolean();
+      const save = vi.fn().mockResolvedValue(undefined);
+      const { editor } = createSaveTestEditor({ customSaveHandler: boundary === "custom-production" ? { save } : undefined });
+      if (boundary === "unlock") mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
+      else {
+        mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Production fixture", db_type: "mysql", is_production: true });
+        mocks.requestProductionConfirmation.mockReturnValueOnce(gate.promise);
+      }
+      editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+      const first = editor.saveChanges();
+      const rejection = expect(first).rejects.toBe(failure);
+      gate.reject(failure);
+      await rejection;
+      expect(mocks.executeBatch).not.toHaveBeenCalled();
+      expect(save).not.toHaveBeenCalled();
+      expect(editor.isSaving.value).toBe(false);
+      expect(editor.hasPendingChanges.value).toBe(true);
+      await editor.saveChanges();
+      expect(boundary === "unlock" ? mocks.executeBatch : save).toHaveBeenCalledOnce();
+    });
+
+    it.each([false, true])("releases conditional preflight on decline or rejection (throws=%s)", async (throws) => {
+      const gate = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
+      const { editor } = createSaveTestEditor();
+      const first = editor.executeConditionalUpdate(conditionalSql);
+      if (throws) {
+        const error = new Error("synthetic conditional unlock rejection");
+        const rejection = expect(first).rejects.toBe(error);
+        gate.reject(error);
+        await rejection;
+      } else {
+        gate.resolve(false);
+        await expect(first).resolves.toBeNull();
+      }
+      expect(mocks.executeConditionalUpdate).not.toHaveBeenCalled();
+      expect(editor.isSaving.value).toBe(false);
+      await editor.executeConditionalUpdate(conditionalSql);
+      expect(mocks.executeConditionalUpdate).toHaveBeenCalledOnce();
+    });
+
+    it("releases preflight when editing becomes unavailable during unlock", async () => {
+      const editable = ref(true);
+      const gate = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
+      const { editor } = createSaveTestEditor({ editable });
+      editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+      const first = editor.saveChanges();
+      editable.value = false;
+      gate.resolve(true);
+      await first;
+      expect(mocks.executeBatch).not.toHaveBeenCalled();
+      expect(editor.isSaving.value).toBe(false);
+      expect(editor.hasPendingChanges.value).toBe(true);
+      editable.value = true;
+      await editor.saveChanges();
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+    });
+
+    it("keeps the failure floor and a reversal made during explicit retry unlock", async () => {
+      const failure = new Error("synthetic unknown batch outcome");
+      mocks.getConfig.mockReturnValue(undefined);
+      mocks.executeBatch.mockRejectedValueOnce(failure);
+      const queryResult: { columns: string[]; rows: CellValue[][] } = {
+        columns: ["id", "status"],
+        rows: [[1, "pending"], [2, "pending"]],
+      };
+      const { editor } = createSaveTestEditor({ queryResult, quickEntry: true, resolveExistingRowItems: true });
+      editor.applyCellValue(0, 1, "changed");
+      await editor.saveChanges();
+      expect(editor.manualSaveRequired.value).toBe(true);
+      const unlock = deferredBoolean();
+      mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Read-only fixture", db_type: "mysql", read_only: true });
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(unlock.promise);
+      const retry = editor.saveChanges();
+      let blur: ReturnType<typeof editor.commitEditFromBlur> | undefined;
+      try {
+        editor.startEdit(0, 1);
+        editor.editValue.value = "pending";
+        blur = editor.commitEditFromBlur();
+        await nextTick();
+        expect(mocks.executeBatch).toHaveBeenCalledOnce();
+      } finally {
+        unlock.resolve(true);
+        await Promise.all([retry, blur]);
+      }
+      // A safe preflight may retire undispatched stale P, or dispatch one retry
+      // and retain the reversal. Neither strategy may erase the newer intent
+      // or lift the failure floor merely because the old snapshot drained.
+      const batchAttemptsAfterRetry = mocks.executeBatch.mock.calls.length;
+      expect([1, 2]).toContain(batchAttemptsAfterRetry);
+      expect.soft(editor.rowDataWithChanges(queryResult.rows[0]!, 0)[1]).toBe("pending");
+      expect.soft(editor.manualSaveRequired.value).toBe(true);
+      await editor.saveChanges({ autoSave: true });
+      expect(mocks.executeBatch).toHaveBeenCalledTimes(batchAttemptsAfterRetry);
+      expect.soft(editor.rowDataWithChanges(queryResult.rows[0]!, 0)[1]).toBe("pending");
+      expect(editor.manualSaveRequired.value).toBe(true);
+    });
+
+    it("does not erase a newer insert value committed from an editor already open before preflight", async () => {
+      const unlock = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(unlock.promise);
+      const savedRows: CellValue[][] = [];
+      const save = vi.fn(async (changes: Parameters<CustomSaveHandler["save"]>[0]) => {
+        savedRows.push(...changes.newRows.map((row) => [...row]));
+      });
+      const { editor } = createSaveTestEditor({ customSaveHandler: { save, supportsInsert: true }, resolveNewRowItems: true });
+      editor.newRows.value = [[3, "P"]];
+      editor.startEdit(-1, 1);
+      editor.editValue.value = "newer intent";
+      const first = editor.saveChanges();
+      try {
+        await editor.commitEditFromBlur();
+      } finally {
+        unlock.resolve(true);
+        await first;
+      }
+      // Do not prescribe whether a future fix retires/rebuilds P or retains the
+      // editor/pending Q. It must not acknowledge a value it never dispatched.
+      const newerValueWasSent = savedRows.some((row) => row[1] === "newer intent");
+      const newerValueIsPending = editor.newRows.value.some((row) => row[1] === "newer intent");
+      const newerValueRemainsInEditor = editor.editingCell.value !== null && editor.editValue.value === "newer intent";
+      expect(newerValueWasSent || newerValueIsPending || newerValueRemainsInEditor).toBe(true);
+    });
+
+    it("preserves a separately appended Q insert while P awaits unlock", async () => {
+      const unlock = deferredBoolean();
+      mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(unlock.promise);
+      const { editor } = createSaveTestEditor();
+      editor.newRows.value = [[3, "P"]];
+      const first = editor.saveChanges();
+      editor.newRows.value.push([4, "Q"]);
+      unlock.resolve(true);
+      await first;
+      expect(editor.newRows.value).toEqual([[4, "Q"]]);
+      expect(editor.hasPendingChanges.value).toBe(true);
+      expect(mocks.executeBatch).toHaveBeenCalledOnce();
+    });
+
+    it("keeps autosave blocked by locked read-only access and custom production confirmation", async () => {
+      mocks.isWriteUnlockActive.mockReturnValue(false);
+      const { editor } = createSaveTestEditor();
+      editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+      await editor.saveChanges({ autoSave: true });
+      expect(mocks.ensureReadOnlyWriteAccess).not.toHaveBeenCalled();
+      expect(mocks.executeBatch).not.toHaveBeenCalled();
+      mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Production fixture", db_type: "mysql", is_production: true });
+      const save = vi.fn();
+      const custom = createSaveTestEditor({ customSaveHandler: { save } }).editor;
+      custom.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+      await custom.saveChanges({ autoSave: true });
+      expect(mocks.requestProductionConfirmation).not.toHaveBeenCalled();
+      expect(save).not.toHaveBeenCalled();
+    });
+
+    it("does not enable unsupported custom inserts and permits a later supported save", async () => {
+      const save = vi.fn().mockResolvedValue(undefined);
+      const handler: CustomSaveHandler = { save };
+      const { editor } = createSaveTestEditor({ customSaveHandler: handler });
+      editor.newRows.value = [[3, "P"]];
+      await editor.saveChanges();
+      expect(save).not.toHaveBeenCalled();
+      expect(editor.hasPendingChanges.value).toBe(true);
+      expect(editor.isSaving.value).toBe(false);
+      handler.supportsInsert = true;
+      await editor.saveChanges();
+      expect(save).toHaveBeenCalledOnce();
+    });
+
+    it("allows ordinary autosave again after a successful preflight and settlement", async () => {
+      const { editor } = createSaveTestEditor({ quickEntry: true });
+      editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+      await editor.saveChanges();
+      editor.dirtyRows.value.set(1, new Map([[1, "later"]]));
+      await editor.saveChanges({ autoSave: true });
+      expect(mocks.executeBatch).toHaveBeenCalledTimes(2);
+      expect(editor.isSaving.value).toBe(false);
+      expect(editor.hasPendingChanges.value).toBe(false);
+    });
+  });
 
   describe("failed batch manual-save lifetime", () => {
     const insertSql = "INSERT INTO orders_test VALUES (3, 'first')";

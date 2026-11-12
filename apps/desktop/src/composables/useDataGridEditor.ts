@@ -400,6 +400,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   // --- Transaction state ---
   const transactionActive = ref(false);
   const isSaving = ref(false);
+  // Reserve approval dialogs without freezing edits or claiming a dispatched save.
+  let savePreflightReserved = false;
   const saveError = ref("");
   const conditionalUpdateExecution = shallowRef<ConditionalUpdateExecution>();
   const isConditionalUpdateActive = computed(() => conditionalUpdateExecution.value !== undefined);
@@ -1803,38 +1805,53 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   async function executeConditionalUpdate(statement: string): Promise<{ affectedRows?: number } | null> {
-    if (isSaving.value || !connectionId.value || !tableMeta.value) return null;
+    if (savePreflightReserved || isSaving.value || !connectionId.value || !tableMeta.value) return null;
     if (editingCell.value) commitEdit();
     if (hasPendingChanges.value) {
       saveError.value = i18n.global.t("grid.conditionalBulkEditPendingChanges");
       return null;
     }
 
-    saveError.value = "";
-    const connection = connectionStore.getConfig(connectionId.value);
-    if (!(await ensureReadOnlyWriteAccess({ connection, sql: statement, source: i18n.global.t("readOnlyUnlock.sourceDataEditor") }))) return null;
-    const productionAssessment = assessProductionSql(statement, connection, database.value);
-    if (productionAssessment.active && productionAssessment.isMutation) {
-      const confirmed = await productionSafetyStore.requestConfirmation({
-        sql: statement,
-        connectionName: connection?.name,
-        database: database.value,
-        productionDatabases: productionAssessment.databases,
-        source: i18n.global.t("readOnlyUnlock.sourceDataEditor"),
-      });
-      if (!confirmed) return null;
+    let execution: ConditionalUpdateExecution;
+    const preflightTarget = { connectionId: connectionId.value, database: database.value, tableMeta: tableMeta.value, rows: result.value.rows, columns: result.value.columns };
+    savePreflightReserved = true;
+    try {
+      saveError.value = "";
+      const connection = connectionStore.getConfig(connectionId.value);
+      if (!(await ensureReadOnlyWriteAccess({ connection, sql: statement, source: i18n.global.t("readOnlyUnlock.sourceDataEditor") }))) return null;
+      const productionAssessment = assessProductionSql(statement, connection, database.value);
+      if (productionAssessment.active && productionAssessment.isMutation) {
+        const confirmed = await productionSafetyStore.requestConfirmation({
+          sql: statement,
+          connectionName: connection?.name,
+          database: database.value,
+          productionDatabases: productionAssessment.databases,
+          source: i18n.global.t("readOnlyUnlock.sourceDataEditor"),
+        });
+        if (!confirmed) return null;
+      }
+
+      if (!editable.value || connectionId.value !== preflightTarget.connectionId || database.value !== preflightTarget.database || tableMeta.value !== preflightTarget.tableMeta || result.value.rows !== preflightTarget.rows || result.value.columns !== preflightTarget.columns) return null;
+      // Edits remain available while approval is open; never reload over them.
+      if (editingCell.value) commitEdit();
+      if (hasPendingChanges.value) {
+        saveError.value = i18n.global.t("grid.conditionalBulkEditPendingChanges");
+        return null;
+      }
+      execution = {
+        executionId: uuid(),
+        dispatched: false,
+        cancelRequested: false,
+        cancelling: false,
+        terminalCheckScheduled: false,
+        outcome: "not-started",
+      };
+      conditionalUpdateExecution.value = execution;
+      isSaving.value = true;
+    } finally {
+      savePreflightReserved = false;
     }
 
-    const execution: ConditionalUpdateExecution = {
-      executionId: uuid(),
-      dispatched: false,
-      cancelRequested: false,
-      cancelling: false,
-      terminalCheckScheduled: false,
-      outcome: "not-started",
-    };
-    conditionalUpdateExecution.value = execution;
-    isSaving.value = true;
     const startedAt = Date.now();
     try {
       if (execution.cancelRequested) return null;
@@ -1906,7 +1923,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   async function saveChanges(saveOptions: SaveChangesOptions = {}) {
-    if (!editable.value) return;
+    if (!editable.value || savePreflightReserved) return;
     if (saveOptions.autoSave && (manualSaveRequired.value || batchFailureRequiresManualSave)) {
       // Remember edits made during a manual retry even though they must not auto-save.
       if (batchFailureRequiresManualSave && isSaving.value) pendingAutoSaveRequested = true;
@@ -1922,34 +1939,44 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
     const customHandler = customSaveHandler?.value;
     const connection = connectionStore.getConfig(connectionId.value ?? "");
-    if (connection?.read_only) {
-      if (saveOptions.autoSave && !isWriteUnlockActive(connection.id)) return;
-      if (!(await ensureReadOnlyWriteAccess({ connection, sql: describeDataGridChanges(snapshot), source: i18n.global.t("readOnlyUnlock.sourceDataEditor"), treatAsMutation: true }))) {
+    const preflightVersion = pendingChangesVersion.value;
+    const preflightTarget = { connectionId: connectionId.value, database: database.value, tableMeta: tableMeta.value, rows: result.value.rows, columns: result.value.columns };
+    savePreflightReserved = true;
+    try {
+      if (connection?.read_only) {
+        if (saveOptions.autoSave && !isWriteUnlockActive(connection.id)) return;
+        if (!(await ensureReadOnlyWriteAccess({ connection, sql: describeDataGridChanges(snapshot), source: i18n.global.t("readOnlyUnlock.sourceDataEditor"), treatAsMutation: true }))) {
+          return;
+        }
+      }
+      const customHandlerProductionContext = productionContextForDatabase(connection, database.value);
+      if (customHandler && customHandlerProductionContext.active) {
+        // Custom data sources may not expose SQL, but their row mutations still need the same production interlock.
+        if (saveOptions.autoSave) {
+          return;
+        }
+        const confirmed = await productionSafetyStore.requestConfirmation({
+          sql: describeDataGridChanges(snapshot),
+          connectionName: connection?.name,
+          database: database.value,
+          productionDatabases: customHandlerProductionContext.databases,
+          source: i18n.global.t("readOnlyUnlock.sourceDataEditor"),
+        });
+        if (!confirmed) return;
+      }
+      if (!editable.value || pendingChangesVersion.value !== preflightVersion) return;
+      if (connectionId.value !== preflightTarget.connectionId || database.value !== preflightTarget.database || tableMeta.value !== preflightTarget.tableMeta || result.value.rows !== preflightTarget.rows || result.value.columns !== preflightTarget.columns || customSaveHandler?.value !== customHandler) return;
+      if (customHandler && snapshot.newRows.length > 0 && customHandler.supportsInsert !== true && customHandler.canInsert !== true) {
+        saveError.value = i18n.global.t("grid.insertRowsNotSupported");
         return;
       }
+      saveError.value = "";
+      isSaving.value = true;
+    } finally {
+      // A changed snapshot was never dispatched. Keep live edits and the failure
+      // floor intact, and require a fresh save to review the current changes.
+      savePreflightReserved = false;
     }
-    const customHandlerProductionContext = productionContextForDatabase(connection, database.value);
-    if (customHandler && customHandlerProductionContext.active) {
-      // Custom data sources may not expose SQL, but their row mutations still need the same production interlock.
-      if (saveOptions.autoSave) {
-        return;
-      }
-      const confirmed = await productionSafetyStore.requestConfirmation({
-        sql: describeDataGridChanges(snapshot),
-        connectionName: connection?.name,
-        database: database.value,
-        productionDatabases: customHandlerProductionContext.databases,
-        source: i18n.global.t("readOnlyUnlock.sourceDataEditor"),
-      });
-      if (!confirmed) return;
-    }
-    if (!editable.value) return;
-    if (customHandler && snapshot.newRows.length > 0 && customHandler.supportsInsert !== true && customHandler.canInsert !== true) {
-      saveError.value = i18n.global.t("grid.insertRowsNotSupported");
-      return;
-    }
-    saveError.value = "";
-    isSaving.value = true;
     snapshot.newRowRefs.forEach((row) => savingNewRows.add(row));
     const shouldReloadAfterSave = snapshot.newRows.length > 0 || snapshot.deletedRows.size > 0;
     // SQL saves may update columns the client can't predict (e.g. an ON UPDATE CURRENT_TIMESTAMP
