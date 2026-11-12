@@ -72,6 +72,11 @@ Thumbs.db
 
 # Temp
 tmp/
+# Session handoffs and one-off design previews belong under tmp/.
+/handoff.md
+/dbx-er-diagram-architecture.html
+/docs/*-handoff.md
+/docs/*-delivery.md
 
 # Local issue screenshots (never commit)
 issue-assets/
