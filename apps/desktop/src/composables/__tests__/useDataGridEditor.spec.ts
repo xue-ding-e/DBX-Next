@@ -44,7 +44,6 @@ vi.mock("@/stores/productionSafetyStore", () => ({
   useProductionSafetyStore: () => ({ requestConfirmation: mocks.requestProductionConfirmation }),
 }));
 
-
 vi.mock("@/lib/database/readOnlyWriteAccess", () => ({
   ensureReadOnlyWriteAccess: mocks.ensureReadOnlyWriteAccess,
   isWriteUnlockActive: mocks.isWriteUnlockActive,
@@ -1087,22 +1086,26 @@ describe("useDataGridEditor saveChanges reload", () => {
       result: computed(() => result.value),
       editable: computed(() => options.editable?.value ?? true),
       databaseType: computed(() => options.databaseType ?? "mysql"),
-      connectionId: computed(() => options.connectionIdRef ? options.connectionIdRef.value : ("connectionId" in options ? options.connectionId : "connection-1")),
-      database: computed(() => options.databaseRef ? options.databaseRef.value : "app"),
-      tableMeta: computed(() => options.tableMetaRef ? options.tableMetaRef.value : ({
-        tableName: "orders_test",
-        columns: [
-          { name: "id", data_type: "int" },
-          { name: "status", data_type: "varchar" },
-        ],
-        primaryKeys: options.primaryKeys ?? ["id"],
-      })),
+      connectionId: computed(() => (options.connectionIdRef ? options.connectionIdRef.value : "connectionId" in options ? options.connectionId : "connection-1")),
+      database: computed(() => (options.databaseRef ? options.databaseRef.value : "app")),
+      tableMeta: computed(() =>
+        options.tableMetaRef
+          ? options.tableMetaRef.value
+          : {
+              tableName: "orders_test",
+              columns: [
+                { name: "id", data_type: "int" },
+                { name: "status", data_type: "varchar" },
+              ],
+              primaryKeys: options.primaryKeys ?? ["id"],
+            },
+      ),
       sourceColumns: computed(() => undefined),
       joinedWriteTargets: computed(() => options.joinedWriteTargets),
       onExecuteSql: computed(() => options.onExecuteSql),
       customSaveHandler: computed(() => options.customSaveHandler),
-      confirmSaveRequest: computed(() => options.confirmSaveRequestRef ? options.confirmSaveRequestRef.value : options.confirmSaveRequest),
-      manualTransactionSessionId: computed(() => options.manualTransactionSessionIdRef ? options.manualTransactionSessionIdRef.value : options.manualTransactionSessionId),
+      confirmSaveRequest: computed(() => (options.confirmSaveRequestRef ? options.confirmSaveRequestRef.value : options.confirmSaveRequest)),
+      manualTransactionSessionId: computed(() => (options.manualTransactionSessionIdRef ? options.manualTransactionSessionIdRef.value : options.manualTransactionSessionId)),
       ensureManualTransactionSession: computed(() => ensureManualTransactionSession.value),
       onManualTransactionMutation: options.onManualTransactionMutation,
       sql: computed(() => undefined),
@@ -1159,22 +1162,33 @@ describe("useDataGridEditor saveChanges reload", () => {
   describe("pre-dispatch snapshot retirement", () => {
     // SOURCE ONLY / UNRUN. These gates exercise the composable, not a model of it.
     const boundaries = ["custom-preview", "custom-confirm", "sql-prepare", "manual-session", "keyless", "sql-production", "sql-confirm"] as const;
-    type Boundary = typeof boundaries[number];
+    type Boundary = (typeof boundaries)[number];
     const statement = "UPDATE orders_test SET status='P' WHERE id=1";
 
     function fixture(boundary: Boundary) {
       let release!: () => void;
       let reject!: (reason: unknown) => void;
       let enter!: () => void;
-      const entered = new Promise<void>((done) => { enter = done; });
-      const gate = new Promise<void>((yes, no) => { release = yes; reject = no; });
+      const entered = new Promise<void>((done) => {
+        enter = done;
+      });
+      const gate = new Promise<void>((yes, no) => {
+        release = yes;
+        reject = no;
+      });
       // Observe even a gate whose boundary is unexpectedly not reached.
-      const gateObserved = gate.then(() => undefined, () => undefined);
-      const pause = () => { enter(); return gate; };
+      const gateObserved = gate.then(
+        () => undefined,
+        () => undefined,
+      );
+      const pause = () => {
+        enter();
+        return gate;
+      };
       const prepared = { statements: [statement], rollbackStatements: [], keylessGuards: boundary === "keyless" ? [keylessGuard] : [] };
       const save = vi.fn().mockResolvedValue(undefined);
-      const preview = vi.fn(() => boundary === "custom-preview" ? pause().then(() => [statement]) : Promise.resolve([statement]));
-      const confirm = vi.fn(() => boundary === "custom-confirm" || boundary === "sql-confirm" ? pause().then(() => true) : Promise.resolve(true));
+      const preview = vi.fn(() => (boundary === "custom-preview" ? pause().then(() => [statement]) : Promise.resolve([statement])));
+      const confirm = vi.fn(() => (boundary === "custom-confirm" || boundary === "sql-confirm" ? pause().then(() => true) : Promise.resolve(true)));
       mocks.getConfig.mockReturnValue(boundary === "sql-production" ? { id: "connection-1", db_type: "mysql", is_production: true } : undefined);
       mocks.prepareDataGridSave.mockResolvedValue(prepared);
       if (boundary === "sql-prepare") mocks.prepareDataGridSave.mockImplementationOnce(() => pause().then(() => prepared));
@@ -1187,13 +1201,21 @@ describe("useDataGridEditor saveChanges reload", () => {
         customSaveHandler: boundary.startsWith("custom") ? { save, preview, supportsInsert: true } : undefined,
         confirmSaveRequest: boundary.startsWith("custom") || boundary === "sql-confirm" ? confirm : undefined,
         ensureManualTransactionSession: boundary === "manual-session" ? () => pause().then(() => "txn-1") : undefined,
-        quickEntry: true, resolveExistingRowItems: true, resolveNewRowItems: true,
+        quickEntry: true,
+        resolveExistingRowItems: true,
+        resolveNewRowItems: true,
       });
       return { ...created, save, release, reject, entered, gateObserved };
     }
 
     async function waitForGate(entered: Promise<void>, settled: Promise<unknown>) {
-      const winner = await Promise.race([entered.then(() => "entered"), settled.then(() => "settled", () => "settled")]);
+      const winner = await Promise.race([
+        entered.then(() => "entered"),
+        settled.then(
+          () => "settled",
+          () => "settled",
+        ),
+      ]);
       if (winner !== "entered") throw new Error("Dispatch fence boundary not reached before save settled");
     }
 
@@ -1201,18 +1223,27 @@ describe("useDataGridEditor saveChanges reload", () => {
       it.each(["replace-P", "reverse-P", "append-Q", "replace-rows", "reactive-rows", "replace-columns", "open-batch"] as const)(`retires accepted ${boundary} without dispatch/replay after %s`, async (change) => {
         const f = fixture(boundary);
         f.editor.applyCellValue(0, 1, "P");
-        const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+        const observed = f.editor.saveChanges().then(
+          () => undefined,
+          (error) => error,
+        );
         try {
           await waitForGate(f.entered, observed);
           // Raw identity seam avoids the separate reactive rows watcher, whose
           // established policy is to discard edits on an actual replacement.
-          if (change === "replace-rows") toRaw(f.result.value).rows = [[1, "replacement"], [2, "pending"]];
+          if (change === "replace-rows")
+            toRaw(f.result.value).rows = [
+              [1, "replacement"],
+              [2, "pending"],
+            ];
           else if (change === "reactive-rows") {
-            f.result.value.rows = [[1, "replacement"], [2, "pending"]];
+            f.result.value.rows = [
+              [1, "replacement"],
+              [2, "pending"],
+            ];
             await nextTick();
             expect(f.editor.hasPendingChanges.value).toBe(false);
-          }
-          else if (change === "replace-columns") f.result.value.columns = ["id", "replacement"];
+          } else if (change === "replace-columns") f.result.value.columns = ["id", "replacement"];
           else if (change === "open-batch") {
             f.editor.beginBatch();
             f.editor.applyCellValue(0, 1, "R");
@@ -1246,7 +1277,10 @@ describe("useDataGridEditor saveChanges reload", () => {
       it(`preserves unchanged accepted ${boundary} dispatch`, async () => {
         const f = fixture(boundary);
         f.editor.applyCellValue(0, 1, "P");
-        const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+        const observed = f.editor.saveChanges().then(
+          () => undefined,
+          (error) => error,
+        );
         try {
           await waitForGate(f.entered, observed);
           f.release();
@@ -1265,8 +1299,12 @@ describe("useDataGridEditor saveChanges reload", () => {
     it.each(["returned-session", "unrelated-session"] as const)("handles initializer publication of %s", async (published) => {
       let release!: () => void;
       let enter!: () => void;
-      const gate = new Promise<void>((done) => { release = done; });
-      const entered = new Promise<void>((done) => { enter = done; });
+      const gate = new Promise<void>((done) => {
+        release = done;
+      });
+      const entered = new Promise<void>((done) => {
+        enter = done;
+      });
       const session = ref<string | undefined>(undefined);
       mocks.prepareDataGridSave.mockResolvedValue({ statements: [statement], rollbackStatements: [] });
       mocks.executeInManualTransaction.mockResolvedValue([{ affected_rows: 1 }]);
@@ -1275,12 +1313,18 @@ describe("useDataGridEditor saveChanges reload", () => {
         manualTransactionSessionIdRef: session,
         ensureManualTransactionSession: () => {
           enter();
-          return gate.then(() => { session.value = published; return "returned-session"; });
+          return gate.then(() => {
+            session.value = published;
+            return "returned-session";
+          });
         },
         resolveExistingRowItems: true,
       });
       f.editor.applyCellValue(0, 1, "P");
-      const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+      const observed = f.editor.saveChanges().then(
+        () => undefined,
+        (error) => error,
+      );
       try {
         await waitForGate(entered, observed);
         release();
@@ -1306,22 +1350,43 @@ describe("useDataGridEditor saveChanges reload", () => {
       it.each(["joined-prepare", "keyless-guards"] as const)(`stops subsequent %s calls after helper invalidation (restore target: ${restoreTarget})`, async (boundary) => {
         let release!: () => void;
         let enter!: () => void;
-        const gate = new Promise<void>((done) => { release = done; });
-        const entered = new Promise<void>((done) => { enter = done; });
+        const gate = new Promise<void>((done) => {
+          release = done;
+        });
+        const entered = new Promise<void>((done) => {
+          enter = done;
+        });
         const targets = [
           { tableMeta: { tableName: "users", primaryKeys: ["id"], columns: [] }, sourceColumns: ["id", "name", undefined, undefined] },
           { tableMeta: { tableName: "papers", primaryKeys: ["id"], columns: [] }, sourceColumns: [undefined, undefined, "id", "title"] },
         ];
         const prepared = { statements: [statement], rollbackStatements: [], keylessGuards: boundary === "keyless-guards" ? [keylessGuard, keylessGuard] : [] };
         mocks.prepareDataGridSave.mockResolvedValue(prepared);
-        if (boundary === "joined-prepare") mocks.prepareDataGridSave.mockResolvedValueOnce(prepared).mockImplementationOnce(() => { enter(); return gate.then(() => prepared); });
-        if (boundary === "keyless-guards") mocks.executeQuery.mockImplementationOnce(() => { enter(); return gate.then(() => ({ columns: ["matches"], rows: [[1]] })); });
+        if (boundary === "joined-prepare")
+          mocks.prepareDataGridSave.mockResolvedValueOnce(prepared).mockImplementationOnce(() => {
+            enter();
+            return gate.then(() => prepared);
+          });
+        if (boundary === "keyless-guards")
+          mocks.executeQuery.mockImplementationOnce(() => {
+            enter();
+            return gate.then(() => ({ columns: ["matches"], rows: [[1]] }));
+          });
         const f = createSaveTestEditor({
           joinedWriteTargets: boundary === "joined-prepare" ? targets : undefined,
           queryResult: { columns: ["id", "name", "paper_id", "title"], rows: [[1, "old", 20, "old"]] },
         });
-        f.editor.dirtyRows.value.set(0, new Map([[1, "P"], [3, "P"]]));
-        const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+        f.editor.dirtyRows.value.set(
+          0,
+          new Map([
+            [1, "P"],
+            [3, "P"],
+          ]),
+        );
+        const observed = f.editor.saveChanges().then(
+          () => undefined,
+          (error) => error,
+        );
         let restoration: Promise<void> | undefined;
         try {
           await waitForGate(entered, observed);
@@ -1333,9 +1398,11 @@ describe("useDataGridEditor saveChanges reload", () => {
             // Gate reaction resolves the API promise; helper then observes stale
             // identity. Restore in the following microtask, before outer await
             // continuation. A non-sticky outer recheck would accept partial work.
-            restoration = Promise.resolve().then(() => Promise.resolve().then(() => {
-              toRaw(f.result.value).rows = originalRows;
-            }));
+            restoration = Promise.resolve().then(() =>
+              Promise.resolve().then(() => {
+                toRaw(f.result.value).rows = originalRows;
+              }),
+            );
           }
           expect(await observed).toBeUndefined();
           await restoration;
@@ -1357,7 +1424,10 @@ describe("useDataGridEditor saveChanges reload", () => {
     it.each(["custom-confirm", "sql-confirm"] as const)("releases saved-insert locks when accepted %s becomes stale", async (boundary) => {
       const f = fixture(boundary);
       f.editor.newRows.value = [[3, "P"]];
-      const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+      const observed = f.editor.saveChanges().then(
+        () => undefined,
+        (error) => error,
+      );
       try {
         await waitForGate(f.entered, observed);
         f.editor.applyCellValue(-1, 1, "blocked");
@@ -1381,7 +1451,10 @@ describe("useDataGridEditor saveChanges reload", () => {
     it.each(["custom-preview", "sql-prepare", "manual-session", "keyless"] as const)("retires %s rejection without replaying queued Q over R", async (boundary) => {
       const f = fixture(boundary);
       f.editor.applyCellValue(0, 1, "P");
-      const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+      const observed = f.editor.saveChanges().then(
+        () => undefined,
+        (error) => error,
+      );
       try {
         await waitForGate(f.entered, observed);
         f.editor.startEdit(0, 1);
@@ -1407,13 +1480,16 @@ describe("useDataGridEditor saveChanges reload", () => {
   describe("later approval interruption cleanup", () => {
     // SOURCE ONLY: none of these regressions has been executed.
     const boundaries = ["custom-confirm", "sql-production", "sql-confirm"] as const;
-    type Boundary = typeof boundaries[number];
+    type Boundary = (typeof boundaries)[number];
     const statement = "UPDATE orders_test SET status='P' WHERE id=1";
 
     async function waitForApproval(started: Promise<void>, settledSave: Promise<unknown>) {
       const winner = await Promise.race([
         started.then(() => "approval"),
-        settledSave.then(() => "settled", () => "settled"),
+        settledSave.then(
+          () => "settled",
+          () => "settled",
+        ),
       ]);
       if (winner !== "approval") throw new Error("Approval not reached before save settled");
     }
@@ -1422,9 +1498,17 @@ describe("useDataGridEditor saveChanges reload", () => {
       let resolve!: (value: boolean) => void;
       let reject!: (reason: unknown) => void;
       let entered!: () => void;
-      const started = new Promise<void>((done) => { entered = done; });
-      const gate = new Promise<boolean>((yes, no) => { resolve = yes; reject = no; });
-      const approve = vi.fn(() => { entered(); return gate; });
+      const started = new Promise<void>((done) => {
+        entered = done;
+      });
+      const gate = new Promise<boolean>((yes, no) => {
+        resolve = yes;
+        reject = no;
+      });
+      const approve = vi.fn(() => {
+        entered();
+        return gate;
+      });
       const callback = ref<((request: import("@/composables/useDataGridEditor").DataGridSaveConfirmationRequest) => Promise<boolean>) | undefined>(boundary === "sql-production" ? undefined : approve);
       const customSave = vi.fn().mockResolvedValue(undefined);
       const preview = vi.fn().mockResolvedValue([statement]);
@@ -1454,7 +1538,10 @@ describe("useDataGridEditor saveChanges reload", () => {
         const failure = { reason: "synthetic approval rejection" };
         const save = f.editor.saveChanges();
         // Observe rejection immediately, including non-Error rejection identity.
-        const observed = save.then(() => undefined, (error) => error);
+        const observed = save.then(
+          () => undefined,
+          (error) => error,
+        );
         try {
           await waitForApproval(f.started, observed);
           expect(f.editor.isSaving.value).toBe(true);
@@ -1488,7 +1575,10 @@ describe("useDataGridEditor saveChanges reload", () => {
           const f = approvalFixture(boundary);
           f.editor.applyCellValue(0, 1, "P");
           const failure = new Error("approval unavailable");
-          const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+          const observed = f.editor.saveChanges().then(
+            () => undefined,
+            (error) => error,
+          );
           try {
             await waitForApproval(f.started, observed);
             f.editor.startEdit(0, 1);
@@ -1526,7 +1616,10 @@ describe("useDataGridEditor saveChanges reload", () => {
         const f = approvalFixture(boundary);
         f.editor.applyCellValue(0, 1, "P");
         const save = f.editor.saveChanges();
-        const observed = save.then(() => undefined, (error) => error);
+        const observed = save.then(
+          () => undefined,
+          (error) => error,
+        );
         try {
           await waitForApproval(f.started, observed);
           f.resolve(true);
@@ -1553,7 +1646,10 @@ describe("useDataGridEditor saveChanges reload", () => {
       if (boundary === "sql-confirm") f.callback.value = approval;
       else mocks.getConfig.mockReturnValue({ id: "connection-1", db_type: "mysql", is_production: true });
       const failure = new Error("retry approval rejected");
-      const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+      const observed = f.editor.saveChanges().then(
+        () => undefined,
+        (error) => error,
+      );
       try {
         await waitForApproval(f.started, observed);
         f.editor.startEdit(0, 1);
@@ -1588,7 +1684,10 @@ describe("useDataGridEditor saveChanges reload", () => {
       expect(f.editor.manualSaveRequired.value).toBe(true);
       if (boundary === "sql-confirm") f.callback.value = approval;
       else mocks.getConfig.mockReturnValue({ id: "connection-1", db_type: "mysql", is_production: true });
-      const observed = f.editor.saveChanges().then(() => undefined, (error) => error);
+      const observed = f.editor.saveChanges().then(
+        () => undefined,
+        (error) => error,
+      );
       try {
         await waitForApproval(f.started, observed);
         f.editor.startEdit(0, 1);
@@ -1642,13 +1741,13 @@ describe("useDataGridEditor saveChanges reload", () => {
     describe("initial approval target context", () => {
       // SOURCE ONLY / UNRUN: real composable entry points with synthetic targets.
       const paths = ["conditional", "custom"] as const;
-      function fixture(path: typeof paths[number], production = true) {
+      function fixture(path: (typeof paths)[number], production = true) {
         const database = ref<string | undefined>("fixture_a");
         const save = vi.fn().mockResolvedValue(undefined);
         mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Synthetic initial approval", db_type: "mysql", read_only: true, is_production: production });
         const { editor, emit } = createSaveTestEditor({ databaseRef: database, resolveExistingRowItems: true, customSaveHandler: path === "custom" ? { save } : undefined });
         if (path === "custom") editor.applyCellValue(0, 1, "changed");
-        const run = () => path === "conditional" ? editor.executeConditionalUpdate(conditionalSql) : editor.saveChanges();
+        const run = () => (path === "conditional" ? editor.executeConditionalUpdate(conditionalSql) : editor.saveChanges());
         return { editor, emit, database, run, dispatch: path === "conditional" ? mocks.executeConditionalUpdate : save };
       }
 
@@ -1663,7 +1762,10 @@ describe("useDataGridEditor saveChanges reload", () => {
           return production.promise;
         });
         // Attach both outcomes immediately, including on the broken baseline.
-        const observed = run().then(() => ({ kind: "settled" as const }), (error: unknown) => ({ kind: "rejected" as const, error }));
+        const observed = run().then(
+          () => ({ kind: "settled" as const }),
+          (error: unknown) => ({ kind: "rejected" as const, error }),
+        );
         try {
           database.value = "fixture_b";
           unlock.resolve(true);
@@ -1703,7 +1805,10 @@ describe("useDataGridEditor saveChanges reload", () => {
           entered.resolve(true);
           return production.promise;
         });
-        const observed = run().then(() => ({ kind: "settled" as const }), (error: unknown) => ({ kind: "rejected" as const, error }));
+        const observed = run().then(
+          () => ({ kind: "settled" as const }),
+          (error: unknown) => ({ kind: "rejected" as const, error }),
+        );
         try {
           expect(dispatch).not.toHaveBeenCalled();
           unlock.resolve(true);
@@ -1796,11 +1901,11 @@ describe("useDataGridEditor saveChanges reload", () => {
     it("shares the reservation with conditional-update preflight before a competing save", async () => {
       const unlock = deferredBoolean();
       mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(unlock.promise);
-      const { editor } = createSaveTestEditor();
+      const { editor } = createSaveTestEditor({ resolveExistingRowItems: true });
       const conditional = editor.executeConditionalUpdate(conditionalSql);
       let competing: Promise<void> | undefined;
       try {
-        editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+        editor.applyCellValue(0, 1, "changed");
         competing = editor.saveChanges();
         await nextTick();
         expect.soft(mocks.ensureReadOnlyWriteAccess).toHaveBeenCalledOnce();
@@ -1861,7 +1966,10 @@ describe("useDataGridEditor saveChanges reload", () => {
       mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
       const save = vi.fn().mockResolvedValue(undefined);
       const { editor } = createSaveTestEditor({ customSaveHandler: { save, supportsInsert: true }, resolveNewRowItems: true });
-      editor.newRows.value = [[3, "P"], [null, null]];
+      editor.newRows.value = [
+        [3, "P"],
+        [null, null],
+      ];
       if (mutation === "undo") editor.applyCellValue(-1, 1, "before approval");
       const previousRow = editor.newRows.value[0];
       const first = editor.saveChanges();
@@ -1892,7 +2000,10 @@ describe("useDataGridEditor saveChanges reload", () => {
       mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
       const queryResult: { columns: string[]; rows: CellValue[][] } = {
         columns: ["id", "status"],
-        rows: [[1, "pending"], [2, "pending"]],
+        rows: [
+          [1, "pending"],
+          [2, "pending"],
+        ],
       };
       const { editor } = createSaveTestEditor({ queryResult, resolveExistingRowItems: true });
       if (boundary.startsWith("save")) editor.applyCellValue(0, 1, "changed");
@@ -1952,13 +2063,13 @@ describe("useDataGridEditor saveChanges reload", () => {
     it.each(["unlock", "custom-production"] as const)("releases a declined %s preflight without dispatching", async (boundary) => {
       const gate = deferredBoolean();
       const save = vi.fn().mockResolvedValue(undefined);
-      const { editor } = createSaveTestEditor({ customSaveHandler: boundary === "custom-production" ? { save } : undefined });
+      const { editor } = createSaveTestEditor({ resolveExistingRowItems: true, customSaveHandler: boundary === "custom-production" ? { save } : undefined });
       if (boundary === "unlock") mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
       else {
         mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Production fixture", db_type: "mysql", is_production: true });
         mocks.requestProductionConfirmation.mockReturnValueOnce(gate.promise);
       }
-      editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+      editor.applyCellValue(0, 1, "changed");
       const first = editor.saveChanges();
       gate.resolve(false);
       await first;
@@ -1974,13 +2085,13 @@ describe("useDataGridEditor saveChanges reload", () => {
       const failure = new Error("synthetic preflight rejection");
       const gate = deferredBoolean();
       const save = vi.fn().mockResolvedValue(undefined);
-      const { editor } = createSaveTestEditor({ customSaveHandler: boundary === "custom-production" ? { save } : undefined });
+      const { editor } = createSaveTestEditor({ resolveExistingRowItems: true, customSaveHandler: boundary === "custom-production" ? { save } : undefined });
       if (boundary === "unlock") mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
       else {
         mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Production fixture", db_type: "mysql", is_production: true });
         mocks.requestProductionConfirmation.mockReturnValueOnce(gate.promise);
       }
-      editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+      editor.applyCellValue(0, 1, "changed");
       const first = editor.saveChanges();
       const rejection = expect(first).rejects.toBe(failure);
       gate.reject(failure);
@@ -2017,8 +2128,8 @@ describe("useDataGridEditor saveChanges reload", () => {
       const editable = ref(true);
       const gate = deferredBoolean();
       mocks.ensureReadOnlyWriteAccess.mockReturnValueOnce(gate.promise);
-      const { editor } = createSaveTestEditor({ editable });
-      editor.dirtyRows.value.set(0, new Map([[1, "changed"]]));
+      const { editor } = createSaveTestEditor({ editable, resolveExistingRowItems: true });
+      editor.applyCellValue(0, 1, "changed");
       const first = editor.saveChanges();
       editable.value = false;
       gate.resolve(true);
@@ -2037,7 +2148,10 @@ describe("useDataGridEditor saveChanges reload", () => {
       mocks.executeBatch.mockRejectedValueOnce(failure);
       const queryResult: { columns: string[]; rows: CellValue[][] } = {
         columns: ["id", "status"],
-        rows: [[1, "pending"], [2, "pending"]],
+        rows: [
+          [1, "pending"],
+          [2, "pending"],
+        ],
       };
       const { editor } = createSaveTestEditor({ queryResult, quickEntry: true, resolveExistingRowItems: true });
       editor.applyCellValue(0, 1, "changed");
@@ -2258,8 +2372,12 @@ describe("useDataGridEditor saveChanges reload", () => {
       clearDataGridPendingSnapshot(key);
       let historyStarted!: () => void;
       let releaseHistory!: () => void;
-      const started = new Promise<void>((resolve) => { historyStarted = resolve; });
-      const blocked = new Promise<void>((resolve) => { releaseHistory = resolve; });
+      const started = new Promise<void>((resolve) => {
+        historyStarted = resolve;
+      });
+      const blocked = new Promise<void>((resolve) => {
+        releaseHistory = resolve;
+      });
       mocks.addHistory.mockImplementationOnce(async () => {
         historyStarted();
         await blocked;
@@ -2300,8 +2418,12 @@ describe("useDataGridEditor saveChanges reload", () => {
       expect(editor.manualSaveRequired.value).toBe(true);
       let retryStarted!: () => void;
       let releaseRetry!: () => void;
-      const started = new Promise<void>((resolve) => { retryStarted = resolve; });
-      const blocked = new Promise<void>((resolve) => { releaseRetry = resolve; });
+      const started = new Promise<void>((resolve) => {
+        retryStarted = resolve;
+      });
+      const blocked = new Promise<void>((resolve) => {
+        releaseRetry = resolve;
+      });
       mocks.executeBatch.mockImplementationOnce(async () => {
         retryStarted();
         await blocked;
@@ -2353,8 +2475,12 @@ describe("useDataGridEditor saveChanges reload", () => {
       expect(mocks.executeBatch).toHaveBeenNthCalledWith(1, "connection-1", "app", [updateSql], undefined);
       let retryStarted!: () => void;
       let releaseRetry!: () => void;
-      const started = new Promise<void>((resolve) => { retryStarted = resolve; });
-      const blocked = new Promise<void>((resolve) => { releaseRetry = resolve; });
+      const started = new Promise<void>((resolve) => {
+        retryStarted = resolve;
+      });
+      const blocked = new Promise<void>((resolve) => {
+        releaseRetry = resolve;
+      });
       mocks.executeBatch.mockImplementationOnce(async () => {
         retryStarted();
         await blocked;
@@ -2980,7 +3106,10 @@ describe("useDataGridEditor saveChanges reload", () => {
     function deferred<T>() {
       let resolve!: (value: T) => void;
       let reject!: (error: unknown) => void;
-      const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+      const promise = new Promise<T>((done, fail) => {
+        resolve = done;
+        reject = fail;
+      });
       // Observe rejection immediately, including a gate released during cleanup.
       void promise.catch(() => undefined);
       return { promise, resolve, reject };
@@ -3034,15 +3163,21 @@ describe("useDataGridEditor saveChanges reload", () => {
           const connectionId = ref<string | undefined>("connection-A");
           const database = ref<string | undefined>("database-A");
           const tableMeta = ref<import("@/composables/useDataGridEditor").UseDataGridEditorOptions["tableMeta"]["value"]>({
-            schema: "schema-A", tableName: "table-A", columns: [], primaryKeys: [],
+            schema: "schema-A",
+            tableName: "table-A",
+            columns: [],
+            primaryKeys: [],
           });
           const config = { id: "connection-A", name: "Connection A", db_type: "mysql" };
           const joinedTargets = [
             { tableMeta: { database: "database-A", schema: "schema-A", tableName: "table-A", columns: [], primaryKeys: [] }, sourceColumns: [] },
             { tableMeta: { database: "database-A", schema: "schema-A", tableName: "joined-A", columns: [], primaryKeys: [] }, sourceColumns: [] },
           ];
-          mocks.getConfig.mockImplementation((id: string) => id === "connection-A" ? config : { id, name: "Connection B", db_type: "mysql" });
-          mocks.executeConditionalUpdate.mockImplementationOnce(() => { apiEntered.resolve(); return apiGate.promise; });
+          mocks.getConfig.mockImplementation((id: string) => (id === "connection-A" ? config : { id, name: "Connection B", db_type: "mysql" }));
+          mocks.executeConditionalUpdate.mockImplementationOnce(() => {
+            apiEntered.resolve();
+            return apiGate.promise;
+          });
           mocks.addHistory.mockResolvedValue(undefined);
           const { editor } = createSaveTestEditor({
             connectionIdRef: connectionId,
@@ -3088,17 +3223,19 @@ describe("useDataGridEditor saveChanges reload", () => {
             else apiGate.reject(sqlError);
             expect(await observed).toEqual({ status: "fulfilled", value: outcome === "success" ? { affectedRows: 7 } : null });
             expect(mocks.addHistory).toHaveBeenCalledTimes(1);
-            expect(mocks.addHistory).toHaveBeenCalledWith(expect.objectContaining({
-              connection_id: "connection-A",
-              connection_name: "Connection A",
-              database: "database-A",
-              target: transition === "joined-in-place" ? "database-A.schema-A.table-A, database-A.schema-A.joined-A" : "schema-A.table-A",
-              sql: statement,
-              operation: "UPDATE",
-              success: outcome === "success",
-              affected_rows: outcome === "success" ? 7 : undefined,
-              error: outcome === "success" ? undefined : "Duplicate entry '1' for key 'PRIMARY'",
-            }));
+            expect(mocks.addHistory).toHaveBeenCalledWith(
+              expect.objectContaining({
+                connection_id: "connection-A",
+                connection_name: "Connection A",
+                database: "database-A",
+                target: transition === "joined-in-place" ? "database-A.schema-A.table-A, database-A.schema-A.joined-A" : "schema-A.table-A",
+                sql: statement,
+                operation: "UPDATE",
+                success: outcome === "success",
+                affected_rows: outcome === "success" ? 7 : undefined,
+                error: outcome === "success" ? undefined : "Duplicate entry '1' for key 'PRIMARY'",
+              }),
+            );
             expect(JSON.parse(mocks.addHistory.mock.calls[0][0].details_json)).toMatchObject({
               schema: "schema-A",
               table: "table-A",
@@ -3119,7 +3256,10 @@ describe("useDataGridEditor saveChanges reload", () => {
     function deferred<T>() {
       let resolve!: (value: T) => void;
       let reject!: (error: unknown) => void;
-      const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+      const promise = new Promise<T>((done, fail) => {
+        resolve = done;
+        reject = fail;
+      });
       // Observe rejection immediately, including a gate released during cleanup.
       void promise.catch(() => undefined);
       return { promise, resolve, reject };
@@ -3159,10 +3299,19 @@ describe("useDataGridEditor saveChanges reload", () => {
             },
           });
           mocks.executeConditionalUpdate
-            .mockImplementationOnce(() => { apiEntered.resolve(); return apiGate.promise; })
-            .mockImplementationOnce(() => { nextApiEntered.resolve(); return nextApiGate.promise; });
+            .mockImplementationOnce(() => {
+              apiEntered.resolve();
+              return apiGate.promise;
+            })
+            .mockImplementationOnce(() => {
+              nextApiEntered.resolve();
+              return nextApiGate.promise;
+            });
           mocks.addHistory
-            .mockImplementationOnce(() => { historyEntered.resolve(); return historyGate.promise; })
+            .mockImplementationOnce(() => {
+              historyEntered.resolve();
+              return historyGate.promise;
+            })
             .mockResolvedValue(undefined);
           mocks.cancelConditionalUpdate.mockResolvedValue({ requested: true, terminal: true });
           const prepareFullReload = vi.fn();
@@ -3178,12 +3327,14 @@ describe("useDataGridEditor saveChanges reload", () => {
             else apiGate.reject(sqlError);
             await waitForEntry(historyEntered.promise, oldObserved);
             expect(mocks.addHistory).toHaveBeenCalledTimes(1);
-            expect(mocks.addHistory).toHaveBeenCalledWith(expect.objectContaining({
-              sql: statement,
-              success: outcome === "success",
-              affected_rows: outcome === "success" ? 7 : undefined,
-              error: outcome === "success" ? undefined : "Duplicate entry '1' for key 'PRIMARY'",
-            }));
+            expect(mocks.addHistory).toHaveBeenCalledWith(
+              expect.objectContaining({
+                sql: statement,
+                success: outcome === "success",
+                affected_rows: outcome === "success" ? 7 : undefined,
+                error: outcome === "success" ? undefined : "Duplicate entry '1' for key 'PRIMARY'",
+              }),
+            );
             expect(editor.isConditionalUpdateActive.value).toBe(true);
             expect(editor.isSaving.value).toBe(true);
             expect(prepareFullReload).not.toHaveBeenCalled();
@@ -3246,7 +3397,10 @@ describe("useDataGridEditor saveChanges reload", () => {
     function deferred<T>() {
       let resolve!: (value: T) => void;
       let reject!: (error: unknown) => void;
-      const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+      const promise = new Promise<T>((done, fail) => {
+        resolve = done;
+        reject = fail;
+      });
       void promise.catch(() => undefined);
       return { promise, resolve, reject };
     }
@@ -3272,10 +3426,19 @@ describe("useDataGridEditor saveChanges reload", () => {
         const nextApiEntered = deferred<void>();
         const nextApiGate = deferred<{ affected_rows: number }>();
         mocks.executeConditionalUpdate
-          .mockImplementationOnce(() => { apiEntered.resolve(); return apiGate.promise; })
-          .mockImplementationOnce(() => { nextApiEntered.resolve(); return nextApiGate.promise; });
+          .mockImplementationOnce(() => {
+            apiEntered.resolve();
+            return apiGate.promise;
+          })
+          .mockImplementationOnce(() => {
+            nextApiEntered.resolve();
+            return nextApiGate.promise;
+          });
         mocks.cancelConditionalUpdate
-          .mockImplementationOnce(() => { cancelEntered.resolve(); return cancelGate.promise; })
+          .mockImplementationOnce(() => {
+            cancelEntered.resolve();
+            return cancelGate.promise;
+          })
           .mockResolvedValue({ requested: true, terminal: true });
         mocks.addHistory.mockResolvedValue(undefined);
         const prepareFullReload = vi.fn();
