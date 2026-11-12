@@ -895,7 +895,11 @@ backend behavior. DBX reports this limitation in the plugin catalog.
 performs connection resolution there. External MCP remains an additional
 consumer of the same registry, with its own exposure and policy checks. CLI
 automation alone does not enable external MCP exposure; that surface requires
-the plugin's explicit `mcp` contribution with `external_tools: true`.
+the plugin's explicit `mcp` contribution with `external_tools: true`. For older
+plugins with no `mcp` contribution, the MCP host operator can opt exact ids into
+read-only compatibility using `DBX_MCP_READONLY_PLUGIN_IDS`; only declared
+read-only tools become visible and all MCP connection/tool scope checks remain
+active. An explicit author opt-out still wins.
 
 Local CLI invocations own their sidecar processes and release them on exit.
 Operations that depend on a process-local job id, cursor or session across

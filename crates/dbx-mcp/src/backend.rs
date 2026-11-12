@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -449,7 +449,8 @@ pub trait DbxBackend: Send + Sync {
     /// Tool-capable plugins for the external `dbx` MCP surface, with their
     /// discovered `mcp/tools` listings. Author opt-in: installed +
     /// compatible + backend entrypoint + a manifest `external_tools: true`
-    /// declaration. An error means plugin discovery is unavailable; the
+    /// declaration, or an explicit process-scoped read-only legacy grant.
+    /// An error means plugin discovery is unavailable; the
     /// server retains its static tools.
     async fn list_plugin_mcp_tools(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
         let _ = self;
@@ -801,6 +802,56 @@ fn plugin_lacks_mcp_surface(err: &str) -> bool {
 /// cannot stall `tools/list` beyond a few seconds.
 const PLUGIN_TOOLS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// A process-scoped operator grant for read-only tools of older plugins whose
+/// manifests predate external MCP exposure. Explicit author opt-outs still win.
+fn readonly_plugin_ids(value: Option<&str>) -> Result<HashSet<String>, String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            if id.len() > 128
+                || !id.as_bytes()[0].is_ascii_alphanumeric()
+                || !id.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+                })
+            {
+                return Err(
+                    "DBX_MCP_READONLY_PLUGIN_IDS requires comma-separated exact plugin ids; wildcards are not allowed"
+                        .to_string(),
+                );
+            }
+            Ok(id.to_string())
+        })
+        .collect()
+}
+
+fn plugin_mcp_probe_mode(manifest: &dbx_core::plugins::PluginManifest, readonly_ids: &HashSet<String>) -> Option<bool> {
+    match manifest.mcp_contribution() {
+        Some(contribution) if contribution.external_tools => Some(false),
+        Some(_) => None,
+        None if readonly_ids.contains(&manifest.id) => Some(true),
+        None => None,
+    }
+}
+
+fn plugin_operation_listing(
+    value: &Value,
+    cli: bool,
+    readonly_override: bool,
+) -> Vec<dbx_core::ai::plugin_tools::RawPluginTool> {
+    let mut tools = dbx_core::ai::plugin_tools::parse_tool_list_with_limit(
+        value,
+        if cli || readonly_override { usize::MAX } else { dbx_core::ai::plugin_tools::MAX_TOOLS_PER_PLUGIN },
+    );
+    if readonly_override && !cli {
+        tools.retain(|tool| tool.read_only);
+        tools.truncate(dbx_core::ai::plugin_tools::MAX_TOOLS_PER_PLUGIN);
+    }
+    tools
+}
+
 impl LocalBackend {
     async fn notify_connections_changed(&self) {
         // Persistence has already succeeded. A closed or unresponsive desktop
@@ -1094,7 +1145,8 @@ impl LocalBackend {
 
     /// Opt-in, parallel `mcp/tools` discovery for the external surface:
     /// installed + compatible + backend plugins whose manifest declares
-    /// `external_tools: true`. A plugin that fails to list skips itself
+    /// `external_tools: true`, plus process-granted read-only legacy plugins.
+    /// A plugin that fails to list skips itself
     /// (with a warning) instead of failing the whole `tools/list`.
     pub async fn detect_plugin_tool_providers(&self) -> Result<Vec<crate::plugin_tools::PluginToolProvider>, String> {
         self.detect_plugin_tool_providers_for_surface(false).await
@@ -1113,19 +1165,30 @@ impl LocalBackend {
         plugin_id: Option<&str>,
     ) -> Result<(Vec<crate::plugin_tools::PluginToolProvider>, HashMap<String, String>), String> {
         let plugins = self.state.plugins.list_installed()?;
-        let candidates: Vec<(String, String)> = plugins
+        let readonly_ids = if cli {
+            HashSet::new()
+        } else {
+            readonly_plugin_ids(std::env::var("DBX_MCP_READONLY_PLUGIN_IDS").ok().as_deref()).unwrap_or_else(|error| {
+                log::warn!("{error}");
+                HashSet::new()
+            })
+        };
+        let candidates: Vec<(String, String, bool)> = plugins
             .into_iter()
             .filter(|plugin| {
                 plugin.compatibility.compatible
                     && plugin.manifest.backend_entrypoint().is_some()
-                    && (cli || !plugin.manifest.external_tools_excluded())
                     && plugin_id.is_none_or(|requested| plugin.manifest.id == requested)
             })
-            .map(|plugin| (plugin.manifest.id.clone(), plugin.manifest.name.clone()))
+            .filter_map(|plugin| {
+                let readonly_override =
+                    if cli { false } else { plugin_mcp_probe_mode(&plugin.manifest, &readonly_ids)? };
+                Some((plugin.manifest.id.clone(), plugin.manifest.name.clone(), readonly_override))
+            })
             .collect();
         // Probe every candidate's sidecar concurrently; the probes share the
         // plugin sidecar sessions, so repeated listings are cheap.
-        let probes = candidates.into_iter().map(|(plugin_id, plugin_name)| {
+        let probes = candidates.into_iter().map(|(plugin_id, plugin_name, readonly_override)| {
             let state = Arc::clone(&self.state);
             async move {
                 let listing = state
@@ -1138,18 +1201,15 @@ impl LocalBackend {
                         Some(PLUGIN_TOOLS_PROBE_TIMEOUT),
                     )
                     .await;
-                (plugin_id, plugin_name, listing)
+                (plugin_id, plugin_name, readonly_override, listing)
             }
         });
         let mut providers = Vec::new();
         let mut diagnostics = HashMap::new();
-        for (plugin_id, plugin_name, listing) in futures::future::join_all(probes).await {
+        for (plugin_id, plugin_name, readonly_override, listing) in futures::future::join_all(probes).await {
             match listing {
                 Ok(value) => {
-                    let tools = dbx_core::ai::plugin_tools::parse_tool_list_with_limit(
-                        &value,
-                        if cli { usize::MAX } else { dbx_core::ai::plugin_tools::MAX_TOOLS_PER_PLUGIN },
-                    );
+                    let tools = plugin_operation_listing(&value, cli, readonly_override);
                     if tools.is_empty() {
                         log::debug!("[mcp] plugin {plugin_id} exposes no MCP tools");
                     } else {
@@ -3380,6 +3440,50 @@ mod tests {
             group_policies: Vec::new(),
             query_timeout_secs: None,
         }
+    }
+
+    #[test]
+    fn legacy_readonly_plugin_grants_require_exact_valid_ids() {
+        let ids = readonly_plugin_ids(Some(" com.astergaze.nats, vendor.metrics,com.astergaze.nats ")).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(readonly_plugin_ids(None).unwrap().is_empty());
+        for invalid in ["*", "vendor.*", "../plugin", ".hidden", "Vendor.Plugin"] {
+            assert!(readonly_plugin_ids(Some(invalid)).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn legacy_readonly_plugin_grants_preserve_author_opt_outs() {
+        let ids = readonly_plugin_ids(Some("vendor.metrics")).unwrap();
+        let manifest = |external: Option<bool>| {
+            let mut value = json!({"id":"vendor.metrics","name":"Metrics","version":"1.0.0"});
+            if let Some(external) = external {
+                value["contributions"] = json!([{"type":"mcp","id":"vendor.metrics.mcp","external_tools":external}]);
+            }
+            serde_json::from_value::<dbx_core::plugins::PluginManifest>(value).unwrap()
+        };
+        assert_eq!(plugin_mcp_probe_mode(&manifest(None), &HashSet::new()), None);
+        assert_eq!(plugin_mcp_probe_mode(&manifest(None), &ids), Some(true));
+        assert_eq!(plugin_mcp_probe_mode(&manifest(Some(false)), &ids), None);
+        assert_eq!(plugin_mcp_probe_mode(&manifest(Some(true)), &HashSet::new()), Some(false));
+    }
+
+    #[test]
+    fn legacy_readonly_plugin_catalog_hides_writes_before_the_surface_limit() {
+        let mut tools = (0..80)
+            .map(|index| json!({"name":format!("write_{index}"),"annotations":{"readOnlyHint":false}}))
+            .collect::<Vec<_>>();
+        tools.push(json!({"name":"unknown_risk"}));
+        tools.push(json!({"name":"inspect","annotations":{"readOnlyHint":true}}));
+        let listing = json!({"tools":tools});
+        let readonly = plugin_operation_listing(&listing, false, true);
+        assert_eq!(readonly.len(), 1);
+        assert_eq!(readonly[0].name, "inspect");
+        assert_eq!(
+            plugin_operation_listing(&listing, true, true).len(),
+            82,
+            "CLI has its own permissions and complete catalog"
+        );
     }
 
     #[test]
