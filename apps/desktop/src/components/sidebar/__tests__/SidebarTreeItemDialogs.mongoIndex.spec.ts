@@ -1,20 +1,154 @@
 // @vitest-environment happy-dom
 
-import { createApp, defineComponent, h, nextTick, reactive } from "vue";
+import { createApp, defineComponent, h, nextTick, reactive, ref } from "vue";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import SidebarTreeItemDialogs from "../SidebarTreeItemDialogs.vue";
+import { connectionDeleteTargetSnapshot, resetSidebarTreeDialogState, showDeleteConfirm } from "../sidebarTreeDialogState";
 
 const mountedApps: ReturnType<typeof createApp>[] = [];
 
 afterEach(() => {
   for (const app of mountedApps.splice(0)) app.unmount();
   document.body.innerHTML = "";
+  resetSidebarTreeDialogState();
+});
+
+function closedDialogState() {
+  return {
+    showDeleteConfirm: false,
+    showMoveToNewGroupDialog: false,
+    showDeleteGroupConfirm: false,
+    showRenameObjectDialog: false,
+    showStructurePreviewDialog: false,
+    showStructureDocCopyDialog: false,
+    showDuplicateDialog: false,
+    showPasteDialog: false,
+    showCreateDatabaseDialog: false,
+    showCreateDatabasePreviewDialog: false,
+    showEditDatabasePropertiesDialog: false,
+    showCreateNacosNamespaceDialog: false,
+    showEditNacosNamespaceDialog: false,
+    showDeleteNacosNamespaceConfirm: false,
+    showRenameMongoCollectionDialog: false,
+    showCloneMongoCollectionDialog: false,
+    showCreateMongoIndexDialog: false,
+    showCreateMeilisearchIndexDialog: false,
+    showMongoIndexManagerDialog: false,
+    showRedisDatabaseAliasDialog: false,
+    showCreateSchemaDialog: false,
+    showEditSchemaCommentDialog: false,
+    showCompileErrorDialog: false,
+  };
+}
+
+describe("SidebarTreeItemDialogs connection deletion cancellation", () => {
+  it.each(["cancel", "close", "escape", "outside"])("clears the captured targets when dismissed using %s", async (dismissal) => {
+    const node = { id: "conn-1", label: "Connection", type: "connection" as const, connectionId: "conn-1" };
+    const confirmDelete = vi.fn();
+    connectionDeleteTargetSnapshot.value = [node];
+    showDeleteConfirm.value = true;
+    const controller = reactive({
+      ...closedDialogState(),
+      node,
+      t: (key: string) => key,
+      highlight: (value: string) => value,
+      showDeleteConfirm,
+      connectionDeleteConfirmMessage: () => "confirm",
+      connectionDeleteMenuLabel: () => "delete",
+      confirmDelete,
+    });
+    const app = createApp(defineComponent({ setup: () => () => h(SidebarTreeItemDialogs, { controller }) }));
+    mountedApps.push(app);
+    app.use(i18n);
+    app.mount(document.createElement("div"));
+    await nextTick();
+
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    if (dismissal === "cancel") {
+      Array.from(dialog!.querySelectorAll("button"))
+        .find((button) => button.textContent?.trim() === "dangerDialog.cancel")!
+        .click();
+    } else if (dismissal === "close") {
+      dialog!.querySelector<HTMLButtonElement>('[data-slot="dialog-close"]')!.click();
+    } else if (dismissal === "escape") {
+      dialog!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    } else {
+      // DismissableLayer registers its document listener after mounting.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerType: "mouse", button: 0 }));
+    }
+
+    await vi.waitFor(() => {
+      expect(showDeleteConfirm.value).toBe(false);
+      expect(connectionDeleteTargetSnapshot.value).toEqual([]);
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+    });
+    expect(confirmDelete).not.toHaveBeenCalled();
+  });
+
+  it.each(["success", "failure"])("retains the dialog controller until asynchronous confirmation settles with %s", async (outcome) => {
+    const node = { id: "conn-1", label: "Connection", type: "connection" as const, connectionId: "conn-1" };
+    let finishRemoval!: () => void;
+    let failRemoval!: (error: Error) => void;
+    const removal = new Promise<void>((resolve, reject) => {
+      finishRemoval = resolve;
+      failRemoval = reject;
+    });
+    const controller = reactive({
+      ...closedDialogState(),
+      node,
+      t: (key: string) => key,
+      highlight: (value: string) => value,
+      showDeleteConfirm,
+      connectionDeleteConfirmMessage: () => "confirm",
+      connectionDeleteMenuLabel: () => "delete",
+      confirmDelete: async () => {
+        showDeleteConfirm.value = false;
+        connectionDeleteTargetSnapshot.value = [];
+        try {
+          await removal;
+        } catch {
+          connectionDeleteTargetSnapshot.value = [node];
+          showDeleteConfirm.value = true;
+        }
+      },
+    });
+    connectionDeleteTargetSnapshot.value = [node];
+    showDeleteConfirm.value = true;
+    const mounted = ref(true);
+    const closed = vi.fn(() => (mounted.value = false));
+    // ConnectionTree drops the controller when the dialog emits `closed`.
+    const app = createApp(defineComponent({ setup: () => () => (mounted.value ? h(SidebarTreeItemDialogs, { controller, onClosed: closed }) : null) }));
+    mountedApps.push(app);
+    app.use(i18n);
+    app.mount(document.createElement("div"));
+    await nextTick();
+    Array.from(document.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "delete")!
+      .click();
+
+    await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull());
+    expect(closed).not.toHaveBeenCalled();
+    if (outcome === "failure") {
+      failRemoval(new Error("persist failed"));
+      await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')).not.toBeNull());
+      expect(connectionDeleteTargetSnapshot.value.map((target) => target.connectionId)).toEqual([node.connectionId]);
+      Array.from(document.querySelectorAll("button"))
+        .find((button) => button.textContent?.trim() === "dangerDialog.cancel")!
+        .click();
+    } else {
+      finishRemoval();
+    }
+    await vi.waitFor(() => expect(closed).toHaveBeenCalledOnce());
+  });
 });
 
 describe("SidebarTreeItemDialogs MongoDB index form", () => {
   it("keeps the group deletion dialog locked while deletion is running", async () => {
     const controller = reactive({
+      ...closedDialogState(),
       node: { id: "group-parent", label: "Parent", type: "connection-group" },
       t: (key: string) => key,
       highlight: (value: string) => value,
@@ -76,6 +210,7 @@ describe("SidebarTreeItemDialogs MongoDB index form", () => {
     const confirmCreateMongoIndex = vi.fn();
     const closed = vi.fn();
     const controller = reactive({
+      ...closedDialogState(),
       node: { id: "mongo:app:users:__indexes", label: "索引", type: "group-indexes", database: "app", tableName: "users" },
       t: (key: string) => key,
       highlight: (value: string) => value,

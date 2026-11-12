@@ -78,7 +78,9 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
   }
 
   function connectionDeleteTargets() {
-    if (showDeleteConfirm.value && connectionDeleteTargetSnapshot.value.length) return connectionDeleteTargetSnapshot.value;
+    // The dialog closes before asynchronous cleanup finishes; always honor the
+    // target captured when the user confirmed instead of recomputing selection.
+    if (connectionDeleteTargetSnapshot.value.length) return connectionDeleteTargetSnapshot.value;
     return selectedConnectionDeleteTargets(activeNode.value, selectedTreeNodesInVisibleOrder());
   }
 
@@ -104,14 +106,25 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
   function deleteConnection() {
     const targets = selectedConnectionDeleteTargets(activeNode.value, selectedTreeNodesInVisibleOrder());
     if (!targets.length) return;
-    connectionDeleteTargetSnapshot.value = targets.slice();
+    connectionDeleteTargetSnapshot.value = targets.map((target) => ({ ...target }));
     showDeleteConfirm.value = true;
   }
 
   async function confirmDelete() {
-    const targets = connectionDeleteTargets();
-    if (!targets.length) return;
+    // A cancelled or already-consumed confirmation must never fall back to the
+    // current selection, which may now point at an unrelated connection.
+    const targets = connectionDeleteTargetSnapshot.value.slice();
+    if (!targets.length) {
+      showDeleteConfirm.value = false;
+      return;
+    }
     const connectionIds = targets.map((target) => target.connectionId);
+    // Capture the confirmed targets before closing the dialog. The removal also
+    // flushes tab state, so the persisted deletion must not leave a modal open
+    // while that unrelated cleanup is still settling.
+    showDeleteConfirm.value = false;
+    connectionDeleteTargetSnapshot.value = [];
+    const clearedSnapshot = connectionDeleteTargetSnapshot.value;
     try {
       await connectionStore.removeConnections(connectionIds);
       options.releaseActiveNodeReference(targets.map((target) => target.id));
@@ -125,6 +138,13 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
       }
       toast(targets.length > 1 ? t("connection.deletedSelected", { count: targets.length }) : t("connection.deleted"), 2000);
     } catch (error: any) {
+      // Keep the exact confirmed target available for a retry when persistence
+      // fails. Snapshot identity also detects a newer dialog that has already
+      // been cancelled or confirmed by the time this request fails.
+      if (!showDeleteConfirm.value && connectionDeleteTargetSnapshot.value === clearedSnapshot) {
+        connectionDeleteTargetSnapshot.value = targets;
+        showDeleteConfirm.value = true;
+      }
       toast(t("connection.saveFailed", { message: error?.message || String(error) }), 5000);
     }
   }

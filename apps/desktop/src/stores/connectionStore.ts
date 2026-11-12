@@ -698,6 +698,13 @@ export const useConnectionStore = defineStore("connection", () => {
   let nextLocalConnectionAttempt = 0;
   let beforeConnectHandler: BeforeConnectHandler | null = null;
   let initFromDiskPromise: Promise<void> | null = null;
+  // An in-flight disk reload may have started before a local connection
+  // mutation completed. Do not let that older snapshot overwrite the local
+  // result when it eventually resolves.
+  let localConnectionMutationRevision = 0;
+  let connectionDeletionsInFlight = 0;
+  let connectionReloadPersistPromise: Promise<void> | null = null;
+  let connectionDeletionQueue = Promise.resolve();
 
   // Loading/stale ownership stays on TreeNodeLoadRegistry (per-node generation), not the
   // coordinator: many specialty loaders bypass runTreeMetadataLoad, and coordinator would
@@ -3964,27 +3971,43 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
-  async function removeConnections(ids: Iterable<string>) {
-    const connectionIds = [...new Set(ids)].filter((id) => connections.value.some((c) => c.id === id));
-    if (!connectionIds.length) return;
+  function enqueueConnectionDeletion<T>(remove: () => Promise<T>): Promise<T> {
+    // A second confirmation can arrive while the first save is pending. Build
+    // its snapshot only after the earlier removal has committed to memory.
+    const removal = connectionDeletionQueue.then(remove);
+    connectionDeletionQueue = removal.then(
+      () => undefined,
+      () => undefined,
+    );
+    return removal;
+  }
 
-    const removedIds = new Set(connectionIds);
-    const oneTimeIds = connectionIds.filter((id) => getConfig(id)?.one_time === true);
-    // 连接配置在 applyConnectionRemoval 后就读不到了，先抓取快照供删除策略使用。
-    const removedConfigs = connectionIds.map((id) => getConfig(id)).filter((config): config is ConnectionConfig => !!config);
-    const nextConnections = connections.value.filter((c) => !removedIds.has(c.id));
-    let nextLayout = sidebarLayout.value;
-    for (const id of removedIds) nextLayout = removeConnectionFromSidebarLayout(nextLayout, id);
-    await persistConnectionDeletion(nextConnections, nextLayout);
-    applyConnectionRemoval(removedIds, nextConnections, nextLayout);
-    purgeTableVGroupsForConnections(removedIds);
+  async function removeConnections(ids: Iterable<string>) {
+    const requestedIds = [...new Set(ids)];
+    const removal = await enqueueConnectionDeletion(async () => {
+      const connectionIds = requestedIds.filter((id) => connections.value.some((c) => c.id === id));
+      if (!connectionIds.length) return null;
+
+      const removedIds = new Set(connectionIds);
+      const oneTimeIds = connectionIds.filter((id) => getConfig(id)?.one_time === true);
+      // 连接配置在 applyConnectionRemoval 后就读不到了，先抓取快照供删除策略使用。
+      const removedConfigs = connectionIds.map((id) => getConfig(id)).filter((config): config is ConnectionConfig => !!config);
+      const nextConnections = connections.value.filter((c) => !removedIds.has(c.id));
+      let nextLayout = sidebarLayout.value;
+      for (const id of removedIds) nextLayout = removeConnectionFromSidebarLayout(nextLayout, id);
+      await persistConnectionDeletion(nextConnections, nextLayout);
+      applyConnectionRemoval(removedIds, nextConnections, nextLayout);
+      purgeTableVGroupsForConnections(removedIds);
+      return { removedIds, removedConfigs, oneTimeIds };
+    });
+    if (!removal) return;
     // 删除已经落盘完成；页签处理失败只告警，不能让已成功的删除以异常收场。
     try {
-      await applyDeletedConnectionTabHandling(removedConfigs);
+      await applyDeletedConnectionTabHandling(removal.removedConfigs);
     } catch (error) {
-      console.warn("[DBX][connection:delete:tab-handling-failed]", { connectionIds: [...removedIds], error });
+      console.warn("[DBX][connection:delete:tab-handling-failed]", { connectionIds: [...removal.removedIds], error });
     }
-    await cleanupRemovedOneTimeConnections(oneTimeIds);
+    await cleanupRemovedOneTimeConnections(removal.oneTimeIds);
   }
 
   /** 删除连接后同步清理其名下的表分组布局（本地内存 + dbx.db 行）。 */
@@ -9319,7 +9342,12 @@ export const useConnectionStore = defineStore("connection", () => {
     let timeoutSettingsPersisted = false;
     let layoutSaveStarted = false;
 
+    localConnectionMutationRevision += 1;
+    connectionDeletionsInFlight += 1;
     try {
+      // A reload may already be saving normalized timeout values. Its upsert
+      // must finish before deletion, otherwise it can recreate the removed ids.
+      await connectionReloadPersistPromise?.catch(() => undefined);
       if (connectionsChanged) {
         await persistConnections(nextConnections, removedConnectionIds);
         connectionsPersisted = true;
@@ -9362,6 +9390,11 @@ export const useConnectionStore = defineStore("connection", () => {
         throw recoveryError;
       }
       throw error;
+    } finally {
+      connectionDeletionsInFlight -= 1;
+      // Invalidate reads started during either persistence or rollback as well
+      // as reads that were already running when deletion began.
+      localConnectionMutationRevision += 1;
     }
   }
 
@@ -9561,48 +9594,54 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function removeConnectionGroups(groupIds: Iterable<string>, deleteConnections = false): Promise<string[]> {
     const uniqueGroupIds = [...new Set(groupIds)];
-    const previousLayout = sidebarLayout.value;
-    const connectionIds = deleteConnections ? connectionIdsInGroupsOp(sidebarLayout.value, uniqueGroupIds).filter((id) => connections.value.some((connection) => connection.id === id)) : [];
-    const oneTimeIds = connectionIds.filter((id) => getConfig(id)?.one_time === true);
-    const removedConnectionIds = new Set(connectionIds);
-    // 删除策略需要连接配置，applyConnectionRemoval 之后就读不到了，先抓快照。
-    const removedConnectionConfigs = connectionIds.map((id) => getConfig(id)).filter((config): config is ConnectionConfig => !!config);
-    const nextConnections = removedConnectionIds.size ? connections.value.filter((connection) => !removedConnectionIds.has(connection.id)) : connections.value;
-    let layoutAfterConnectionRemoval = previousLayout;
-    for (const id of removedConnectionIds) layoutAfterConnectionRemoval = removeConnectionFromSidebarLayout(layoutAfterConnectionRemoval, id);
-    const nextLayout = deleteGroupsOp(layoutAfterConnectionRemoval, uniqueGroupIds);
-    if (nextLayout === previousLayout && nextConnections === connections.value) return [];
+    const removal = await enqueueConnectionDeletion(async () => {
+      const previousLayout = sidebarLayout.value;
+      const connectionIds = deleteConnections ? connectionIdsInGroupsOp(sidebarLayout.value, uniqueGroupIds).filter((id) => connections.value.some((connection) => connection.id === id)) : [];
+      const oneTimeIds = connectionIds.filter((id) => getConfig(id)?.one_time === true);
+      const removedConnectionIds = new Set(connectionIds);
+      // 删除策略需要连接配置，applyConnectionRemoval 之后就读不到了，先抓快照。
+      const removedConnectionConfigs = connectionIds.map((id) => getConfig(id)).filter((config): config is ConnectionConfig => !!config);
+      const nextConnections = removedConnectionIds.size ? connections.value.filter((connection) => !removedConnectionIds.has(connection.id)) : connections.value;
+      let layoutAfterConnectionRemoval = previousLayout;
+      for (const id of removedConnectionIds) layoutAfterConnectionRemoval = removeConnectionFromSidebarLayout(layoutAfterConnectionRemoval, id);
+      const nextLayout = deleteGroupsOp(layoutAfterConnectionRemoval, uniqueGroupIds);
+      if (nextLayout === previousLayout && nextConnections === connections.value) return null;
 
-    await persistConnectionDeletion(nextConnections, nextLayout);
-    if (removedConnectionIds.size) {
-      applyConnectionRemoval(removedConnectionIds, nextConnections, nextLayout);
-      purgeTableVGroupsForConnections(removedConnectionIds);
+      await persistConnectionDeletion(nextConnections, nextLayout);
+      if (removedConnectionIds.size) {
+        applyConnectionRemoval(removedConnectionIds, nextConnections, nextLayout);
+        purgeTableVGroupsForConnections(removedConnectionIds);
+      } else {
+        sidebarLayout.value = nextLayout;
+        rebuildTreeNodes();
+      }
+
+      const remainingGroupIds = new Set(nextLayout.groups.map((group) => group.id));
+      const removedGroupIds = new Set(previousLayout.groups.filter((group) => !remainingGroupIds.has(group.id)).map((group) => group.id));
+      if (removedGroupIds.size) {
+        const nextPinnedOrder = pinnedTreeNodeOrder.value.filter((pinId) => !removedGroupIds.has(pinId));
+        if (nextPinnedOrder.length !== pinnedTreeNodeOrder.value.length) {
+          setPinnedTreeNodeOrder(nextPinnedOrder);
+          persistPinnedTreeNodeIds();
+        }
+        selectedTreeNodeIds.value = selectedTreeNodeIds.value.filter((id) => !removedGroupIds.has(id));
+        if (selectedTreeNodeId.value && removedGroupIds.has(selectedTreeNodeId.value)) selectedTreeNodeId.value = null;
+        if (treeSelectionAnchorId.value && removedGroupIds.has(treeSelectionAnchorId.value)) treeSelectionAnchorId.value = null;
+        if (!selectedTreeNodeIds.value.length) connectionMultiSelectActive.value = false;
+      }
+      return { connectionIds, oneTimeIds, removedConnectionConfigs };
+    });
+    if (!removal) return [];
+    if (removal.connectionIds.length) {
       // 删除已经落盘完成；页签处理失败只告警，不能让已成功的删除以异常收场。
       try {
-        await applyDeletedConnectionTabHandling(removedConnectionConfigs);
+        await applyDeletedConnectionTabHandling(removal.removedConnectionConfigs);
       } catch (error) {
-        console.warn("[DBX][connection:delete:tab-handling-failed]", { connectionIds: [...removedConnectionIds], error });
+        console.warn("[DBX][connection:delete:tab-handling-failed]", { connectionIds: removal.connectionIds, error });
       }
-    } else {
-      sidebarLayout.value = nextLayout;
-      rebuildTreeNodes();
     }
-    await cleanupRemovedOneTimeConnections(oneTimeIds);
-
-    const remainingGroupIds = new Set(nextLayout.groups.map((group) => group.id));
-    const removedGroupIds = new Set(previousLayout.groups.filter((group) => !remainingGroupIds.has(group.id)).map((group) => group.id));
-    if (removedGroupIds.size) {
-      const nextPinnedOrder = pinnedTreeNodeOrder.value.filter((pinId) => !removedGroupIds.has(pinId));
-      if (nextPinnedOrder.length !== pinnedTreeNodeOrder.value.length) {
-        setPinnedTreeNodeOrder(nextPinnedOrder);
-        persistPinnedTreeNodeIds();
-      }
-      selectedTreeNodeIds.value = selectedTreeNodeIds.value.filter((id) => !removedGroupIds.has(id));
-      if (selectedTreeNodeId.value && removedGroupIds.has(selectedTreeNodeId.value)) selectedTreeNodeId.value = null;
-      if (treeSelectionAnchorId.value && removedGroupIds.has(treeSelectionAnchorId.value)) treeSelectionAnchorId.value = null;
-      if (!selectedTreeNodeIds.value.length) connectionMultiSelectActive.value = false;
-    }
-    return connectionIds;
+    await cleanupRemovedOneTimeConnections(removal.oneTimeIds);
+    return removal.connectionIds;
   }
 
   function collapseAllTreeNodes() {
@@ -10033,12 +10072,15 @@ export const useConnectionStore = defineStore("connection", () => {
     await settingsStore.initEditorSettings();
     if (!initFromDiskPromise) {
       initFromDiskPromise = (async () => {
+        const reloadRevision = localConnectionMutationRevision;
+        const isCurrentReload = () => reloadRevision === localConnectionMutationRevision && connectionDeletionsInFlight === 0;
         // 整体覆盖内存布局前，先落盘窗口内未写盘的分组编辑（防止 300ms 防抖窗口
         // 内的编辑被备份轮询/重载带回的旧快照静默回滚）。
         await flushTableVGroupPersist();
         const [pinnedOrder, saved, , loadedTableVGroups] = await Promise.all([loadPinnedTreeNodeOrder(), api.loadConnections(), tunnelProfileStore.init(), api.loadTableVGroups()]);
-        setPinnedTreeNodeOrder(pinnedOrder);
+        if (!isCurrentReload()) return;
         await migrateTimeoutInheritance(saved);
+        if (!isCurrentReload()) return;
         const loadedConnections = saved.map(normalizeConnection);
         const loadedIds = new Set(loadedConnections.map((connection) => connection.id));
         // One-time deep-link connections are intentionally filtered from disk
@@ -10047,12 +10089,21 @@ export const useConnectionStore = defineStore("connection", () => {
         const runtimeOneTimeConnections = connections.value.filter((connection) => connection.one_time === true && !loadedIds.has(connection.id));
         connections.value = [...loadedConnections, ...runtimeOneTimeConnections];
         if (loadedConnections.some((connection, index) => (connection.connect_timeout_inherit === true && connection.connect_timeout_secs !== saved[index]?.connect_timeout_secs) || (connection.query_timeout_inherit === true && connection.query_timeout_secs !== saved[index]?.query_timeout_secs))) {
-          await persistConnections();
+          const persistPromise = persistConnections();
+          connectionReloadPersistPromise = persistPromise;
+          try {
+            await persistPromise;
+          } finally {
+            connectionReloadPersistPromise = null;
+          }
+          if (!isCurrentReload()) return;
         }
+        const savedLayout = await api.loadSidebarLayout();
+        if (!isCurrentReload()) return;
+        setPinnedTreeNodeOrder(pinnedOrder);
         syncTimeoutInheritanceBackup();
         // 旧版本写下的行可能缺字段（如 version），一律归一化后再进内存，避免脏数据被原样写回。
         tableVGroupLayouts.value = Object.fromEntries(Object.entries(loadedTableVGroups ?? {}).map(([scopeKey, layout]) => [scopeKey, normalizeTableVGroupLayoutOp(layout)]));
-        const savedLayout = await api.loadSidebarLayout();
         const currentLayout = sidebarLayout.value.groups.length || sidebarLayout.value.order.length ? sidebarLayout.value : null;
         sidebarLayout.value = reconcileLayout(
           connections.value.map((c) => c.id),

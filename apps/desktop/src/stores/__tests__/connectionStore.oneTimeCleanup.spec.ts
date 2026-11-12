@@ -60,6 +60,16 @@ function previewConnection(overrides: Partial<ConnectionConfig> = {}): Connectio
   } as ConnectionConfig;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("connectionStore one_time runtime cleanup", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -158,6 +168,237 @@ describe("connectionStore one_time runtime cleanup", () => {
 
     expect(loadConnections).toHaveBeenCalledTimes(2);
     expect(store.getConfig("new")).toBeDefined();
+  });
+
+  it("does not restore a connection from a stale reload after local deletion", async () => {
+    installApiMocks();
+    const { loadConnections } = await import("@/lib/backend/api");
+    const saved = previewConnection({ id: "saved-1", one_time: false });
+    let finishInitialRead!: (connections: ConnectionConfig[]) => void;
+    vi.mocked(loadConnections).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishInitialRead = resolve;
+      }),
+    );
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [saved];
+
+    const initialLoad = store.initFromDisk();
+    await vi.waitFor(() => expect(loadConnections).toHaveBeenCalledOnce());
+
+    await store.removeConnection(saved.id);
+    finishInitialRead([saved]);
+    await initialLoad;
+
+    expect(store.getConfig(saved.id)).toBeUndefined();
+    expect(store.treeNodes.some((node) => node.id === saved.id)).toBe(false);
+  });
+
+  it.each(["before", "after"])("ignores a reload started during deletion when its read finishes %s persistence", async (readFinishes) => {
+    installApiMocks();
+    const { loadConnections, saveConnections } = await import("@/lib/backend/api");
+    const saved = previewConnection({ id: "saved-1", name: "Current", one_time: false });
+    const diskRead = deferred<ConnectionConfig[]>();
+    const deletionWrite = deferred<void>();
+    vi.mocked(loadConnections).mockReturnValueOnce(diskRead.promise);
+    vi.mocked(saveConnections).mockReturnValueOnce(deletionWrite.promise);
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [saved];
+
+    const deletion = store.removeConnection(saved.id);
+    await vi.waitFor(() => expect(saveConnections).toHaveBeenCalledOnce());
+    const reload = store.initFromDisk();
+    await vi.waitFor(() => expect(loadConnections).toHaveBeenCalledOnce());
+
+    if (readFinishes === "before") {
+      diskRead.resolve([{ ...saved, name: "Stale" }]);
+      await reload;
+      expect(store.getConfig(saved.id)?.name).toBe("Current");
+    }
+    deletionWrite.resolve();
+    await deletion;
+    if (readFinishes === "after") diskRead.resolve([saved]);
+    await reload;
+
+    expect(store.getConfig(saved.id)).toBeUndefined();
+    expect(store.treeNodes.some((node) => node.id === saved.id)).toBe(false);
+  });
+
+  it("does not apply an old snapshot after deletion interrupts timeout migration", async () => {
+    installApiMocks();
+    const { loadConnections } = await import("@/lib/backend/api");
+    const saved = previewConnection({ id: "saved-1", one_time: false });
+    vi.mocked(loadConnections).mockResolvedValueOnce([saved]);
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const settingsStore = useSettingsStore();
+    await settingsStore.initEditorSettings();
+    const migrationWrite = deferred<void>();
+    const persistSettings = vi.spyOn(settingsStore, "persistEditorSettings").mockReturnValueOnce(migrationWrite.promise);
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [saved];
+
+    const reload = store.initFromDisk();
+    await vi.waitFor(() => expect(persistSettings).toHaveBeenCalledOnce());
+    await store.removeConnection(saved.id);
+    migrationWrite.resolve();
+    await reload;
+
+    expect(store.getConfig(saved.id)).toBeUndefined();
+    expect(store.treeNodes.some((node) => node.id === saved.id)).toBe(false);
+  });
+
+  it("does not restore a deleted group from a delayed sidebar-layout read", async () => {
+    installApiMocks();
+    const { loadConnections, loadSidebarLayout } = await import("@/lib/backend/api");
+    const saved = previewConnection({ id: "saved-1", one_time: false });
+    const layout: SidebarLayout = {
+      groups: [{ id: "group-1", name: "Group", collapsed: false }],
+      order: [{ type: "group", id: "group-1", children: [{ type: "connection", id: saved.id }] }],
+    };
+    vi.mocked(loadConnections).mockResolvedValueOnce([saved]);
+    const layoutRead = deferred<SidebarLayout>();
+    vi.mocked(loadSidebarLayout).mockReturnValueOnce(layoutRead.promise);
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [saved];
+    store.sidebarLayout = layout;
+
+    const reload = store.initFromDisk();
+    await vi.waitFor(() => expect(loadSidebarLayout).toHaveBeenCalledOnce());
+    await store.deleteConnectionGroups(["group-1"], true);
+    layoutRead.resolve(layout);
+    await reload;
+
+    expect(store.connections).toEqual([]);
+    expect(store.sidebarLayout.groups).toEqual([]);
+    expect(store.treeNodes).toEqual([]);
+  });
+
+  it("keeps a rolled-back deletion when a reload read the temporary disk state", async () => {
+    installApiMocks();
+    const { loadConnections, saveConnections, saveSidebarLayout } = await import("@/lib/backend/api");
+    const saved = previewConnection({ id: "saved-1", one_time: false });
+    const layout: SidebarLayout = { groups: [], order: [{ type: "connection", id: saved.id }] };
+    const layoutWrite = deferred<void>();
+    const diskRead = deferred<ConnectionConfig[]>();
+    vi.mocked(saveSidebarLayout).mockReturnValueOnce(layoutWrite.promise);
+    vi.mocked(loadConnections)
+      .mockReturnValueOnce(diskRead.promise)
+      .mockResolvedValueOnce([saved, previewConnection({ id: "external", one_time: false })]);
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [saved];
+    store.sidebarLayout = layout;
+
+    const deletion = expect(store.removeConnection(saved.id)).rejects.toThrow("layout failed");
+    await vi.waitFor(() => expect(saveSidebarLayout).toHaveBeenCalledOnce());
+    const reload = store.initFromDisk();
+    await vi.waitFor(() => expect(loadConnections).toHaveBeenCalledOnce());
+    layoutWrite.reject(new Error("layout failed"));
+    await deletion;
+    diskRead.resolve([]);
+    await reload;
+
+    expect(saveConnections).toHaveBeenCalledWith([], [saved.id]);
+    expect(saveConnections).toHaveBeenLastCalledWith([saved]);
+    expect(store.getConfig(saved.id)).toBeDefined();
+    expect(store.sidebarLayout).toEqual(layout);
+
+    await store.reloadFromDisk();
+    expect(store.connections.map((connection) => connection.id)).toEqual([saved.id, "external"]);
+  });
+
+  it("finishes an in-flight timeout-normalization save before persisting a deletion", async () => {
+    installApiMocks();
+    const { loadConnections, saveConnections } = await import("@/lib/backend/api");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const settingsStore = useSettingsStore();
+    await settingsStore.initEditorSettings();
+    settingsStore.updateEditorSettings({ globalConnectTimeoutSecs: 42, timeoutInheritanceMigrationVersion: 2 });
+    const saved = previewConnection({ id: "saved-1", one_time: false, connect_timeout_inherit: true, connect_timeout_secs: 10 });
+    let diskConnections = [saved];
+    const normalizationWrite = deferred<void>();
+    vi.mocked(loadConnections).mockImplementation(async () => [...diskConnections]);
+    vi.mocked(saveConnections)
+      .mockImplementationOnce(async (configs) => {
+        await normalizationWrite.promise;
+        diskConnections = configs;
+      })
+      .mockImplementation(async (configs) => {
+        diskConnections = configs;
+      });
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [saved];
+
+    const reload = store.initFromDisk();
+    await vi.waitFor(() => expect(saveConnections).toHaveBeenCalledOnce());
+    const deletion = store.removeConnection(saved.id);
+    // Let removal reach its persistence boundary before releasing the earlier save.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    normalizationWrite.resolve();
+    await Promise.all([reload, deletion]);
+
+    expect(diskConnections).toEqual([]);
+    expect(store.getConfig(saved.id)).toBeUndefined();
+    await store.reloadFromDisk();
+    expect(store.getConfig(saved.id)).toBeUndefined();
+  });
+
+  it.each(["connection", "group"])("does not restore an earlier deletion when a second %s deletion overlaps it", async (secondTarget) => {
+    installApiMocks();
+    const { saveConnections } = await import("@/lib/backend/api");
+    const first = previewConnection({ id: "first", one_time: false });
+    const second = previewConnection({ id: "second", one_time: false });
+    const firstWrite = deferred<void>();
+    vi.mocked(saveConnections).mockReturnValueOnce(firstWrite.promise);
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useConnectionStore();
+    const queryStore = useQueryStore();
+    store.connections = [first, second];
+    queryStore.createTab(first.id, "", "first.sql", "query");
+    queryStore.createTab(second.id, "", "second.sql", "query");
+    store.sidebarLayout = {
+      groups: [{ id: "group-1", name: "Group", collapsed: false }],
+      order: [
+        { type: "connection", id: first.id },
+        { type: "group", id: "group-1", children: [{ type: "connection", id: second.id }] },
+      ],
+    };
+
+    const firstDeletion = store.removeConnection(first.id);
+    await vi.waitFor(() => expect(saveConnections).toHaveBeenCalledOnce());
+    const secondDeletion = secondTarget === "connection" ? store.removeConnection(second.id) : store.deleteConnectionGroups(["group-1"], true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    firstWrite.resolve();
+    await Promise.all([firstDeletion, secondDeletion]);
+
+    expect(store.connections).toEqual([]);
+    expect(queryStore.tabs).toEqual([]);
+    expect(saveConnections).toHaveBeenLastCalledWith([], [second.id]);
+  });
+
+  it("allows a queued deletion to proceed after an earlier save fails", async () => {
+    installApiMocks();
+    const { saveConnections } = await import("@/lib/backend/api");
+    vi.mocked(saveConnections).mockRejectedValueOnce(new Error("first save failed"));
+    const first = previewConnection({ id: "first", one_time: false });
+    const second = previewConnection({ id: "second", one_time: false });
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [first, second];
+
+    const failedDeletion = expect(store.removeConnection(first.id)).rejects.toThrow("first save failed");
+    const succeedingDeletion = store.removeConnection(second.id);
+    await Promise.all([failedDeletion, succeedingDeletion]);
+
+    expect(store.connections.map((connection) => connection.id)).toEqual([first.id]);
+    expect(saveConnections).toHaveBeenLastCalledWith([first], [second.id]);
   });
 
   it("removeConnection leaves saved connections to the save_connections sync", async () => {

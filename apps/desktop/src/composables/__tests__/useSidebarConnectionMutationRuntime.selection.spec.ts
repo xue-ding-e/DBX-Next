@@ -199,7 +199,172 @@ describe("sidebar connection deletion selection", () => {
       ["conn-1", { skipTabHandling: true }],
       ["conn-2", { skipTabHandling: true }],
     ]);
+    expect(showDeleteConfirm.value).toBe(false);
+    expect(connectionDeleteTargetSnapshot.value).toEqual([]);
     expect(mocks.toast).toHaveBeenCalledWith('connection.deletedSelected:{"count":2}', 2000);
+  });
+
+  it("keeps the confirmed targets when the dialog state changes before deletion runs", async () => {
+    const nodes = [connectionNode("conn-1"), connectionNode("conn-2")];
+    const replacement = connectionNode("conn-3");
+    const store = connectionStore(nodes.map((node) => node.id));
+    const activeNode = shallowRef<TreeNode>(nodes[0]);
+    let selectedNodes = nodes;
+    const runtime = useSidebarConnectionMutationRuntime({
+      activeNode,
+      releaseActiveNodeReference: vi.fn(),
+      selectedTreeNodesInVisibleOrder: () => selectedNodes,
+      connectionStore: store as any,
+      queryStore: { openDatabaseKeys: new Set<string>() } as any,
+      requestGroupRename: vi.fn(),
+      openVisibleDatabases: vi.fn(),
+      openVisibleSchemas: vi.fn(),
+    });
+
+    runtime.deleteConnection();
+    activeNode.value = replacement;
+    selectedNodes = [];
+    showDeleteConfirm.value = false;
+
+    await runtime.confirmDelete();
+
+    expect(store.removeConnections).toHaveBeenCalledWith(["conn-1", "conn-2"]);
+    expect(store.removeConnections).not.toHaveBeenCalledWith(["conn-3"]);
+  });
+
+  it("closes the confirmation while post-delete cleanup is still settling", async () => {
+    const node = connectionNode("conn-slow");
+    const store = connectionStore([node.id]);
+    let finishRemoval!: () => void;
+    store.removeConnections.mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishRemoval = resolve;
+      }),
+    );
+    const mutationRuntime = runtime(node, store, [node]);
+
+    mutationRuntime.deleteConnection();
+    const deletion = mutationRuntime.confirmDelete();
+
+    expect(showDeleteConfirm.value).toBe(false);
+    expect(connectionDeleteTargetSnapshot.value).toEqual([]);
+
+    finishRemoval();
+    await deletion;
+  });
+
+  it("does not delete the current selection after the captured confirmation was cancelled", async () => {
+    const node = connectionNode("conn-cancelled");
+    const store = connectionStore([node.id]);
+    const mutationRuntime = runtime(node, store, [node]);
+    mutationRuntime.deleteConnection();
+    showDeleteConfirm.value = false;
+    connectionDeleteTargetSnapshot.value = [];
+
+    await mutationRuntime.confirmDelete();
+
+    expect(store.removeConnections).not.toHaveBeenCalled();
+    expect(store.disconnect).not.toHaveBeenCalled();
+  });
+
+  it("consumes the captured confirmation only once while removal is pending", async () => {
+    const node = connectionNode("conn-slow");
+    const store = connectionStore([node.id]);
+    let finishRemoval!: () => void;
+    store.removeConnections.mockReturnValue(new Promise<void>((resolve) => (finishRemoval = resolve)));
+    const mutationRuntime = runtime(node, store, [node]);
+    mutationRuntime.deleteConnection();
+
+    const deletion = mutationRuntime.confirmDelete();
+    const duplicateConfirmation = mutationRuntime.confirmDelete();
+    finishRemoval();
+    await Promise.all([deletion, duplicateConfirmation]);
+
+    expect(store.removeConnections).toHaveBeenCalledOnce();
+    expect(store.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("captures connection identities and labels instead of retaining mutable tree nodes", async () => {
+    const node = connectionNode("conn-original");
+    const store = connectionStore([node.id]);
+    const mutationRuntime = runtime(node, store, [node]);
+    mutationRuntime.deleteConnection();
+    node.id = "conn-replacement";
+    node.connectionId = "conn-replacement";
+    node.label = "Replacement";
+
+    expect(mutationRuntime.connectionDeleteConfirmMessage()).toBe('contextMenu.confirmDeleteMessage:{"name":"conn-original"}');
+    await mutationRuntime.confirmDelete();
+
+    expect(store.removeConnections).toHaveBeenCalledWith(["conn-original"]);
+  });
+
+  it("restores the captured targets for retry after an asynchronous persistence failure", async () => {
+    const node = connectionNode("conn-original");
+    const store = connectionStore([node.id]);
+    let failRemoval!: (error: Error) => void;
+    store.removeConnections.mockReturnValueOnce(new Promise<void>((_, reject) => (failRemoval = reject)));
+    const mutationRuntime = runtime(node, store, [node]);
+    mutationRuntime.deleteConnection();
+
+    const deletion = mutationRuntime.confirmDelete();
+    node.connectionId = "conn-replacement";
+    failRemoval(new Error("persist failed"));
+    await deletion;
+
+    expect(showDeleteConfirm.value).toBe(true);
+    expect(connectionDeleteTargetSnapshot.value.map((target) => target.connectionId)).toEqual(["conn-original"]);
+    expect(store.disconnect).not.toHaveBeenCalled();
+    expect(mocks.toast).toHaveBeenCalledWith('connection.saveFailed:{"message":"persist failed"}', 5000);
+
+    await mutationRuntime.confirmDelete();
+    expect(store.removeConnections.mock.calls).toEqual([[["conn-original"]], [["conn-original"]]]);
+    expect(showDeleteConfirm.value).toBe(false);
+  });
+
+  it.each(["open", "cancelled", "confirmed"])("does not revive an older failed delete after a newer confirmation was %s", async (newerState) => {
+    const node = connectionNode("conn-original");
+    const store = connectionStore([node.id]);
+    let failRemoval!: (error: Error) => void;
+    store.removeConnections.mockReturnValueOnce(new Promise<void>((_, reject) => (failRemoval = reject)));
+    const olderRuntime = runtime(node, store, [node]);
+    olderRuntime.deleteConnection();
+    const deletion = olderRuntime.confirmDelete();
+
+    const newerNode = connectionNode("conn-newer");
+    const newerRuntime = runtime(newerNode, store, [newerNode]);
+    newerRuntime.deleteConnection();
+    if (newerState === "cancelled") {
+      showDeleteConfirm.value = false;
+      connectionDeleteTargetSnapshot.value = [];
+    } else if (newerState === "confirmed") {
+      await newerRuntime.confirmDelete();
+    }
+    failRemoval(new Error("older persist failed"));
+    await deletion;
+
+    expect(showDeleteConfirm.value).toBe(newerState === "open");
+    expect(connectionDeleteTargetSnapshot.value.map((target) => target.connectionId)).toEqual(newerState === "open" ? ["conn-newer"] : []);
+    expect(store.disconnect.mock.calls).toEqual(newerState === "confirmed" ? [["conn-newer", { skipTabHandling: true }]] : []);
+  });
+
+  it("keeps a successful deletion closed when asynchronous disconnect cleanup fails", async () => {
+    const node = connectionNode("conn-cleanup");
+    const store = connectionStore([node.id]);
+    store.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const mutationRuntime = runtime(node, store, [node]);
+      mutationRuntime.deleteConnection();
+      await mutationRuntime.confirmDelete();
+
+      expect(showDeleteConfirm.value).toBe(false);
+      expect(connectionDeleteTargetSnapshot.value).toEqual([]);
+      expect(mocks.toast).toHaveBeenCalledWith("connection.deleted", 2000);
+      expect(warning).toHaveBeenCalledWith("[DBX][connection:delete:disconnect-failed]", expect.objectContaining({ connectionId: node.id }));
+    } finally {
+      warning.mockRestore();
+    }
   });
 });
 

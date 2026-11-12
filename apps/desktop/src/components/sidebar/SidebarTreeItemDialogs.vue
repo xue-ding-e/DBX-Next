@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import DdlStorageToggle from "@/components/objects/DdlStorageToggle.vue";
-import { structurePreviewDdlStorageType } from "./sidebarTreeDialogState";
-import { computed, toRefs, watch } from "vue";
+import { connectionDeleteTargetSnapshot, structurePreviewDdlStorageType } from "./sidebarTreeDialogState";
+import { computed, ref, toRefs, watch } from "vue";
 import { AlertTriangle, Check, Loader2, Clipboard, Plus, Trash2, Upload } from "@lucide/vue";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -178,6 +178,28 @@ function closeCreateDatabaseResult() {
   showCreateDatabasePreviewDialog.value = false;
 }
 
+const connectionDeletePending = ref(false);
+
+async function confirmConnectionDelete() {
+  if (connectionDeletePending.value) return;
+  connectionDeletePending.value = true;
+  try {
+    await confirmDelete.value();
+  } finally {
+    connectionDeletePending.value = false;
+  }
+}
+
+function cancelConnectionDelete() {
+  showDeleteConfirm.value = false;
+  connectionDeleteTargetSnapshot.value = [];
+}
+
+function updateConnectionDeleteDialogOpen(open: boolean) {
+  showDeleteConfirm.value = open;
+  if (!open) connectionDeleteTargetSnapshot.value = [];
+}
+
 function updateDeleteGroupDialogOpen(open: boolean) {
   if (!open && deletingConnectionGroups.value) return;
   showDeleteGroupConfirm.value = open;
@@ -197,6 +219,9 @@ function mongoIndexTypeLabel(type: string): string {
 
 watch(
   [
+    // The modal closes immediately, but ConnectionTree must retain its controller
+    // until failure can reopen it or successful cleanup has finished.
+    connectionDeletePending,
     showDeleteConfirm,
     showMoveToNewGroupDialog,
     showDeleteGroupConfirm,
@@ -228,7 +253,7 @@ watch(
 </script>
 
 <template>
-  <Dialog v-model:open="showDeleteConfirm">
+  <Dialog :open="showDeleteConfirm" @update:open="updateConnectionDeleteDialogOpen">
     <DialogContent class="sm:max-w-[400px]">
       <DialogHeader>
         <DialogTitle>{{ t("contextMenu.confirmDeleteTitle") }}</DialogTitle>
@@ -237,15 +262,8 @@ watch(
         {{ connectionDeleteConfirmMessage() }}
       </p>
       <DialogFooter>
-        <Button variant="outline" @click="showDeleteConfirm = false">{{ t("dangerDialog.cancel") }}</Button>
-        <Button
-          variant="destructive"
-          @click="
-            showDeleteConfirm = false;
-            confirmDelete();
-          "
-          >{{ connectionDeleteMenuLabel() }}</Button
-        >
+        <Button variant="outline" @click="cancelConnectionDelete">{{ t("dangerDialog.cancel") }}</Button>
+        <Button variant="destructive" @click="confirmConnectionDelete">{{ connectionDeleteMenuLabel() }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>
