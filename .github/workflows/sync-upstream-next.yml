@@ -1,0 +1,174 @@
+name: DBX-Next Upstream Sync
+
+on:
+  schedule:
+    - cron: '17 0,6,12,18 * * *'
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Official commit SHA to integrate (blank follows official main)
+        type: string
+      apply:
+        description: Fast-forward main after candidate validation
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dbx-next-upstream-sync
+  cancel-in-progress: false
+
+env:
+  OFFICIAL_REPO: https://github.com/t8y2/dbx.git
+  OFFICIAL_REF: refs/remotes/upstream/main
+
+jobs:
+  mirror:
+    if: github.repository == 'xue-ding-e/DBX-Next' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Fast-forward the official history mirror
+        shell: bash
+        run: |
+          git fetch --no-tags --no-recurse-submodules "$OFFICIAL_REPO" "refs/heads/main:$OFFICIAL_REF"
+          old=$(git rev-parse refs/remotes/origin/upstream-main)
+          target=$(git rev-parse "$OFFICIAL_REF")
+          git merge-base --is-ancestor "$old" "$target"
+          if [[ "$old" != "$target" ]]; then
+            # The built-in token suppresses workflows on the raw upstream tree.
+            git push --no-follow-tags origin "$target:refs/heads/upstream-main"
+          fi
+          [[ "$(git ls-remote --refs origin refs/heads/upstream-main | cut -f1)" == "$target" ]]
+          echo "Official mirror: $target" >> "$GITHUB_STEP_SUMMARY"
+
+  prepare:
+    if: github.repository == 'xue-ding-e/DBX-Next' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      status: ${{ steps.plan.outputs.status }}
+      head: ${{ steps.plan.outputs.head }}
+      target: ${{ steps.plan.outputs.target }}
+      candidate: ${{ steps.plan.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Test the integration planner
+        run: node --test scripts/next-upstream-sync.test.mjs
+      - name: Prepare the linear candidate
+        id: plan
+        env:
+          REQUESTED_TARGET: ${{ inputs.target_sha }}
+        run: |
+          git fetch --no-tags --no-recurse-submodules "$OFFICIAL_REPO" "refs/heads/main:$OFFICIAL_REF"
+          node scripts/next-upstream-sync.mjs --target "$REQUESTED_TARGET" --report "$RUNNER_TEMP/sync-result.json"
+          {
+            echo '### DBX-Next upstream sync'
+            jq -r '"- Status: \(.status)\n- Official range: \(.base) → \(.target)\n- Candidate: \(.candidate // "needs review")", (.conflicts[]? | "- Conflict: " + @json)' "$RUNNER_TEMP/sync-result.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dbx-next-upstream-plan
+          path: ${{ runner.temp }}/sync-result.json
+          if-no-files-found: error
+      - name: Flag conflicts for review
+        if: steps.plan.outputs.status == 'blocked'
+        run: |
+          echo "::error::Resolve the paths in sync-result.json in an integration worktree before advancing main."
+          exit 1
+
+  validate:
+    if: needs.prepare.outputs.status == 'ready'
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [frontend, cli-mcp]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TARGET_SHA: ${{ needs.prepare.outputs.target }}
+      CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.head }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Check out the verified candidate tree
+        run: |
+          git fetch --no-tags --no-recurse-submodules "$OFFICIAL_REPO" "refs/heads/main:$OFFICIAL_REF"
+          actual=$(node scripts/next-upstream-sync.mjs --target "$TARGET_SHA" | jq -er '.candidate')
+          [[ "$actual" == "$CANDIDATE_SHA" ]]
+          git switch --detach "$CANDIDATE_SHA"
+      - uses: pnpm/action-setup@v6
+        if: matrix.check == 'frontend'
+      - if: matrix.check == 'frontend'
+        run: pnpm --filter dbx... install --frozen-lockfile
+      - name: Test updater, grid saves and connection changes
+        if: matrix.check == 'frontend'
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: |
+          pnpm typecheck
+          pnpm exec vitest run \
+            useAppUpdater.spec.ts useDataGridEditor.spec.ts useDataGridResultLifecycle.spec.ts \
+            useSidebarConnectionMutationRuntime.selection.spec.ts connectionStore.oneTimeCleanup.spec.ts \
+            connectionConfigTransfer.spec.ts --maxWorkers=2
+      - uses: dtolnay/rust-toolchain@1.97.1
+        if: matrix.check == 'cli-mcp'
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.check == 'cli-mcp'
+        with:
+          shared-key: dbx-next-upstream-cli-mcp
+      - name: Test the shared CLI and MCP runtime
+        if: matrix.check == 'cli-mcp'
+        run: cargo test --locked -p dbx-cli -p dbx-mcp --no-default-features --features dbx-mcp/sqlite-bundled
+
+  integrate:
+    if: >-
+      needs.validate.result == 'success' &&
+      (github.event_name == 'schedule' || inputs.apply)
+    needs: [prepare, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      PARENT_SHA: ${{ needs.prepare.outputs.head }}
+      TARGET_SHA: ${{ needs.prepare.outputs.target }}
+      CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.head }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Fast-forward main to the tested commit
+        shell: bash
+        run: |
+          [[ "$(git ls-remote --refs origin refs/heads/main | cut -f1)" == "$PARENT_SHA" ]]
+          git fetch --no-tags --no-recurse-submodules "$OFFICIAL_REPO" "refs/heads/main:$OFFICIAL_REF"
+          actual=$(node scripts/next-upstream-sync.mjs --target "$TARGET_SHA" | jq -er '.candidate')
+          [[ "$actual" == "$CANDIDATE_SHA" ]]
+          [[ "$(git rev-list --parents -1 "$actual")" == "$actual $PARENT_SHA" ]]
+          git push --no-follow-tags origin "$actual:refs/heads/main"
+          [[ "$(git ls-remote --refs origin refs/heads/main | cut -f1)" == "$actual" ]]
+          echo "DBX-Next main advanced to $actual" >> "$GITHUB_STEP_SUMMARY"

@@ -15,37 +15,75 @@ on:
         required: true
         default: main
         type: string
+      publish:
+        description: Publish to GitHub Releases (off builds and signs Actions artifacts only)
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: dbx-next-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
+  resolve:
+    name: Pin the release source
+    if: >-
+      github.repository == 'xue-ding-e/DBX-Next' &&
+      (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source: ${{ steps.version.outputs.source }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check tag, source and package versions
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          REQUESTED_REF: ${{ github.ref_type == 'tag' && github.ref || inputs.source_ref }}
+          PUBLISH: ${{ (github.ref_type == 'tag' || inputs.publish) && 'true' || 'false' }}
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          source=$(git rev-parse --verify --end-of-options "$REQUESTED_REF^{commit}")
+          if [[ "$PUBLISH" == true ]]; then
+            git merge-base --is-ancestor "$source" HEAD
+          else
+            # A build-only dispatch can qualify a candidate based on main before integration.
+            git merge-base --is-ancestor HEAD "$source" || git merge-base --is-ancestor "$source" HEAD
+          fi
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            [[ "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" == "$source" ]]
+          fi
+          version=$(git show "$source:package.json" | jq -er '.version')
+          [[ "v$version" == "$RELEASE_TAG" ]]
+          [[ "$(git show "$source:src-tauri/tauri.conf.json" | jq -er '.version')" == "$version" ]]
+          {
+            echo "source=$source"
+            echo "tag=$RELEASE_TAG"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
   cli:
     name: Build CLI
+    needs: resolve
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
-      - name: Check out the source ref
+      - name: Check out the pinned source
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
-          fetch-depth: 0
-
-      - name: Resolve release version
-        id: release
-        shell: pwsh
-        run: |
-          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
-          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid release tag: $tag" }
-          $version = $tag.Substring(1)
-          $packageVersion = (Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json).version
-          if ($packageVersion -ne $version) { throw "Tag $tag does not match package.json=$packageVersion" }
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
+          ref: ${{ needs.resolve.outputs.source }}
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@1.97.1
@@ -64,6 +102,7 @@ jobs:
         shell: pwsh
         run: |
           cargo build --locked --package dbx-cli --no-default-features --features os-keyring --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { throw "CLI build failed ($LASTEXITCODE)." }
           $source = 'target\x86_64-pc-windows-msvc\release\dbx.exe'
           if (-not (Test-Path -LiteralPath $source)) { throw "Missing DBX CLI binary $source" }
           $stage = Join-Path $env:RUNNER_TEMP 'cli-package'
@@ -89,27 +128,15 @@ jobs:
 
   desktop:
     name: Build Desktop
+    needs: resolve
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
-      - name: Check out the source ref
+      - name: Check out the pinned source
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
-          fetch-depth: 0
-
-      - name: Resolve release version
-        id: release
-        shell: pwsh
-        run: |
-          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
-          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid release tag: $tag" }
-          $version = $tag.Substring(1)
-          $packageVersion = (Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json).version
-          $tauriVersion = (Get-Content -Raw -LiteralPath 'src-tauri\tauri.conf.json' | ConvertFrom-Json).version
-          if ($packageVersion -ne $version -or $tauriVersion -ne $version) { throw "Version mismatch: $tag / $packageVersion / $tauriVersion" }
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
+          ref: ${{ needs.resolve.outputs.source }}
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -165,6 +192,8 @@ jobs:
           "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" >> $env:GITHUB_ENV
 
       - name: Run frontend checks
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
         run: pnpm typecheck
 
       - name: Build Tauri Desktop bundles
@@ -203,29 +232,17 @@ jobs:
           $keyPath = Join-Path $env:RUNNER_TEMP 'dbx-next-updater.key'
           if (Test-Path -LiteralPath $keyPath) { [IO.File]::WriteAllBytes($keyPath, [byte[]]::new(0)); Remove-Item -LiteralPath $keyPath -Force }
 
-  publish:
-    name: Publish Release
-    needs: [cli, desktop]
+  bundle:
+    name: Assemble the signed release
+    needs: [resolve, cli, desktop]
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
-      - name: Check out the source ref
+      - name: Check out the pinned source
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
-          fetch-depth: 0
-
-      - name: Resolve release version
-        id: release
-        shell: pwsh
-        run: |
-          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
-          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid release tag: $tag" }
-          $version = $tag.Substring(1)
-          $packageVersion = (Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json).version
-          if ($packageVersion -ne $version) { throw "Version mismatch: $tag / $packageVersion" }
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
+          ref: ${{ needs.resolve.outputs.source }}
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -276,9 +293,13 @@ jobs:
 
       - name: Assemble and sign portable package
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source }}
         run: |
-          $tag = '${{ steps.release.outputs.tag }}'
-          $version = '${{ steps.release.outputs.version }}'
+          $tag = $env:RELEASE_TAG
+          $version = $env:RELEASE_VERSION
           $root = Join-Path $env:RUNNER_TEMP 'build-assets'
           $cliRoot = Join-Path $root 'dbx-next-cli-assets'
           $desktopRoot = Join-Path $root 'dbx-next-desktop-assets'
@@ -301,50 +322,46 @@ jobs:
           set "DBX_DATA_DIR=%~dp0..\data"
           "%~dp0dbx.exe" %*
           '@ | Set-Content -LiteralPath (Join-Path $portableCli 'dbx-portable.cmd') -Encoding ascii
-          $manifest = [ordered]@{ schema_version = 1; version = $version; arch = 'x64'; executable = 'DBX.exe'; executable_sha256 = (Get-FileHash -LiteralPath (Join-Path $portable 'DBX.exe') -Algorithm SHA256).Hash.ToLowerInvariant(); source = 'DBX-Next GitHub Actions release'; source_commit = $env:GITHUB_SHA } | ConvertTo-Json
+          $manifest = [ordered]@{ schema_version = 1; version = $version; arch = 'x64'; executable = 'DBX.exe'; executable_sha256 = (Get-FileHash -LiteralPath (Join-Path $portable 'DBX.exe') -Algorithm SHA256).Hash.ToLowerInvariant(); source = 'DBX-Next GitHub Actions release'; source_commit = $env:SOURCE_SHA } | ConvertTo-Json
           Set-Content -LiteralPath (Join-Path $portable 'portable-update.json') -Value $manifest -Encoding utf8NoBOM
           $portableZip = "DBX_${version}_x64-portable.zip"
           Compress-Archive -Path (Join-Path $portable '*') -DestinationPath $portableZip -CompressionLevel Optimal -Force
           if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) { pnpm tauri signer sign '--password=' $portableZip } else { pnpm tauri signer sign $portableZip }
-          if (-not (Test-Path -LiteralPath "$portableZip.sig")) { throw "Missing $portableZip.sig" }
+          if ($LASTEXITCODE -or -not (Test-Path -LiteralPath "$portableZip.sig")) { throw "Portable signing failed." }
           $rawName = "DBX_${version}_x64-portable.exe"
           Copy-Item -LiteralPath $desktopExe -Destination $rawName -Force
           $rawHash = (Get-FileHash -LiteralPath $rawName -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath "$rawName.sha256" -Value "$rawHash  $rawName" -Encoding utf8NoBOM
-          $signature = Get-Content -Raw -LiteralPath (Join-Path $desktopRoot "$($nsis.Name).sig")
-          $latest = [ordered]@{ version = $version; notes = "DBX-Next $version"; pub_date = (Get-Date).ToUniversalTime().ToString('o'); platforms = [ordered]@{ 'windows-x86_64' = [ordered]@{ signature = $signature.Trim(); url = "https://github.com/xue-ding-e/DBX-Next/releases/download/$tag/$($nsis.Name)" } } } | ConvertTo-Json -Depth 6
+          $downloadBase = "https://github.com/xue-ding-e/DBX-Next/releases/download/$tag"
+          $nsisUpdate = [ordered]@{ signature = (Get-Content -Raw -LiteralPath "$($nsis.FullName).sig").Trim(); url = "$downloadBase/$($nsis.Name)" }
+          $msiUpdate = [ordered]@{ signature = (Get-Content -Raw -LiteralPath "$($msi.FullName).sig").Trim(); url = "$downloadBase/$($msi.Name)" }
+          $platforms = [ordered]@{
+            'windows-x86_64' = $nsisUpdate
+            'windows-x86_64-nsis' = $nsisUpdate
+            'windows-x86_64-msi' = $msiUpdate
+          }
+          $latest = [ordered]@{ version = $version; notes = "DBX-Next $version"; pub_date = (Get-Date).ToUniversalTime().ToString('o'); platforms = $platforms } | ConvertTo-Json -Depth 6
           $latest | Set-Content -LiteralPath 'latest.json' -Encoding utf8NoBOM
           $sumFiles = @((Get-Item -LiteralPath (Join-Path $desktopRoot $nsis.Name)), (Get-Item -LiteralPath (Join-Path $desktopRoot $msi.Name)), (Get-Item -LiteralPath $portableZip), (Get-Item -LiteralPath $rawName))
           $sumFiles | ForEach-Object { "$( (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($_.Name)" } | Set-Content -LiteralPath 'SHA256SUMS' -Encoding utf8NoBOM
 
-      - name: Create or reuse draft release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $tag = '${{ steps.release.outputs.tag }}'
-          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -ne 0) { gh release create $tag --repo $env:GITHUB_REPOSITORY --draft --title "DBX-Next $tag" --notes 'DBX-Next Windows x64 release.' --target $env:GITHUB_SHA }
+          $release = Join-Path $env:RUNNER_TEMP 'release-assets'
+          New-Item -ItemType Directory -Force -Path $release | Out-Null
+          Copy-Item -Path (Join-Path $desktopRoot '*') -Destination $release
+          Copy-Item -LiteralPath (Join-Path $cliRoot 'dbx-cli-win32-x64.zip'), (Join-Path $cliRoot 'CLI-SHA256SUMS'), $portableZip, "$portableZip.sig", $rawName, "$rawName.sha256", 'latest.json', 'SHA256SUMS' -Destination $release
 
-      - name: Upload and publish release
+      - name: Verify the updater feed and signed packages
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $tag = '${{ steps.release.outputs.tag }}'
-          $version = '${{ steps.release.outputs.version }}'
-          $desktopRoot = Join-Path $env:RUNNER_TEMP 'build-assets\dbx-next-desktop-assets'
-          $cliRoot = Join-Path $env:RUNNER_TEMP 'build-assets\dbx-next-cli-assets'
-          $upload = @()
-          $upload += (Get-ChildItem -LiteralPath $desktopRoot -File | ForEach-Object { $_.FullName })
-          $upload += (Get-ChildItem -LiteralPath $cliRoot -File | Where-Object { $_.Name -in @('dbx-cli-win32-x64.zip','CLI-SHA256SUMS') } | ForEach-Object { $_.FullName })
-          $upload += "DBX_${version}_x64-portable.zip", "DBX_${version}_x64-portable.zip.sig", "DBX_${version}_x64-portable.exe", "DBX_${version}_x64-portable.exe.sha256", 'latest.json', 'SHA256SUMS'
-          gh release upload $tag $upload --repo $env:GITHUB_REPOSITORY --clobber
-          gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --prerelease=false
-          $names = gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
-          $required = @('latest.json','SHA256SUMS','CLI-SHA256SUMS','dbx-cli-win32-x64.zip',"DBX_${version}_x64-setup.exe", "DBX_${version}_x64_en-US.msi", "DBX_${version}_x64-portable.zip", "DBX_${version}_x64-portable.exe")
-          foreach ($name in $required) { if ($names -notcontains $name) { throw "Published release is missing $name" } }
-          Write-Host "Published DBX-Next $tag from parallel CLI/Desktop jobs."
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: node .github/scripts/dbx-next-verify-update-assets.mjs (Join-Path $env:RUNNER_TEMP 'release-assets') $env:RELEASE_TAG
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dbx-next-release-assets
+          path: ${{ runner.temp }}\release-assets
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Remove the ephemeral updater key
         if: always()
@@ -352,3 +369,42 @@ jobs:
         run: |
           $keyPath = Join-Path $env:RUNNER_TEMP 'dbx-next-updater.key'
           if (Test-Path -LiteralPath $keyPath) { [IO.File]::WriteAllBytes($keyPath, [byte[]]::new(0)); Remove-Item -LiteralPath $keyPath -Force }
+
+  publish:
+    name: Publish Release
+    if: github.ref_type == 'tag' || inputs.publish
+    needs: [resolve, bundle]
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dbx-next-release-assets
+          path: ${{ runner.temp }}\release-assets
+      - name: Upload assets to a draft and publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tag = $env:RELEASE_TAG
+          $repo = $env:GITHUB_REPOSITORY
+          $existing = gh release list --repo $repo --limit 100 --json tagName,isDraft | ConvertFrom-Json | Where-Object tagName -eq $tag
+          if ($existing -and -not $existing.isDraft) { throw "Release $tag is already public." }
+          if (-not $existing) {
+            gh release create $tag --repo $repo --draft --title "DBX-Next $tag" --notes 'DBX-Next Windows x64 release.' --target $env:SOURCE_SHA
+          }
+          $draft = gh release view $tag --repo $repo --json isDraft,targetCommitish | ConvertFrom-Json
+          if (-not $draft.isDraft) { throw "Release $tag is already public." }
+          $target = gh api "repos/$repo/commits/$($draft.targetCommitish)" --jq '.sha'
+          if ($target -ne $env:SOURCE_SHA) { throw "Draft $tag points to a different source." }
+          $files = @(Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP 'release-assets') -File)
+          $paths = $files.FullName
+          gh release upload $tag @paths --repo $repo --clobber
+          $names = gh release view $tag --repo $repo --json assets --jq '.assets[].name'
+          foreach ($file in $files) { if ($names -notcontains $file.Name) { throw "Draft release is missing $($file.Name)." } }
+          gh release edit $tag --repo $repo --draft=false --prerelease=false --latest
