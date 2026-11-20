@@ -31,12 +31,17 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+    outputs:
+      status: ${{ steps.mirror.outputs.status }}
+      old: ${{ steps.mirror.outputs.old }}
+      target: ${{ steps.mirror.outputs.target }}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Fast-forward the official history mirror
+        id: mirror
         shell: bash
         run: |
           git fetch --no-tags --no-recurse-submodules "$OFFICIAL_REPO" "refs/heads/main:$OFFICIAL_REF"
@@ -45,10 +50,72 @@ jobs:
           git merge-base --is-ancestor "$old" "$target"
           if [[ "$old" != "$target" ]]; then
             # The built-in token suppresses workflows on the raw upstream tree.
-            git push --no-follow-tags origin "$target:refs/heads/upstream-main"
+            if ! result=$(git push --no-follow-tags origin "$target:refs/heads/upstream-main" 2>&1); then
+              printf '%s\n' "$result"
+              if [[ "$result" != *"without "*workflow*" permission"* ]]; then exit 1; fi
+              {
+                echo 'status=needs-ssh'
+                echo "old=$old"
+                echo "target=$target"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
           [[ "$(git ls-remote --refs origin refs/heads/upstream-main | cut -f1)" == "$target" ]]
           echo "Official mirror: $target" >> "$GITHUB_STEP_SUMMARY"
+
+  mirror-ssh:
+    if: needs.mirror.outputs.status == 'needs-ssh'
+    needs: mirror
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    environment:
+      name: dbx-next-upstream-mirror
+      deployment: false
+    env:
+      MIRROR_OLD: ${{ needs.mirror.outputs.old }}
+      MIRROR_TARGET: ${{ needs.mirror.outputs.target }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the raw mirror update before using SSH
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          [[ "$(git rev-parse refs/remotes/origin/upstream-main)" == "$MIRROR_OLD" ]]
+          git fetch --no-tags --no-recurse-submodules "$OFFICIAL_REPO" "refs/heads/main:$OFFICIAL_REF"
+          git merge-base --is-ancestor "$MIRROR_TARGET" "$OFFICIAL_REF"
+          git merge-base --is-ancestor "$MIRROR_OLD" "$MIRROR_TARGET"
+          for role in base head; do
+            ref=upstream-main
+            if [[ "$role" == head ]]; then ref="xue-ding-e:$ref"; fi
+            gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f "$role=$ref" -f per_page=1 | jq -e 'length == 0'
+          done
+          python3 .github/scripts/dbx-next-check-mirror.py "$MIRROR_TARGET"
+      - name: Fast-forward upstream-main using the repository deploy key
+        env:
+          DEPLOY_KEY: ${{ secrets.DBX_UPSTREAM_MIRROR_DEPLOY_KEY }}
+        shell: bash
+        run: |
+          : "${DEPLOY_KEY:?Configure the DBX_UPSTREAM_MIRROR_DEPLOY_KEY environment secret}"
+          [[ "$(git ls-remote --refs origin refs/heads/upstream-main | cut -f1)" == "$MIRROR_OLD" ]]
+          umask 077
+          key_dir=$(mktemp -d "$RUNNER_TEMP/dbx-mirror.XXXXXXXX")
+          trap 'rm -f "$key_dir/key" "$key_dir/known_hosts"; rmdir "$key_dir"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" > "$key_dir/key"
+          unset DEPLOY_KEY
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$key_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i '$key_dir/key' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$key_dir/known_hosts'"
+          git push --no-follow-tags git@github.com:xue-ding-e/DBX-Next.git "$MIRROR_TARGET:refs/heads/upstream-main"
+          [[ "$(git ls-remote --refs origin refs/heads/upstream-main | cut -f1)" == "$MIRROR_TARGET" ]]
+          echo "Official mirror: $MIRROR_TARGET" >> "$GITHUB_STEP_SUMMARY"
 
   prepare:
     if: github.repository == 'xue-ding-e/DBX-Next' && github.ref == 'refs/heads/main'
